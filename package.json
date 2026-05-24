@@ -1,0 +1,19 @@
+{
+  "name": "local-llm-chat",
+  "version": "1.0.0",
+  "description": "Local LLM Chat — connect to LM Studio and other local servers",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tauri dev",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0"
+  }
+}

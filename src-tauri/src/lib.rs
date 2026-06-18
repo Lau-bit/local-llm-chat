@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose, Engine as _};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::{
@@ -14,10 +15,12 @@ use tokio::sync::oneshot;
 const DEFAULT_SERVER_URL: &str = "http://localhost:1234";
 const CONNECT_TIMEOUT_SECS: u64 = 30;
 const STALL_TIMEOUT_SECS: u64 = 120;
+const IMAGE_ANALYSIS_MAX_TOKENS: u64 = 8192;
 
 #[derive(Default)]
 struct AppState {
     current_cancel: Mutex<Option<oneshot::Sender<()>>>,
+    current_model_load_cancel: Mutex<Option<oneshot::Sender<()>>>,
     server_url: Mutex<String>,
 }
 
@@ -156,6 +159,22 @@ fn chat_file_name(chat_id: &str) -> String {
     format!("{chat_id}.txt")
 }
 
+fn chat_json_path(text_path: &Path) -> PathBuf {
+    text_path.with_extension("json")
+}
+
+fn chat_attachment_dir(text_path: &Path) -> PathBuf {
+    let stem = text_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("chat");
+    text_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("attachments")
+        .join(stem)
+}
+
 fn list_chat_files(root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     if let Ok(entries) = fs::read_dir(root) {
@@ -224,16 +243,6 @@ fn find_chat_file_in(root: &Path, chat_id: &str) -> Option<PathBuf> {
 fn find_chat_file(app: &AppHandle, chat_id: &str) -> Option<PathBuf> {
     find_chat_file_in(&chats_dir(app), chat_id)
         .or_else(|| find_chat_file_in(&private_dir(app), chat_id))
-}
-
-fn resolve_chat_dir(app: &AppHandle, chat_id: &str, month: Option<&str>) -> PathBuf {
-    if let Some(path) = find_chat_file(app, chat_id) {
-        return path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf();
-    }
-    monthly_dir(&chats_dir(app), month.unwrap_or("unknown"))
 }
 
 fn get_text_content(msg: &Value) -> String {
@@ -356,6 +365,230 @@ fn text_to_chat(text: &str, filename: &str) -> Value {
         "branchGroup": branch_group,
         "messages": messages
     })
+}
+
+fn ext_from_mime(mime: &str) -> &str {
+    match mime {
+        "image/png" => "png",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "image/bmp" => "bmp",
+        "image/svg+xml" => "svg",
+        "image/jpeg" | "image/jpg" => "jpg",
+        _ => "jpg",
+    }
+}
+
+fn mime_from_ext(ext: &str) -> &str {
+    match ext.trim_start_matches('.').to_ascii_lowercase().as_str() {
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "jpg" | "jpeg" => "image/jpeg",
+        _ => "image/jpeg",
+    }
+}
+
+fn clean_attachment_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        .collect::<String>()
+}
+
+fn decode_data_url(data_url: &str) -> Option<(String, Vec<u8>)> {
+    let rest = data_url.strip_prefix("data:")?;
+    let (meta, b64) = rest.split_once(',')?;
+    if !meta.to_ascii_lowercase().contains(";base64") {
+        return None;
+    }
+    let mime = meta.split(';').next().unwrap_or("image/jpeg").to_string();
+    let bytes = general_purpose::STANDARD.decode(b64).ok()?;
+    Some((mime, bytes))
+}
+
+fn attachment_url_filename(url: &str) -> Option<String> {
+    url.strip_prefix("attachment://")
+        .map(clean_attachment_name)
+        .filter(|s| !s.is_empty())
+}
+
+fn persist_chat_attachments(chat: &mut Value, text_path: &Path) -> Result<(), String> {
+    let Some(messages) = chat.get_mut("messages").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    let attachment_dir = chat_attachment_dir(text_path);
+
+    for (msg_idx, msg) in messages.iter_mut().enumerate() {
+        let Some(parts) = msg.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for (part_idx, part) in parts.iter_mut().enumerate() {
+            if part.get("type").and_then(Value::as_str) != Some("image_url") {
+                continue;
+            }
+            let Some(url) = part
+                .pointer("/image_url/url")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+
+            if attachment_url_filename(&url).is_some() {
+                continue;
+            }
+
+            let Some((mime, bytes)) = decode_data_url(&url) else {
+                continue;
+            };
+
+            ensure_dir(&attachment_dir)?;
+            let ext = part
+                .get("_ext")
+                .and_then(Value::as_str)
+                .map(clean_attachment_name)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| ext_from_mime(&mime).to_string());
+            let existing = part
+                .get("_attachment")
+                .and_then(Value::as_str)
+                .map(clean_attachment_name)
+                .filter(|s| !s.is_empty());
+            let filename = existing.unwrap_or_else(|| format!("m{msg_idx}_p{part_idx}.{ext}"));
+            let path = attachment_dir.join(&filename);
+            fs::write(&path, bytes).map_err(|e| format!("Failed to save image attachment: {e}"))?;
+
+            if let Some(obj) = part.as_object_mut() {
+                obj.insert("_attachment".into(), Value::String(filename.clone()));
+                obj.insert("_ext".into(), Value::String(ext));
+                obj.insert(
+                    "image_url".into(),
+                    json!({ "url": format!("attachment://{filename}") }),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn hydrate_chat_attachments(chat: &mut Value, text_path: &Path) {
+    let Some(messages) = chat.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let attachment_dir = chat_attachment_dir(text_path);
+
+    for msg in messages {
+        let Some(parts) = msg.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for part in parts {
+            if part.get("type").and_then(Value::as_str) != Some("image_url") {
+                continue;
+            }
+            let Some(url) = part.pointer("/image_url/url").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(filename) = attachment_url_filename(url) else {
+                continue;
+            };
+            let path = attachment_dir.join(&filename);
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
+            let ext = part
+                .get("_ext")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    Path::new(&filename)
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| "jpg".to_string());
+            let data_url = format!(
+                "data:{};base64,{}",
+                mime_from_ext(&ext),
+                general_purpose::STANDARD.encode(bytes)
+            );
+            if let Some(obj) = part.as_object_mut() {
+                obj.insert(
+                    "image_url".into(),
+                    json!({ "url": data_url }),
+                );
+                obj.insert("_attachment".into(), Value::String(filename));
+                obj.insert("_ext".into(), Value::String(ext));
+            }
+        }
+    }
+}
+
+fn load_chat_from_file(text_path: &Path) -> Result<Value, String> {
+    let filename = text_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let json_path = chat_json_path(text_path);
+    if json_path.exists() {
+        let json_text = fs::read_to_string(&json_path).map_err(|e| e.to_string())?;
+        let mut chat: Value = serde_json::from_str(&json_text).map_err(|e| e.to_string())?;
+        hydrate_chat_attachments(&mut chat, text_path);
+        return Ok(chat);
+    }
+
+    let text = fs::read_to_string(text_path).map_err(|e| e.to_string())?;
+    Ok(text_to_chat(&text, filename))
+}
+
+fn write_chat_bundle(text_path: &Path, chat: &Value) -> Result<(), String> {
+    if let Some(parent) = text_path.parent() {
+        ensure_dir(parent)?;
+    }
+    let mut structured = chat.clone();
+    persist_chat_attachments(&mut structured, text_path)?;
+    fs::write(text_path, chat_to_text(&structured)).map_err(|e| e.to_string())?;
+    let json_text = serde_json::to_string_pretty(&structured).map_err(|e| e.to_string())?;
+    fs::write(chat_json_path(text_path), json_text).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn remove_chat_bundle(text_path: &Path) -> Result<(), String> {
+    if text_path.exists() {
+        fs::remove_file(text_path).map_err(|e| e.to_string())?;
+    }
+    let json_path = chat_json_path(text_path);
+    if json_path.exists() {
+        fs::remove_file(json_path).map_err(|e| e.to_string())?;
+    }
+    let attachments = chat_attachment_dir(text_path);
+    if attachments.exists() {
+        fs::remove_dir_all(attachments).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn move_chat_bundle(src: &Path, dst: &Path) -> Result<(), String> {
+    if let Some(parent) = dst.parent() {
+        ensure_dir(parent)?;
+    }
+    fs::rename(src, dst).map_err(|e| e.to_string())?;
+
+    let src_json = chat_json_path(src);
+    if src_json.exists() {
+        fs::rename(src_json, chat_json_path(dst)).map_err(|e| e.to_string())?;
+    }
+
+    let src_attachments = chat_attachment_dir(src);
+    if src_attachments.exists() {
+        let dst_attachments = chat_attachment_dir(dst);
+        if let Some(parent) = dst_attachments.parent() {
+            ensure_dir(parent)?;
+        }
+        fs::rename(src_attachments, dst_attachments).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 fn parse_header(text: &str, filename: &str) -> Value {
@@ -622,6 +855,40 @@ async fn post_stream(
     json!({ "content": full_content })
 }
 
+async fn post_image_analysis_stream(
+    window: WebviewWindow,
+    state: tauri::State<'_, AppState>,
+    messages: Value,
+    options: Option<Value>,
+    stream_channel: Channel<String>,
+) -> Value {
+    let mut effective = Vec::<Value>::new();
+    effective.push(json!({
+        "role": "system",
+        "content": "Describe the attached image for another language model that may not be able to inspect images. Include visible text, objects, layout, chart/table details, UI elements, notable colors, and any context needed to answer later questions. Be thorough and specific while avoiding speculation. Do not claim you cannot see the image if it is provided."
+    }));
+    if let Some(arr) = messages.as_array() {
+        effective.extend(arr.iter().cloned());
+    }
+
+    let mut analysis_options = options.unwrap_or_else(|| json!({}));
+    if analysis_options.get("temperature").is_none() {
+        analysis_options["temperature"] = json!(0.2);
+    }
+    if analysis_options.get("maxTokens").is_none() {
+        analysis_options["maxTokens"] = json!(IMAGE_ANALYSIS_MAX_TOKENS);
+    }
+
+    post_stream(
+        window,
+        state,
+        Value::Array(effective),
+        Some(analysis_options),
+        stream_channel,
+    )
+    .await
+}
+
 // ── Tauri commands ─────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -636,6 +903,17 @@ async fn chat_send(
 }
 
 #[tauri::command]
+async fn chat_analyze_image(
+    window: WebviewWindow,
+    state: tauri::State<'_, AppState>,
+    messages: Value,
+    options: Option<Value>,
+    stream_channel: Channel<String>,
+) -> Result<Value, String> {
+    Ok(post_image_analysis_stream(window, state, messages, options, stream_channel).await)
+}
+
+#[tauri::command]
 fn chat_cancel(state: tauri::State<'_, AppState>) -> Result<Value, String> {
     if let Some(cancel) = state
         .current_cancel
@@ -646,6 +924,30 @@ fn chat_cancel(state: tauri::State<'_, AppState>) -> Result<Value, String> {
         let _ = cancel.send(());
     }
     Ok(json!({ "cancelled": true }))
+}
+
+fn text_has_vision_hint(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    ["image", "images", "vision", "visual", "multimodal", "vl", "video"]
+        .iter()
+        .any(|hint| lower.contains(hint))
+}
+
+fn value_has_vision_hint(value: &Value, depth: u8) -> bool {
+    if depth > 4 {
+        return false;
+    }
+    match value {
+        Value::String(s) => text_has_vision_hint(s),
+        Value::Array(items) => items
+            .iter()
+            .any(|item| value_has_vision_hint(item, depth + 1)),
+        Value::Object(map) => map.iter().any(|(key, val)| {
+            (text_has_vision_hint(key) && val != &Value::Bool(false))
+                || value_has_vision_hint(val, depth + 1)
+        }),
+        _ => false,
+    }
 }
 
 #[tauri::command]
@@ -686,10 +988,109 @@ async fn get_models(server_url: String) -> Result<Value, String> {
                 .or_else(|| m.get("n_ctx"))
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
-            json!({ "id": id, "contextLength": ctx })
+            let vision = value_has_vision_hint(&m, 0);
+            json!({
+                "id": id,
+                "contextLength": ctx,
+                "vision": if vision { Value::Bool(true) } else { Value::Null },
+                "visionSource": if vision { "server metadata" } else { "" },
+                "raw": m
+            })
         })
         .collect::<Vec<_>>();
     Ok(json!({ "models": models }))
+}
+
+#[tauri::command]
+async fn load_model(window: WebviewWindow, state: tauri::State<'_, AppState>, model: String) -> Result<Value, String> {
+    let server_url = state.server_url.lock().unwrap().clone();
+    let endpoint = format!("{}/api/v1/models/load", server_url.trim_end_matches('/'));
+    let start = now_ms();
+    let (cancel_tx, mut cancel_rx) = oneshot::channel();
+    if let Ok(mut current) = state.current_model_load_cancel.lock() {
+        if let Some(cancel) = current.take() {
+            let _ = cancel.send(());
+        }
+        *current = Some(cancel_tx);
+    }
+
+    dev_log(
+        &window,
+        "request",
+        json!({
+            "endpoint": endpoint,
+            "method": "POST",
+            "model": model,
+            "purpose": "preload"
+        }),
+    );
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(8))
+        .timeout(Duration::from_secs(300))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let request = client
+        .post(&endpoint)
+        .json(&json!({ "model": model }))
+        .send();
+    let resp = tokio::select! {
+        _ = &mut cancel_rx => {
+            dev_log(
+                &window,
+                "response",
+                json!({
+                    "endpoint": endpoint,
+                    "model": model,
+                    "durationMs": now_ms().saturating_sub(start),
+                    "status": "cancelled"
+                }),
+            );
+            return Ok(json!({ "ok": false, "cancelled": true }));
+        }
+        resp = request => resp.map_err(|e| format!("Model load request failed: {e}"))?
+    };
+    let status = resp.status();
+    let body_text = resp.text().await.unwrap_or_default();
+
+    if !status.is_success() {
+        dev_log(
+            &window,
+            "response",
+            json!({
+                "endpoint": endpoint,
+                "model": model,
+                "durationMs": now_ms().saturating_sub(start),
+                "status": "error",
+                "error": format!("Server returned {status}: {body_text}")
+            }),
+        );
+        if let Ok(mut current) = state.current_model_load_cancel.lock() {
+            *current = None;
+        }
+        return Ok(json!({
+            "ok": false,
+            "unsupported": status.as_u16() == 404,
+            "status": status.as_u16(),
+            "error": body_text
+        }));
+    }
+
+    let data: Value = serde_json::from_str(&body_text).unwrap_or_else(|_| json!({ "body": body_text }));
+    dev_log(
+        &window,
+        "response",
+        json!({
+            "endpoint": endpoint,
+            "model": model,
+            "durationMs": now_ms().saturating_sub(start),
+            "status": "success"
+        }),
+    );
+    if let Ok(mut current) = state.current_model_load_cancel.lock() {
+        *current = None;
+    }
+    Ok(json!({ "ok": true, "result": data }))
 }
 
 #[tauri::command]
@@ -719,14 +1120,13 @@ fn chat_save(app: AppHandle, mut chat: Value, base_count: Option<usize>) -> Resu
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let filename = chat_file_name(&old_id);
-    let filepath = find_chat_file(&app, &old_id).unwrap_or_else(|| dir.join(&filename));
+    let filepath = find_chat_file(&app, &old_id).unwrap_or_else(|| dir.join(chat_file_name(&old_id)));
     let relocated = filepath.starts_with(private_dir(&app));
     if !filepath.exists() {
         let new_id = generate_chat_id();
         chat["id"] = Value::String(new_id.clone());
         let new_file = dir.join(chat_file_name(&new_id));
-        fs::write(&new_file, chat_to_text(&chat)).map_err(|e| e.to_string())?;
+        write_chat_bundle(&new_file, &chat)?;
         return Ok(json!({
             "ok": true,
             "newId": new_id,
@@ -738,8 +1138,7 @@ fn chat_save(app: AppHandle, mut chat: Value, base_count: Option<usize>) -> Resu
     }
     let mut merged = false;
     if let Some(base_count) = base_count.filter(|c| *c > 0) {
-        if let Ok(disk_text) = fs::read_to_string(&filepath) {
-            let disk_chat = text_to_chat(&disk_text, &filename);
+        if let Ok(disk_chat) = load_chat_from_file(&filepath) {
             let disk_len = disk_chat
                 .pointer("/messages")
                 .and_then(Value::as_array)
@@ -759,7 +1158,7 @@ fn chat_save(app: AppHandle, mut chat: Value, base_count: Option<usize>) -> Resu
             }
         }
     }
-    fs::write(&filepath, chat_to_text(&chat)).map_err(|e| e.to_string())?;
+    write_chat_bundle(&filepath, &chat)?;
     Ok(json!({
         "ok": true,
         "savedCount": chat.pointer("/messages").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0),
@@ -773,12 +1172,7 @@ fn chat_load(app: AppHandle, chat_id: String) -> Result<Value, String> {
     let Some(filepath) = find_chat_file(&app, &chat_id) else {
         return Err(format!("Chat not found: {chat_id}"));
     };
-    let text = fs::read_to_string(&filepath).map_err(|e| e.to_string())?;
-    let filename = filepath
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default();
-    Ok(text_to_chat(&text, filename))
+    load_chat_from_file(&filepath)
 }
 
 #[tauri::command]
@@ -807,7 +1201,7 @@ fn chat_delete(app: AppHandle, chat_id: String) -> Result<Value, String> {
     let Some(filepath) = find_chat_file(&app, &chat_id) else {
         return Ok(json!({ "ok": true, "notFound": true }));
     };
-    fs::remove_file(&filepath).map_err(|e| e.to_string())?;
+    remove_chat_bundle(&filepath)?;
     Ok(json!({ "ok": true }))
 }
 
@@ -816,14 +1210,9 @@ fn chat_rename(app: AppHandle, chat_id: String, new_title: String) -> Result<Val
     let Some(filepath) = find_chat_file(&app, &chat_id) else {
         return Err(format!("Chat not found: {chat_id}"));
     };
-    let text = fs::read_to_string(&filepath).map_err(|e| e.to_string())?;
-    let filename = filepath
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default();
-    let mut chat = text_to_chat(&text, filename);
+    let mut chat = load_chat_from_file(&filepath)?;
     chat["title"] = Value::String(new_title);
-    fs::write(&filepath, chat_to_text(&chat)).map_err(|e| e.to_string())?;
+    write_chat_bundle(&filepath, &chat)?;
     Ok(json!({ "ok": true }))
 }
 
@@ -835,7 +1224,7 @@ fn chat_make_private(app: AppHandle, chat_id: String) -> Result<Value, String> {
     let private = private_dir(&app);
     ensure_dir(&private)?;
     let dst = private.join(chat_file_name(&chat_id));
-    fs::rename(&src, &dst).map_err(|e| e.to_string())?;
+    move_chat_bundle(&src, &dst)?;
     Ok(json!({ "ok": true }))
 }
 
@@ -865,17 +1254,12 @@ fn chat_unhide(app: AppHandle, chat_id: String) -> Result<Value, String> {
     let Some(src) = find_chat_file_in(&private_dir(&app), &chat_id) else {
         return Err(format!("Private chat not found: {chat_id}"));
     };
-    let text = fs::read_to_string(&src).map_err(|e| e.to_string())?;
-    let filename = src
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default();
-    let chat = text_to_chat(&text, filename);
+    let chat = load_chat_from_file(&src)?;
     let month = month_from_chat(&chat);
     let dst_dir = monthly_dir(&chats_dir(&app), &month);
     ensure_dir(&dst_dir)?;
     let dst = dst_dir.join(chat_file_name(&chat_id));
-    fs::rename(&src, &dst).map_err(|e| e.to_string())?;
+    move_chat_bundle(&src, &dst)?;
     Ok(json!({ "ok": true }))
 }
 
@@ -917,14 +1301,9 @@ fn chat_set_branch_group(
     let Some(filepath) = find_chat_file(&app, &chat_id) else {
         return Err(format!("Chat not found: {chat_id}"));
     };
-    let text = fs::read_to_string(&filepath).map_err(|e| e.to_string())?;
-    let filename = filepath
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default();
-    let mut chat = text_to_chat(&text, filename);
+    let mut chat = load_chat_from_file(&filepath)?;
     chat["branchGroup"] = Value::String(group_id);
-    fs::write(&filepath, chat_to_text(&chat)).map_err(|e| e.to_string())?;
+    write_chat_bundle(&filepath, &chat)?;
     Ok(json!({ "ok": true }))
 }
 
@@ -1076,6 +1455,7 @@ pub fn run() {
             let url = load_server_url_from_file(app.handle());
             let state = AppState {
                 current_cancel: Mutex::new(None),
+                current_model_load_cancel: Mutex::new(None),
                 server_url: Mutex::new(url),
             };
             app.manage(state);
@@ -1083,6 +1463,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             chat_send,
+            chat_analyze_image,
             chat_cancel,
             chat_save,
             chat_load,
@@ -1097,6 +1478,7 @@ pub fn run() {
             chat_meta_record,
             chat_meta_load,
             get_models,
+            load_model,
             get_server_url,
             set_server_url,
             shell_open_external,

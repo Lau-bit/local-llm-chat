@@ -41,9 +41,11 @@
 
   window.api = {
     sendMessage: (messages, options, onChunk) => streamInvoke('chat_send', messages, options, onChunk),
+    analyzeImage: (messages, options, onChunk) => streamInvoke('chat_analyze_image', messages, options, onChunk),
     cancelMessage: () => invoke('chat_cancel'),
 
     getModels: (serverUrl) => invoke('get_models', { serverUrl }),
+    loadModel: (model) => invoke('load_model', { model }),
     getServerUrl: () => invoke('get_server_url'),
     setServerUrl: (url) => invoke('set_server_url', { url }),
 

@@ -70,78 +70,115 @@
           <span>Settings</span>
           <button id="settings-close">&times;</button>
         </div>
+        <div id="settings-tabs" role="tablist" aria-label="Settings sections">
+          <button class="settings-tab" data-settings-tab="setup" role="tab" aria-selected="false">Setup</button>
+          <button class="settings-tab active" data-settings-tab="general" role="tab" aria-selected="true">General</button>
+          <button class="settings-tab" data-settings-tab="models" role="tab" aria-selected="false">Models</button>
+        </div>
         <div id="settings-body">
-          <label class="settings-label">Server URL</label>
-          <div class="settings-server-row">
-            <input type="text" id="settings-server-url" placeholder="http://localhost:1234" spellcheck="false">
-            <button id="settings-server-connect">Connect</button>
-          </div>
+          <section class="settings-pane" data-settings-pane="setup" role="tabpanel">
+            <div id="setup-checklist"></div>
+          </section>
 
-          <label class="settings-label">Context window (tokens)</label>
-          <div class="settings-row">
-            <input type="number" id="settings-ctx-window" min="512" max="2097152" step="512" placeholder="auto">
-            <span class="settings-hint">override if not detected</span>
-          </div>
+          <section class="settings-pane active" data-settings-pane="general" role="tabpanel">
+            <label class="settings-label">Server URL</label>
+            <div class="settings-server-row">
+              <input type="text" id="settings-server-url" placeholder="http://localhost:1234" spellcheck="false">
+              <button id="settings-server-connect">Connect</button>
+            </div>
 
-          <label class="settings-label">System prompt</label>
-          <textarea id="settings-system-prompt" placeholder="You are a helpful assistant." rows="3" spellcheck="false"></textarea>
+            <label class="settings-label">Context window (tokens)</label>
+            <div class="settings-row">
+              <input type="number" id="settings-ctx-window" min="512" max="2097152" step="512" placeholder="auto">
+              <span class="settings-hint">override if not detected</span>
+            </div>
 
-          <label class="settings-label">Temperature</label>
-          <div class="settings-row">
-            <input type="range" id="settings-temp" min="0" max="2" step="0.05" value="0.7">
-            <span id="settings-temp-value">0.70</span>
-          </div>
+            <label class="settings-label">System prompt</label>
+            <textarea id="settings-system-prompt" placeholder="You are a helpful assistant." rows="3" spellcheck="false"></textarea>
 
-          <label class="settings-label">Max tokens <span class="settings-hint">(0 = unlimited)</span></label>
-          <div class="settings-row">
-            <input type="number" id="settings-max-tokens" min="0" max="131072" step="256" value="0">
-          </div>
+            <label class="settings-label">Temperature</label>
+            <div class="settings-row">
+              <input type="range" id="settings-temp" min="0" max="2" step="0.05" value="0.7">
+              <span id="settings-temp-value">0.70</span>
+              <button id="settings-temp-reset" class="settings-icon-btn" title="Reset temperature to 0.70" aria-label="Reset temperature">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <polyline points="23 4 23 10 17 10"></polyline>
+                  <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+                </svg>
+              </button>
+            </div>
 
-          <label class="settings-label">Theme</label>
-          <div class="theme-options">
-            <button class="theme-btn" data-theme="amber">
-              <span class="theme-dot amber"></span>
-              Amber
-            </button>
-            <button class="theme-btn" data-theme="cyan">
-              <span class="theme-dot cyan"></span>
-              Cyan
-            </button>
-            <button class="theme-btn" data-theme="space">
-              <span class="theme-dot space"></span>
-              Space
-            </button>
-            <button class="theme-btn" data-theme="green">
-              <span class="theme-dot green"></span>
-              Green
-            </button>
-            <button class="theme-btn" data-theme="light">
-              <span class="theme-dot light"></span>
-              Light
-            </button>
-          </div>
+            <label class="settings-label">Max tokens <span class="settings-hint">(0 = unlimited)</span></label>
+            <div class="settings-row">
+              <input type="number" id="settings-max-tokens" min="0" max="131072" step="256" value="0">
+            </div>
 
-          <label class="settings-label">Message max width</label>
-          <div class="settings-row">
-            <input type="range" id="msg-width-slider" min="40" max="100" step="5" value="85">
-            <span id="msg-width-value">85%</span>
-          </div>
-          <div class="settings-presets">
-            <button class="preset-btn" data-value="50">Narrow</button>
-            <button class="preset-btn" data-value="75">Medium</button>
-            <button class="preset-btn" data-value="85">Wide</button>
-            <button class="preset-btn" data-value="100">Full</button>
-          </div>
+            <label class="settings-label">Theme</label>
+            <div class="theme-options">
+              <button class="theme-btn" data-theme="amber">
+                <span class="theme-dot amber"></span>
+                Amber
+              </button>
+              <button class="theme-btn" data-theme="cyan">
+                <span class="theme-dot cyan"></span>
+                Cyan
+              </button>
+              <button class="theme-btn" data-theme="space">
+                <span class="theme-dot space"></span>
+                Space
+              </button>
+              <button class="theme-btn" data-theme="green">
+                <span class="theme-dot green"></span>
+                Green
+              </button>
+              <button class="theme-btn" data-theme="light">
+                <span class="theme-dot light"></span>
+                Light
+              </button>
+            </div>
 
-          <label class="settings-label">Read marker</label>
-          <label class="settings-toggle">
-            <input type="checkbox" id="settings-read-marker">
-            <span class="settings-toggle-slider"></span>
-            <span class="settings-toggle-text">Click to place marker</span>
-          </label>
+            <label class="settings-label">Message max width</label>
+            <div class="settings-row">
+              <input type="range" id="msg-width-slider" min="40" max="100" step="5" value="85">
+              <span id="msg-width-value">85%</span>
+            </div>
+            <div class="settings-presets">
+              <button class="preset-btn" data-value="50">Narrow</button>
+              <button class="preset-btn" data-value="75">Medium</button>
+              <button class="preset-btn" data-value="85">Wide</button>
+              <button class="preset-btn" data-value="100">Full</button>
+            </div>
 
-          <button id="settings-hidden-chats" class="settings-action-btn">Hidden chats</button>
-          <button id="settings-dev-console" class="settings-action-btn">Developer Console [§]</button>
+            <label class="settings-label">Read marker</label>
+            <label class="settings-toggle">
+              <input type="checkbox" id="settings-read-marker">
+              <span class="settings-toggle-slider"></span>
+              <span class="settings-toggle-text">Click to place marker</span>
+            </label>
+
+            <button id="settings-hidden-chats" class="settings-action-btn">Hidden chats</button>
+            <button id="settings-dev-console" class="settings-action-btn">Developer Console [§]</button>
+          </section>
+
+          <section class="settings-pane" data-settings-pane="models" role="tabpanel">
+            <div class="model-settings-header">
+              <select id="settings-model-select" title="Model settings"></select>
+              <button id="settings-model-refresh" title="Refresh models">Refresh</button>
+            </div>
+            <label class="settings-label">Fallback image analysis model</label>
+            <select id="settings-image-analysis-model" title="Image analysis model"></select>
+            <label class="settings-toggle">
+              <input type="checkbox" id="settings-use-current-image-analysis">
+              <span class="settings-toggle-slider"></span>
+              <span class="settings-toggle-text">Use current trusted vision model for image analysis</span>
+            </label>
+            <label class="settings-toggle">
+              <input type="checkbox" id="settings-include-image-analysis-context">
+              <span class="settings-toggle-slider"></span>
+              <span class="settings-toggle-text">Include saved image analysis in chat context</span>
+            </label>
+            <div id="settings-model-details" class="model-settings-details"></div>
+          </section>
         </div>
       </div>
 
@@ -161,6 +198,14 @@
     </div>
 
     <div id="input-bar">
+      <div id="image-preview" class="hidden">
+        <div id="image-preview-list"></div>
+        <label id="image-analysis-toggle" title="Analyze pasted images into text before sending them to the active chat model">
+          <input type="checkbox" id="image-analysis-before-send">
+          <span>Analyze images into text first</span>
+        </label>
+        <button id="image-preview-clear" title="Remove all images">&times;</button>
+      </div>
       <div id="composer-main-row">
         <textarea id="message-input" placeholder="Type a message..." rows="1" spellcheck="false"></textarea>
         <button id="send-btn">Send</button>

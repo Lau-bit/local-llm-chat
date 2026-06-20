@@ -46,6 +46,7 @@
 
     getModels: (serverUrl) => invoke('get_models', { serverUrl }),
     loadModel: (model) => invoke('load_model', { model }),
+    exaSearch: (query, options) => invoke('exa_search', { query, options }),
     getServerUrl: () => invoke('get_server_url'),
     setServerUrl: (url) => invoke('set_server_url', { url }),
 

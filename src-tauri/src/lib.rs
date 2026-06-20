@@ -1094,6 +1094,117 @@ async fn load_model(window: WebviewWindow, state: tauri::State<'_, AppState>, mo
 }
 
 #[tauri::command]
+async fn exa_search(
+    window: WebviewWindow,
+    query: String,
+    options: Option<Value>,
+) -> Result<Value, String> {
+    let api_key = options
+        .as_ref()
+        .and_then(|o| o.get("apiKey"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "Missing Exa API key. Add it in Settings → General.".to_string())?;
+
+    let num_results = options
+        .as_ref()
+        .and_then(|o| o.get("numResults"))
+        .and_then(Value::as_u64)
+        .filter(|&n| (1..=10).contains(&n))
+        .unwrap_or(5);
+
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Err("Empty search query.".to_string());
+    }
+
+    let start = now_ms();
+    dev_log(
+        &window,
+        "request",
+        json!({
+            "endpoint": "https://api.exa.ai/search",
+            "method": "POST",
+            "purpose": "web-search",
+            "query": trimmed,
+            "numResults": num_results
+        }),
+    );
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(45))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let body = json!({
+        "query": trimmed,
+        "type": "auto",
+        "numResults": num_results,
+        "contents": { "highlights": true }
+    });
+
+    let resp = client
+        .post("https://api.exa.ai/search")
+        .header("x-api-key", api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Exa request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        let msg = format!("Exa error {status}: {text}");
+        dev_log(
+            &window,
+            "response",
+            json!({
+                "endpoint": "https://api.exa.ai/search",
+                "durationMs": now_ms().saturating_sub(start),
+                "status": "error",
+                "error": msg
+            }),
+        );
+        return Err(msg);
+    }
+
+    let data: Value = resp.json().await.map_err(|e| e.to_string())?;
+    let results = data
+        .get("results")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| {
+            json!({
+                "title": r.get("title").and_then(Value::as_str).unwrap_or(""),
+                "url": r.get("url").and_then(Value::as_str).unwrap_or(""),
+                "publishedDate": r.get("publishedDate").cloned().unwrap_or(Value::Null),
+                "author": r.get("author").cloned().unwrap_or(Value::Null),
+                "highlights": r.get("highlights").cloned().unwrap_or_else(|| json!([])),
+                "summary": r.get("summary").cloned().unwrap_or(Value::Null)
+            })
+        })
+        .collect::<Vec<_>>();
+
+    dev_log(
+        &window,
+        "response",
+        json!({
+            "endpoint": "https://api.exa.ai/search",
+            "durationMs": now_ms().saturating_sub(start),
+            "resultCount": results.len(),
+            "status": "success"
+        }),
+    );
+
+    Ok(json!({ "results": results }))
+}
+
+#[tauri::command]
 fn get_server_url(state: tauri::State<'_, AppState>) -> Result<String, String> {
     Ok(state.server_url.lock().unwrap().clone())
 }
@@ -1479,6 +1590,7 @@ pub fn run() {
             chat_meta_load,
             get_models,
             load_model,
+            exa_search,
             get_server_url,
             set_server_url,
             shell_open_external,

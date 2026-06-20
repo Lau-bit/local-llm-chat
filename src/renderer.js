@@ -55,6 +55,9 @@ const imageAnalysisBeforeSend = document.getElementById('image-analysis-before-s
 const settingsUseCurrentImageAnalysis = document.getElementById('settings-use-current-image-analysis');
 const settingsIncludeImageAnalysisContext = document.getElementById('settings-include-image-analysis-context');
 const setupChecklist = document.getElementById('setup-checklist');
+const webSearchToggle   = document.getElementById('web-search-toggle');
+const settingsExaKey    = document.getElementById('settings-exa-key');
+const settingsExaResults = document.getElementById('settings-exa-results');
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -82,6 +85,9 @@ let isProgrammaticScroll = false;
 let autoScrollDebounceTimer = null;
 let activeGeneration = null;
 let modelLoadRequestId = 0;
+let webSearchEnabled = localStorage.getItem('webSearchEnabled') === '1';
+let exaApiKey = localStorage.getItem('exaApiKey') || '';
+let exaNumResults = parseInt(localStorage.getItem('exaNumResults') || '5');
 
 const STOP_GRACE_MS = 2500;
 const IMAGE_ANALYSIS_MAX_TOKENS = 8192;
@@ -194,6 +200,41 @@ settingsCtxWindow.addEventListener('change', () => {
   else localStorage.removeItem('contextWindow');
   updateContextBar();
 });
+
+// ── Web search (Exa) ────────────────────────────────────────────────────────────
+
+if (settingsExaKey) settingsExaKey.value = exaApiKey;
+if (settingsExaResults) settingsExaResults.value = exaNumResults;
+
+settingsExaKey?.addEventListener('change', () => {
+  exaApiKey = settingsExaKey.value.trim();
+  localStorage.setItem('exaApiKey', exaApiKey);
+});
+
+settingsExaResults?.addEventListener('change', () => {
+  const val = Math.min(10, Math.max(1, parseInt(settingsExaResults.value) || 5));
+  exaNumResults = val;
+  settingsExaResults.value = val;
+  localStorage.setItem('exaNumResults', val);
+});
+
+function applyWebSearchToggle() {
+  if (!webSearchToggle) return;
+  webSearchToggle.classList.toggle('active', webSearchEnabled);
+  webSearchToggle.setAttribute('aria-pressed', webSearchEnabled ? 'true' : 'false');
+  webSearchToggle.title = `Web search (Exa) — ${webSearchEnabled ? 'on' : 'off'}`;
+}
+
+webSearchToggle?.addEventListener('click', () => {
+  webSearchEnabled = !webSearchEnabled;
+  localStorage.setItem('webSearchEnabled', webSearchEnabled ? '1' : '0');
+  applyWebSearchToggle();
+  if (webSearchEnabled && !exaApiKey) {
+    addMessage('error', 'Web search is on, but no Exa API key is set. Add one in Settings → General.');
+  }
+});
+
+applyWebSearchToggle();
 
 settingsServerConnect.addEventListener('click', () => {
   const url = settingsServerUrl.value.trim();
@@ -1976,6 +2017,92 @@ async function analyzeMissingImagesForTextProjection() {
 
 // ── Sending messages ───────────────────────────────────────────────────────────
 
+// ── Web search execution ─────────────────────────────────────────────────────────
+
+function formatSearchContext(query, results) {
+  const lines = results.map((r, i) => {
+    const parts = [`[${i + 1}] ${r.title || r.url || 'Untitled'}`];
+    if (r.url) parts.push(`URL: ${r.url}`);
+    if (r.publishedDate) parts.push(`Published: ${r.publishedDate}`);
+    const snippets = Array.isArray(r.highlights) ? r.highlights.filter(Boolean) : [];
+    const body = (r.summary || snippets.join(' … ') || '').trim();
+    if (body) parts.push(body);
+    return parts.join('\n');
+  });
+  return `The user has web search enabled. Here are current web search results for the query "${query}". `
+    + `Use them to inform your answer and cite sources as [n] with their URLs when relevant. `
+    + `If they are not useful, rely on your own knowledge.\n\n`
+    + lines.join('\n\n');
+}
+
+function renderSearchSources(query, results) {
+  const div = document.createElement('div');
+  div.className = 'message search-sources';
+
+  const title = document.createElement('div');
+  title.className = 'search-sources-title';
+  title.textContent = `Web results for "${query}"`;
+  div.appendChild(title);
+
+  const list = document.createElement('ol');
+  for (const r of results) {
+    const li = document.createElement('li');
+    if (r.url) {
+      const a = document.createElement('a');
+      a.href = r.url;
+      a.textContent = r.title || r.url;
+      li.appendChild(a);
+    } else {
+      li.textContent = r.title || 'Untitled';
+    }
+    list.appendChild(li);
+  }
+  div.appendChild(list);
+  messagesEl.appendChild(div);
+  return div;
+}
+
+// Guard injected when a search was attempted but produced nothing usable, so the
+// model cannot pretend it searched the web.
+function noSearchResultsGuard(query, reason) {
+  return `Web search was enabled and attempted for the query "${query}", but it ${reason}. `
+    + `You did NOT receive any web search results. Do not claim that you searched the web, `
+    + `and do not cite or invent web sources or URLs. Answer from your own knowledge and note `
+    + `that your information may be out of date.`;
+}
+
+// Returns a context string to inject, or null if no search was attempted
+// (toggle off, empty query, or no API key).
+async function runWebSearch(query) {
+  if (!webSearchEnabled || !query) return null;
+  if (!exaApiKey) {
+    addMessage('error', 'Web search is on, but no Exa API key is set. Add one in Settings → General.');
+    return null;
+  }
+
+  const status = document.createElement('div');
+  status.className = 'message search-sources searching';
+  status.textContent = `Searching the web for "${query}"…`;
+  messagesEl.appendChild(status);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+
+  try {
+    const result = await window.api.exaSearch(query, {
+      apiKey: exaApiKey,
+      numResults: exaNumResults,
+    });
+    status.remove();
+    const results = Array.isArray(result?.results) ? result.results : [];
+    if (results.length === 0) return noSearchResultsGuard(query, 'returned no results');
+    renderSearchSources(query, results);
+    return formatSearchContext(query, results);
+  } catch (err) {
+    status.remove();
+    addMessage('error', `Web search failed: ${err?.message || err}`);
+    return noSearchResultsGuard(query, `failed (${err?.message || err})`);
+  }
+}
+
 async function sendMessage() {
   const text = inputEl.value.trim();
   if ((!text && pendingImages.length === 0) || document.body.classList.contains('streaming')) return;
@@ -2025,10 +2152,18 @@ async function sendMessage() {
     }
   }
 
-  await streamAssistantResponse({ forceImageDescriptionsForLastUser: shouldAnalyzeOutgoingImages });
+  let webSearchContext = null;
+  if (webSearchEnabled && text) {
+    webSearchContext = await runWebSearch(text);
+  }
+
+  await streamAssistantResponse({
+    forceImageDescriptionsForLastUser: shouldAnalyzeOutgoingImages,
+    webSearchContext,
+  });
 }
 
-async function streamAssistantResponse({ forceImageDescriptionsForLastUser = false } = {}) {
+async function streamAssistantResponse({ forceImageDescriptionsForLastUser = false, webSearchContext = null } = {}) {
   const distToBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight;
   if (distToBottom < 350) autoScrollEnabled = true;
   document.body.classList.add('streaming');
@@ -2099,6 +2234,15 @@ async function streamAssistantResponse({ forceImageDescriptionsForLastUser = fal
   };
   const requestHadImages = conversationHistory.some(messageHasImages);
   const apiMessages = buildApiMessagesForModel(conversationHistory, currentModel, { forceImageDescriptionsForLastUser });
+  if (webSearchContext) {
+    // Inject search results as a system message just before the last user turn.
+    let lastUserIdx = -1;
+    for (let i = apiMessages.length - 1; i >= 0; i--) {
+      if (apiMessages[i].role === 'user') { lastUserIdx = i; break; }
+    }
+    const insertAt = lastUserIdx >= 0 ? lastUserIdx : apiMessages.length;
+    apiMessages.splice(insertAt, 0, { role: 'system', content: webSearchContext });
+  }
   const requestSentActualImages = apiMessages.some(messageHasImages);
 
   const result = await window.api.sendMessage(

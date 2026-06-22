@@ -11,6 +11,7 @@ const analysisContainer = document.getElementById('analysis-container');
 const dataAnalysisBtn   = document.getElementById('data-analysis-btn');
 const analysisBackChat  = document.getElementById('analysis-back-chat');
 const analysisSourcePath = document.getElementById('analysis-source-path');
+const analysisSourceTabs = Array.from(document.querySelectorAll('.analysis-source-tab'));
 const analysisImportBtn = document.getElementById('analysis-import-btn');
 const analysisDatasetSelect = document.getElementById('analysis-dataset-select');
 const analysisRefreshBtn = document.getElementById('analysis-refresh-btn');
@@ -127,8 +128,12 @@ let exaApiKey = localStorage.getItem('exaApiKey') || '';
 let exaNumResults = parseInt(localStorage.getItem('exaNumResults') || '5');
 let analysisDatasets = [];
 let analysisRuns = [];
-let activeAnalysisDatasetId = localStorage.getItem('activeAnalysisDatasetId') || '';
-let activeAnalysisRunId = localStorage.getItem('activeAnalysisRunId') || '';
+let activeAnalysisSource = ['anthropic', 'openai'].includes(localStorage.getItem('activeAnalysisSource'))
+  ? localStorage.getItem('activeAnalysisSource')
+  : 'anthropic';
+let activeAnalysisDatasetId = localStorage.getItem(`activeAnalysisDatasetId:${activeAnalysisSource}`) || localStorage.getItem('activeAnalysisDatasetId') || '';
+let activeAnalysisRunId = localStorage.getItem(`activeAnalysisRunId:${activeAnalysisSource}`) || localStorage.getItem('activeAnalysisRunId') || '';
+let analysisBusy = false;
 let analysisStopRequested = false;
 let densityChanged = false;
 let activeAnalysisLogKind = '';
@@ -437,6 +442,68 @@ function initAnalysisProfile() {
   applyAnalysisProfileDefaults(analysisProfile.value, saved !== 'fast');
 }
 
+function analysisStorageKey(name, source = activeAnalysisSource) {
+  return `${name}:${source}`;
+}
+
+function analysisSourceLabel(source = activeAnalysisSource) {
+  return source === 'openai' ? 'OpenAI' : 'Anthropic';
+}
+
+function saveCurrentAnalysisSourceState() {
+  localStorage.setItem('activeAnalysisSource', activeAnalysisSource);
+  localStorage.setItem(analysisStorageKey('activeAnalysisDatasetId'), activeAnalysisDatasetId || '');
+  localStorage.setItem(analysisStorageKey('activeAnalysisRunId'), activeAnalysisRunId || '');
+  if (analysisSourcePath) {
+    localStorage.setItem(analysisStorageKey('analysisSourcePath'), analysisSourcePath.value || '');
+  }
+}
+
+function restoreAnalysisSourceState(source) {
+  activeAnalysisSource = source;
+  activeAnalysisDatasetId = localStorage.getItem(analysisStorageKey('activeAnalysisDatasetId', source)) || '';
+  activeAnalysisRunId = localStorage.getItem(analysisStorageKey('activeAnalysisRunId', source)) || '';
+  if (analysisSourcePath) {
+    analysisSourcePath.value = localStorage.getItem(analysisStorageKey('analysisSourcePath', source)) || '';
+    analysisSourcePath.placeholder = source === 'openai'
+      ? 'Paste ChatGPT conversations.json or HTML export path...'
+      : 'Paste Anthropic / Claude JSON export path...';
+  }
+  localStorage.setItem('activeAnalysisSource', source);
+}
+
+function renderAnalysisSourceTabs() {
+  for (const tab of analysisSourceTabs) {
+    const selected = tab.dataset.source === activeAnalysisSource;
+    tab.classList.toggle('active', selected);
+    tab.setAttribute('aria-selected', selected ? 'true' : 'false');
+    tab.disabled = analysisBusy;
+  }
+}
+
+function setAnalysisBusy(enabled) {
+  analysisBusy = enabled;
+  renderAnalysisSourceTabs();
+}
+
+async function withAnalysisBusy(task) {
+  if (analysisBusy) {
+    analysisLogLine('Data analysis is already processing.', 'warn');
+    return;
+  }
+  setAnalysisBusy(true);
+  try {
+    return await task();
+  } finally {
+    setAnalysisBusy(false);
+  }
+}
+
+function initAnalysisSourceTabs() {
+  restoreAnalysisSourceState(activeAnalysisSource);
+  renderAnalysisSourceTabs();
+}
+
 function currentAnalysisSettings() {
   const profile = analysisProfile?.value || 'fast';
   const density = analysisDensity?.value || (profile === 'quality' ? 'rich' : 'normal');
@@ -473,10 +540,14 @@ function renderAnalysisDatasetSummary(dataset) {
     return;
   }
   const parts = [
+    `source: ${dataset.source_format || dataset.adapter || 'unknown'}`,
     `records: ${dataset.record_count ?? 0}`,
     `chunks: ${dataset.chunk_count ?? 0}`,
     `omitted blocks: ${dataset.omitted_code_blocks ?? 0}`,
   ];
+  if (dataset.conversation_count != null) {
+    parts.splice(1, 0, `conversations: ${dataset.conversation_count}`);
+  }
   if (dataset.time_start || dataset.time_end) {
     parts.push(`${dataset.time_start || '?'} -> ${dataset.time_end || '?'}`);
   }
@@ -485,7 +556,7 @@ function renderAnalysisDatasetSummary(dataset) {
 
 async function loadAnalysisDatasets() {
   if (!window.api?.analysisList) return;
-  analysisDatasets = await window.api.analysisList().catch((err) => {
+  analysisDatasets = await window.api.analysisList(activeAnalysisSource).catch((err) => {
     analysisLogLine(`Failed to list datasets: ${err?.message || err}`, 'error');
     return [];
   });
@@ -502,14 +573,24 @@ async function loadAnalysisDatasets() {
   } else if (analysisDatasets[0]) {
     activeAnalysisDatasetId = analysisDatasets[0].dataset_id;
     analysisDatasetSelect.value = activeAnalysisDatasetId;
+  } else {
+    activeAnalysisDatasetId = '';
   }
-  localStorage.setItem('activeAnalysisDatasetId', activeAnalysisDatasetId || '');
+  localStorage.setItem(analysisStorageKey('activeAnalysisDatasetId'), activeAnalysisDatasetId || '');
   renderAnalysisDatasetSummary(analysisDatasets.find(d => d.dataset_id === activeAnalysisDatasetId));
   await loadAnalysisRuns();
 }
 
 async function loadAnalysisRuns() {
-  if (!activeAnalysisDatasetId || !analysisRunSelect) return;
+  if (!analysisRunSelect) return;
+  if (!activeAnalysisDatasetId) {
+    analysisRuns = [];
+    analysisRunSelect.innerHTML = '';
+    activeAnalysisRunId = '';
+    localStorage.setItem(analysisStorageKey('activeAnalysisRunId'), '');
+    await refreshAnalysisRunProgress();
+    return;
+  }
   analysisRuns = await window.api.analysisListRuns(activeAnalysisDatasetId).catch((err) => {
     analysisLogLine(`Failed to list runs: ${err?.message || err}`, 'error');
     return [];
@@ -529,7 +610,7 @@ async function loadAnalysisRuns() {
   } else {
     activeAnalysisRunId = '';
   }
-  localStorage.setItem('activeAnalysisRunId', activeAnalysisRunId || '');
+  localStorage.setItem(analysisStorageKey('activeAnalysisRunId'), activeAnalysisRunId || '');
   await refreshAnalysisPaths();
   await refreshAnalysisRunProgress();
 }
@@ -2249,21 +2330,43 @@ async function canonizeAnalysisRun(options = {}) {
 }
 
 initAnalysisProfile();
+initAnalysisSourceTabs();
 
 dataAnalysisBtn?.addEventListener('click', () => setAnalysisMode(true));
 analysisBackChat?.addEventListener('click', () => setAnalysisMode(false));
 analysisRefreshBtn?.addEventListener('click', loadAnalysisDatasets);
 analysisRunRefreshBtn?.addEventListener('click', loadAnalysisRuns);
+for (const tab of analysisSourceTabs) {
+  tab.addEventListener('click', async () => {
+    const source = tab.dataset.source;
+    if (!source || source === activeAnalysisSource) return;
+    if (analysisBusy) {
+      analysisLogLine('Finish or stop the current analysis before switching source tabs.', 'warn');
+      return;
+    }
+    saveCurrentAnalysisSourceState();
+    clearAnalysisView('');
+    activeAnalysisPaths = null;
+    restoreAnalysisSourceState(source);
+    renderAnalysisSourceTabs();
+    setAnalysisStatus('Loading', 0);
+    if (analysisProgressText) analysisProgressText.textContent = `Loading ${analysisSourceLabel(source)} data analysis workspace...`;
+    await loadAnalysisDatasets();
+  });
+}
+analysisSourcePath?.addEventListener('input', () => {
+  localStorage.setItem(analysisStorageKey('analysisSourcePath'), analysisSourcePath.value || '');
+});
 analysisDatasetSelect?.addEventListener('change', async () => {
   activeAnalysisDatasetId = analysisDatasetSelect.value;
-  localStorage.setItem('activeAnalysisDatasetId', activeAnalysisDatasetId);
+  localStorage.setItem(analysisStorageKey('activeAnalysisDatasetId'), activeAnalysisDatasetId);
   renderAnalysisDatasetSummary(analysisDatasets.find(d => d.dataset_id === activeAnalysisDatasetId));
   activeAnalysisRunId = '';
   await loadAnalysisRuns();
 });
 analysisRunSelect?.addEventListener('change', async () => {
   activeAnalysisRunId = analysisRunSelect.value;
-  localStorage.setItem('activeAnalysisRunId', activeAnalysisRunId);
+  localStorage.setItem(analysisStorageKey('activeAnalysisRunId'), activeAnalysisRunId);
   await refreshAnalysisPaths();
   await refreshAnalysisRunProgress();
 });
@@ -2285,45 +2388,51 @@ analysisOpenLogBtn?.addEventListener('click', async () => {
   window.api.analysisOpenPath(target).catch((err) => analysisLogLine(`Open log failed: ${err?.message || err}`, 'error'));
 });
 analysisImportBtn?.addEventListener('click', async () => {
-  const path = analysisSourcePath?.value?.trim();
-  if (!path) return analysisLogLine('Paste a JSON file path first.', 'error');
-  setAnalysisStatus('Importing', 0);
-  try {
-    const dataset = await window.api.analysisImport(path);
-    activeAnalysisDatasetId = dataset.dataset_id;
-    localStorage.setItem('activeAnalysisDatasetId', activeAnalysisDatasetId);
-    analysisLogLine(`Imported ${dataset.dataset_id}: ${dataset.record_count} records`);
-    await loadAnalysisDatasets();
-  } catch (err) {
-    analysisLogLine(`Import failed: ${err?.message || err}`, 'error');
-    setAnalysisStatus('Import failed', 0);
-  }
+  await withAnalysisBusy(async () => {
+    const path = analysisSourcePath?.value?.trim();
+    if (!path) return analysisLogLine(`Paste a ${analysisSourceLabel()} export path first.`, 'error');
+    setAnalysisStatus('Importing', 0);
+    try {
+      const dataset = await window.api.analysisImport(path, activeAnalysisSource);
+      activeAnalysisDatasetId = dataset.dataset_id;
+      localStorage.setItem(analysisStorageKey('activeAnalysisDatasetId'), activeAnalysisDatasetId);
+      analysisLogLine(`Imported ${dataset.dataset_id}: ${dataset.record_count} records from ${dataset.source_format || activeAnalysisSource}`);
+      await loadAnalysisDatasets();
+    } catch (err) {
+      analysisLogLine(`Import failed: ${err?.message || err}`, 'error');
+      setAnalysisStatus('Import failed', 0);
+    }
+  });
 });
 analysisChunkBtn?.addEventListener('click', async () => {
-  if (!activeAnalysisDatasetId) return analysisLogLine('Import or select a dataset first.', 'error');
-  const target = currentAnalysisSettings().chunkTargetChars;
-  setAnalysisStatus('Chunking', 0);
-  try {
-    const result = await window.api.analysisBuildChunks(activeAnalysisDatasetId, target);
-    analysisLogLine(`Built ${result.chunk_count} chunks at target ${result.target_chars} chars`);
-    await loadAnalysisDatasets();
-    setAnalysisStatus('Chunks ready', 0);
-  } catch (err) {
-    analysisLogLine(`Chunking failed: ${err?.message || err}`, 'error');
-    setAnalysisStatus('Chunking failed', 0);
-  }
+  await withAnalysisBusy(async () => {
+    if (!activeAnalysisDatasetId) return analysisLogLine('Import or select a dataset first.', 'error');
+    const target = currentAnalysisSettings().chunkTargetChars;
+    setAnalysisStatus('Chunking', 0);
+    try {
+      const result = await window.api.analysisBuildChunks(activeAnalysisDatasetId, target);
+      analysisLogLine(`Built ${result.chunk_count} chunks at target ${result.target_chars} chars`);
+      await loadAnalysisDatasets();
+      setAnalysisStatus('Chunks ready', 0);
+    } catch (err) {
+      analysisLogLine(`Chunking failed: ${err?.message || err}`, 'error');
+      setAnalysisStatus('Chunking failed', 0);
+    }
+  });
 });
 analysisNewRunBtn?.addEventListener('click', async () => {
-  if (!activeAnalysisDatasetId) return analysisLogLine('Select a dataset first.', 'error');
-  try {
-    const run = await window.api.analysisCreateRun(activeAnalysisDatasetId, currentAnalysisSettings());
-    activeAnalysisRunId = run.run_id;
-    localStorage.setItem('activeAnalysisRunId', activeAnalysisRunId);
-    analysisLogLine(`Created ${run.run_id}`);
-    await loadAnalysisRuns();
-  } catch (err) {
-    analysisLogLine(`Run creation failed: ${err?.message || err}`, 'error');
-  }
+  await withAnalysisBusy(async () => {
+    if (!activeAnalysisDatasetId) return analysisLogLine('Select a dataset first.', 'error');
+    try {
+      const run = await window.api.analysisCreateRun(activeAnalysisDatasetId, currentAnalysisSettings());
+      activeAnalysisRunId = run.run_id;
+      localStorage.setItem(analysisStorageKey('activeAnalysisRunId'), activeAnalysisRunId);
+      analysisLogLine(`Created ${run.run_id}`);
+      await loadAnalysisRuns();
+    } catch (err) {
+      analysisLogLine(`Run creation failed: ${err?.message || err}`, 'error');
+    }
+  });
 });
 analysisProfile?.addEventListener('change', () => {
   localStorage.setItem('analysisProfile', analysisProfile.value || 'fast');
@@ -2341,21 +2450,24 @@ analysisDensity?.addEventListener('change', () => {
 });
 analysisMaxTopics?.addEventListener('input', () => { densityChanged = true; });
 analysisProcessBtn?.addEventListener('click', () => {
-  clearAnalysisView('analysis');
-  refreshAnalysisPaths();
-  processAnalysisTopics({ logKind: 'analysis' });
+  withAnalysisBusy(async () => {
+    clearAnalysisView('analysis');
+    await refreshAnalysisPaths();
+    await processAnalysisTopics({ logKind: 'analysis' });
+  });
 });
 analysisTestRunBtn?.addEventListener('click', async () => {
-  clearAnalysisView('test');
-  if (!activeAnalysisDatasetId) {
-    analysisLogLine('Import or select a dataset first.', 'error');
-    return;
-  }
-  if (!currentModel) {
-    analysisLogLine('Select a model before running a test slice.', 'error');
-    return;
-  }
-  try {
+  await withAnalysisBusy(async () => {
+    clearAnalysisView('test');
+    if (!activeAnalysisDatasetId) {
+      analysisLogLine('Import or select a dataset first.', 'error');
+      return;
+    }
+    if (!currentModel) {
+      analysisLogLine('Select a model before running a test slice.', 'error');
+      return;
+    }
+    try {
     analysisStopRequested = false;
     const settings = {
       ...currentAnalysisSettings(),
@@ -2367,7 +2479,7 @@ analysisTestRunBtn?.addEventListener('click', async () => {
     };
     const run = await window.api.analysisCreateRun(activeAnalysisDatasetId, settings);
     activeAnalysisRunId = run.run_id;
-    localStorage.setItem('activeAnalysisRunId', activeAnalysisRunId);
+    localStorage.setItem(analysisStorageKey('activeAnalysisRunId'), activeAnalysisRunId);
     await loadAnalysisRuns();
     await refreshAnalysisPaths();
     activeAnalysisLogKind = 'test';
@@ -2399,10 +2511,11 @@ analysisTestRunBtn?.addEventListener('click', async () => {
         lastPhaseDurationMs: performance.now() - testStartedAt
       });
     }
-  } catch (err) {
-    analysisLogLine(`Test slice failed: ${err?.message || err}`, 'error');
-    setAnalysisStatus('Test failed', 0);
-  }
+    } catch (err) {
+      analysisLogLine(`Test slice failed: ${err?.message || err}`, 'error');
+      setAnalysisStatus('Test failed', 0);
+    }
+  });
 });
 analysisReprocessBtn?.addEventListener('click', () => {
   if (!activeAnalysisDatasetId || !activeAnalysisRunId) {
@@ -2412,28 +2525,32 @@ analysisReprocessBtn?.addEventListener('click', () => {
   showConfirmDialog(
     'Re-process topics for this run? This clears saved topic results, errors, canonization batches, and the exported graph, then starts the topic pass again. This can take a very long time.',
     async () => {
-      try {
-        clearAnalysisView('analysis');
-        analysisStopRequested = false;
-        setAnalysisStatus('Resetting topics', 0);
-        await window.api.analysisResetTopics(activeAnalysisDatasetId, activeAnalysisRunId);
-        if (analysisOutputPath) analysisOutputPath.textContent = '';
-        analysisLogLine('Cleared topic results and dependent canonization outputs.');
-        await loadAnalysisRuns();
-        await refreshAnalysisPaths();
-        await processAnalysisTopics({ logKind: 'analysis' });
-      } catch (err) {
-        analysisLogLine(`Re-process reset failed: ${err?.message || err}`, 'error');
-        setAnalysisStatus('Reset failed', 0);
-      }
+      await withAnalysisBusy(async () => {
+        try {
+          clearAnalysisView('analysis');
+          analysisStopRequested = false;
+          setAnalysisStatus('Resetting topics', 0);
+          await window.api.analysisResetTopics(activeAnalysisDatasetId, activeAnalysisRunId);
+          if (analysisOutputPath) analysisOutputPath.textContent = '';
+          analysisLogLine('Cleared topic results and dependent canonization outputs.');
+          await loadAnalysisRuns();
+          await refreshAnalysisPaths();
+          await processAnalysisTopics({ logKind: 'analysis' });
+        } catch (err) {
+          analysisLogLine(`Re-process reset failed: ${err?.message || err}`, 'error');
+          setAnalysisStatus('Reset failed', 0);
+        }
+      });
     },
     'Re-process'
   );
 });
 analysisCanonizeBtn?.addEventListener('click', () => {
-  clearAnalysisView('analysis');
-  refreshAnalysisPaths();
-  canonizeAnalysisRun({ logKind: 'analysis' });
+  withAnalysisBusy(async () => {
+    clearAnalysisView('analysis');
+    await refreshAnalysisPaths();
+    await canonizeAnalysisRun({ logKind: 'analysis' });
+  });
 });
 analysisRecanonizeBtn?.addEventListener('click', () => {
   if (!activeAnalysisDatasetId || !activeAnalysisRunId) {
@@ -2443,19 +2560,21 @@ analysisRecanonizeBtn?.addEventListener('click', () => {
   showConfirmDialog(
     'Re-canonize all topic results for this run? This clears saved canonization batches and the exported graph, then starts canonization again. This can take a very long time.',
     async () => {
-      try {
-        clearAnalysisView('analysis');
-        analysisStopRequested = false;
-        setAnalysisStatus('Resetting canonization', 0);
-        await window.api.analysisResetCanonization(activeAnalysisDatasetId, activeAnalysisRunId);
-        if (analysisOutputPath) analysisOutputPath.textContent = '';
-        analysisLogLine('Cleared canonization batches and exported graph.');
-        await refreshAnalysisPaths();
-        await canonizeAnalysisRun({ logKind: 'analysis' });
-      } catch (err) {
-        analysisLogLine(`Re-canonize reset failed: ${err?.message || err}`, 'error');
-        setAnalysisStatus('Reset failed', 0);
-      }
+      await withAnalysisBusy(async () => {
+        try {
+          clearAnalysisView('analysis');
+          analysisStopRequested = false;
+          setAnalysisStatus('Resetting canonization', 0);
+          await window.api.analysisResetCanonization(activeAnalysisDatasetId, activeAnalysisRunId);
+          if (analysisOutputPath) analysisOutputPath.textContent = '';
+          analysisLogLine('Cleared canonization batches and exported graph.');
+          await refreshAnalysisPaths();
+          await canonizeAnalysisRun({ logKind: 'analysis' });
+        } catch (err) {
+          analysisLogLine(`Re-canonize reset failed: ${err?.message || err}`, 'error');
+          setAnalysisStatus('Reset failed', 0);
+        }
+      });
     },
     'Re-canonize'
   );

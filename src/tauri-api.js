@@ -64,8 +64,8 @@
     recordChatMeta: (entry) => invoke('chat_meta_record', { entry }),
     loadChatMeta: (chatId) => invoke('chat_meta_load', { chatId }),
 
-    analysisImport: (sourcePath) => invoke('analysis_import', { sourcePath }),
-    analysisList: () => invoke('analysis_list'),
+    analysisImport: (sourcePath, sourceFormat) => invoke('analysis_import', { sourcePath, sourceFormat }),
+    analysisList: (sourceFormat) => invoke('analysis_list', { sourceFormat }),
     analysisBuildChunks: (datasetId, targetChars) => invoke('analysis_build_chunks', { datasetId, targetChars }),
     analysisCreateRun: (datasetId, settings) => invoke('analysis_create_run', { datasetId, settings }),
     analysisListRuns: (datasetId) => invoke('analysis_list_runs', { datasetId }),

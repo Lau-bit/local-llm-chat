@@ -723,8 +723,27 @@ fn sanitize_id_part(value: &str) -> String {
     }
 }
 
+fn source_analysis_dir(app: &AppHandle, source_format: &str) -> PathBuf {
+    analysis_dir(app).join(source_format)
+}
+
+fn source_dataset_dir(app: &AppHandle, source_format: &str, dataset_id: &str) -> PathBuf {
+    source_analysis_dir(app, source_format).join(dataset_id)
+}
+
 fn dataset_dir(app: &AppHandle, dataset_id: &str) -> PathBuf {
-    analysis_dir(app).join(dataset_id)
+    let root = analysis_dir(app);
+    let flat = root.join(dataset_id);
+    if flat.exists() {
+        return flat;
+    }
+    for source in ["anthropic", "openai"] {
+        let path = root.join(source).join(dataset_id);
+        if path.exists() {
+            return path;
+        }
+    }
+    flat
 }
 
 fn run_dir(app: &AppHandle, dataset_id: &str, run_id: &str) -> PathBuf {
@@ -833,6 +852,216 @@ fn push_record(
     }));
 }
 
+fn format_openai_timestamp(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::Number(n)) => n
+            .as_f64()
+            .map(|v| format!("{v:.3}"))
+            .unwrap_or_else(|| n.to_string()),
+        Some(Value::String(s)) => s.trim().to_string(),
+        _ => String::new(),
+    }
+}
+
+fn openai_content_parts(content: &Value) -> Vec<String> {
+    let content_type = content
+        .get("content_type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if content_type != "text" && content_type != "multimodal_text" {
+        return Vec::new();
+    }
+
+    content
+        .get("parts")
+        .and_then(Value::as_array)
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| match part {
+                    Value::String(text) if !text.trim().is_empty() => Some(text.clone()),
+                    Value::Object(obj)
+                        if obj.get("content_type").and_then(Value::as_str)
+                            == Some("audio_transcription") =>
+                    {
+                        obj.get("text")
+                            .and_then(Value::as_str)
+                            .filter(|text| !text.trim().is_empty())
+                            .map(|text| format!("[Transcript]: {text}"))
+                    }
+                    Value::Object(obj) => obj
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .filter(|text| !text.trim().is_empty())
+                        .map(str::to_string),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn openai_author_role(message: &serde_json::Map<String, Value>) -> &str {
+    message
+        .get("author")
+        .and_then(Value::as_object)
+        .and_then(|author| author.get("role"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+}
+
+fn push_openai_record(
+    records: &mut Vec<Value>,
+    source_path: &str,
+    conversation: &serde_json::Map<String, Value>,
+    node_id: &str,
+    parent_id: &str,
+    message: &serde_json::Map<String, Value>,
+    text: &str,
+) {
+    let clean = text.trim();
+    if clean.is_empty() {
+        return;
+    }
+
+    let message_id = message
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(node_id);
+    let role = openai_author_role(message);
+    let created_at = format_openai_timestamp(message.get("create_time"));
+    let conversation_id = conversation
+        .get("conversation_id")
+        .or_else(|| conversation.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let title = conversation
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let record_key = format!("{conversation_id}:{message_id}:{created_at}:{clean}");
+    let (analysis_text, omitted_blocks, omitted_chars) = omit_code_blocks_for_analysis(clean);
+
+    records.push(json!({
+        "record_id": format!("rec_{}", stable_hash(&record_key)),
+        "source_message_uuid": message_id,
+        "sender": role,
+        "created_at": created_at,
+        "updated_at": format_openai_timestamp(conversation.get("update_time")),
+        "start_timestamp": created_at,
+        "stop_timestamp": "",
+        "parent_message_uuid": parent_id,
+        "source_path": source_path,
+        "conversation_id": conversation_id,
+        "conversation_title": title,
+        "content_index": 0,
+        "text": clean,
+        "analysis_text": analysis_text,
+        "omitted_code_blocks": omitted_blocks,
+        "omitted_code_chars": omitted_chars
+    }));
+}
+
+fn extract_openai_conversation_records(
+    conversation: &serde_json::Map<String, Value>,
+    source_path: &str,
+    records: &mut Vec<Value>,
+) -> usize {
+    let Some(mapping) = conversation.get("mapping").and_then(Value::as_object) else {
+        return 0;
+    };
+    let mut current = conversation
+        .get("current_node")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if current.is_empty() {
+        return 0;
+    }
+
+    let mut path = Vec::<(String, Value)>::new();
+    let mut seen = BTreeSet::<String>::new();
+    while !current.is_empty() && seen.insert(current.clone()) {
+        let Some(node) = mapping.get(&current).cloned() else {
+            break;
+        };
+        let parent = node
+            .get("parent")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        path.push((current, node));
+        current = parent;
+    }
+
+    path.reverse();
+    let before = records.len();
+    for (node_id, node) in path {
+        let Some(node_obj) = node.as_object() else {
+            continue;
+        };
+        let Some(message) = node_obj.get("message").and_then(Value::as_object) else {
+            continue;
+        };
+        if message
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .is_empty()
+        {
+            continue;
+        }
+        let role = openai_author_role(message);
+        let is_user_system_message = message
+            .get("metadata")
+            .and_then(Value::as_object)
+            .and_then(|metadata| metadata.get("is_user_system_message"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if role == "system" && !is_user_system_message {
+            continue;
+        }
+        let Some(content) = message.get("content") else {
+            continue;
+        };
+        let text = openai_content_parts(content).join("\n\n");
+        let parent_id = node_obj.get("parent").and_then(Value::as_str).unwrap_or("");
+        push_openai_record(
+            records,
+            source_path,
+            conversation,
+            &node_id,
+            parent_id,
+            message,
+            &text,
+        );
+    }
+    records.len() - before
+}
+
+fn extract_openai_records_from_value(
+    value: &Value,
+    source_path: &str,
+    records: &mut Vec<Value>,
+) -> usize {
+    let before = records.len();
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                if let Some(obj) = item.as_object() {
+                    extract_openai_conversation_records(obj, source_path, records);
+                }
+            }
+        }
+        Value::Object(obj) => {
+            extract_openai_conversation_records(obj, source_path, records);
+        }
+        _ => {}
+    }
+    records.len() - before
+}
+
 fn extract_records_from_value(value: &Value, source_path: &str, records: &mut Vec<Value>) {
     match value {
         Value::Array(items) => {
@@ -893,6 +1122,76 @@ fn extract_records_from_value(value: &Value, source_path: &str, records: &mut Ve
 
 fn analysis_manifest_path(app: &AppHandle, dataset_id: &str) -> PathBuf {
     dataset_dir(app, dataset_id).join("manifest.json")
+}
+
+fn extract_balanced_json(text: &str, start_idx: usize) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let opener = *bytes.get(start_idx)? as char;
+    let closer = match opener {
+        '[' => ']',
+        '{' => '}',
+        _ => return None,
+    };
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (offset, ch) in text[start_idx..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if ch == '"' {
+            in_string = true;
+        } else if ch == opener {
+            depth += 1;
+        } else if ch == closer {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                let end = start_idx + offset + ch.len_utf8();
+                return text.get(start_idx..end);
+            }
+        }
+    }
+    None
+}
+
+fn parse_analysis_source(source_text: &str, source_format: &str) -> Result<Value, String> {
+    match serde_json::from_str::<Value>(source_text) {
+        Ok(value) => Ok(value),
+        Err(json_err) if source_format == "openai" => {
+            let marker = "var jsonData";
+            let marker_idx = source_text
+                .find(marker)
+                .ok_or_else(|| format!("Could not parse JSON: {json_err}"))?;
+            let after_marker = &source_text[marker_idx + marker.len()..];
+            let equals_idx = after_marker.find('=').ok_or_else(|| {
+                "Could not find jsonData assignment in ChatGPT HTML export.".to_string()
+            })?;
+            let json_start = marker_idx
+                + marker.len()
+                + equals_idx
+                + 1
+                + after_marker[equals_idx + 1..]
+                    .find(|ch| ch == '[' || ch == '{')
+                    .ok_or_else(|| {
+                        "Could not find jsonData JSON payload in ChatGPT HTML export.".to_string()
+                    })?;
+            let payload = extract_balanced_json(source_text, json_start).ok_or_else(|| {
+                "Could not read complete jsonData payload from ChatGPT HTML export.".to_string()
+            })?;
+            serde_json::from_str::<Value>(payload)
+                .map_err(|e| format!("Could not parse ChatGPT HTML jsonData payload: {e}"))
+        }
+        Err(err) => Err(format!("Could not parse JSON: {err}")),
+    }
 }
 
 fn chunks_path(app: &AppHandle, dataset_id: &str) -> PathBuf {
@@ -1195,33 +1494,72 @@ fn chat_cancel(state: tauri::State<'_, AppState>) -> Result<Value, String> {
 }
 
 #[tauri::command]
-fn analysis_import(app: AppHandle, source_path: String) -> Result<Value, String> {
+fn analysis_import(
+    app: AppHandle,
+    source_path: String,
+    source_format: String,
+) -> Result<Value, String> {
+    let source_format = source_format.trim().to_ascii_lowercase();
+    if source_format != "anthropic" && source_format != "openai" {
+        return Err(
+            "Choose Anthropic / Claude export or OpenAI / ChatGPT export before importing."
+                .to_string(),
+        );
+    }
     let source = PathBuf::from(source_path.trim().trim_matches('"'));
     if !source.exists() {
         return Err(format!("File not found: {}", source.display()));
     }
     let source_text = fs::read_to_string(&source).map_err(|e| e.to_string())?;
-    let parsed: Value = serde_json::from_str(&source_text)
-        .map_err(|e| format!("Could not parse JSON: {e}"))?;
+    let parsed = parse_analysis_source(&source_text, &source_format)?;
     let source_name = source
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("dataset");
     let dataset_id = format!(
-        "{}_{}",
+        "{}_{}_{}",
+        source_format,
         sanitize_id_part(source_name),
         stable_hash(&format!("{}:{}:{}", source.display(), source_text.len(), now_ms()))
             .chars()
             .take(8)
             .collect::<String>()
     );
-    let root = dataset_dir(&app, &dataset_id);
+    let root = source_dataset_dir(&app, &source_format, &dataset_id);
     ensure_dir(&root.join("source"))?;
     ensure_dir(&root.join("normalized"))?;
-    fs::copy(&source, root.join("source").join("original.json")).map_err(|e| e.to_string())?;
+    let source_ext = source
+        .extension()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("json");
+    fs::copy(
+        &source,
+        root.join("source").join(format!("original.{source_ext}")),
+    )
+    .map_err(|e| e.to_string())?;
 
     let mut records = Vec::new();
-    extract_records_from_value(&parsed, &source.display().to_string(), &mut records);
+    let conversation_count = match &parsed {
+        Value::Array(items) => items.len(),
+        Value::Object(_) => 1,
+        _ => 0,
+    };
+    if source_format == "openai" {
+        extract_openai_records_from_value(&parsed, &source.display().to_string(), &mut records);
+    } else {
+        extract_records_from_value(&parsed, &source.display().to_string(), &mut records);
+    }
+    if records.is_empty() {
+        return Err(format!(
+            "No analyzable records found for {} export.",
+            if source_format == "openai" {
+                "OpenAI / ChatGPT"
+            } else {
+                "Anthropic / Claude"
+            }
+        ));
+    }
     records.sort_by(|a, b| {
         a.get("start_timestamp")
             .and_then(Value::as_str)
@@ -1259,10 +1597,12 @@ fn analysis_import(app: AppHandle, source_path: String) -> Result<Value, String>
         .to_string();
     let manifest = json!({
         "dataset_id": dataset_id,
-        "adapter": "conversation_export_v1",
+        "adapter": if source_format == "openai" { "openai_chatgpt_export_v1" } else { "conversation_export_v1" },
+        "source_format": source_format,
         "schema_version": "0.1.0",
         "source_file": source.display().to_string(),
         "imported_at_ms": now_ms() as u64,
+        "conversation_count": conversation_count,
         "record_count": records.len(),
         "chunk_count": 0,
         "omitted_code_blocks": omitted_blocks,
@@ -1278,21 +1618,52 @@ fn analysis_import(app: AppHandle, source_path: String) -> Result<Value, String>
     Ok(manifest)
 }
 
-#[tauri::command]
-fn analysis_list(app: AppHandle) -> Result<Value, String> {
+fn list_analysis_manifest_paths(app: &AppHandle, source_format: &str) -> Result<Vec<PathBuf>, String> {
     let root = analysis_dir(&app);
     ensure_dir(&root)?;
-    let mut items = Vec::new();
+    let mut paths = BTreeSet::<PathBuf>::new();
+    let source_root = source_analysis_dir(app, source_format);
+    if source_root.exists() {
+        for entry in fs::read_dir(source_root).map_err(|e| e.to_string())?.flatten() {
+            let path = entry.path().join("manifest.json");
+            if path.exists() {
+                paths.insert(path);
+            }
+        }
+    }
     for entry in fs::read_dir(root).map_err(|e| e.to_string())?.flatten() {
         let path = entry.path().join("manifest.json");
         if path.exists() {
-            if let Ok(text) = fs::read_to_string(path) {
-                if let Ok(mut manifest) = serde_json::from_str::<Value>(&text) {
-                    if let Some(id) = manifest.get("dataset_id").and_then(Value::as_str) {
-                        manifest["chunk_count"] = json!(count_jsonl(&chunks_path(&app, id)));
-                    }
-                    items.push(manifest);
+            paths.insert(path);
+        }
+    }
+    Ok(paths.into_iter().collect())
+}
+
+#[tauri::command]
+fn analysis_list(app: AppHandle, source_format: Option<String>) -> Result<Value, String> {
+    let source_format = source_format
+        .unwrap_or_else(|| "anthropic".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    if source_format != "anthropic" && source_format != "openai" {
+        return Err("Unknown analysis source format.".to_string());
+    }
+    let mut items = Vec::new();
+    for path in list_analysis_manifest_paths(&app, &source_format)? {
+        if let Ok(text) = fs::read_to_string(path) {
+            if let Ok(mut manifest) = serde_json::from_str::<Value>(&text) {
+                let manifest_source = manifest
+                    .get("source_format")
+                    .and_then(Value::as_str)
+                    .unwrap_or("anthropic");
+                if manifest_source != source_format {
+                    continue;
                 }
+                if let Some(id) = manifest.get("dataset_id").and_then(Value::as_str) {
+                    manifest["chunk_count"] = json!(count_jsonl(&chunks_path(&app, id)));
+                }
+                items.push(manifest);
             }
         }
     }

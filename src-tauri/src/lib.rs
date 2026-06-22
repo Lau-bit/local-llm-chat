@@ -2,8 +2,9 @@ use base64::{engine::general_purpose, Engine as _};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::{
+    collections::BTreeSet,
     fs,
-    io::Write,
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::Command,
     sync::Mutex,
@@ -73,6 +74,10 @@ fn chats_dir(app: &AppHandle) -> PathBuf {
 
 fn data_dir(app: &AppHandle) -> PathBuf {
     app_root(app).join("data")
+}
+
+fn analysis_dir(app: &AppHandle) -> PathBuf {
+    data_dir(app).join("analysis-projects")
 }
 
 fn chat_meta_dir(app: &AppHandle) -> PathBuf {
@@ -659,6 +664,261 @@ fn dev_log(window: &WebviewWindow, log_type: &str, mut data: Value) {
     let _ = window.emit("dev:log", data);
 }
 
+fn stable_hash(text: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in text.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    radix36(hash)
+}
+
+fn jsonl_append(path: &Path, value: &Value) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    writeln!(file, "{}", serde_json::to_string(value).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())
+}
+
+fn read_jsonl(path: &Path) -> Result<Vec<Value>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let file = fs::File::open(path).map_err(|e| e.to_string())?;
+    let reader = BufReader::new(file);
+    let mut out = Vec::new();
+    for line in reader.lines() {
+        let line = line.map_err(|e| e.to_string())?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        out.push(serde_json::from_str::<Value>(trimmed).map_err(|e| e.to_string())?);
+    }
+    Ok(out)
+}
+
+fn sanitize_id_part(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if ch == '-' || ch == '_' {
+            out.push(ch);
+        }
+        if out.len() >= 42 {
+            break;
+        }
+    }
+    if out.is_empty() {
+        "dataset".to_string()
+    } else {
+        out
+    }
+}
+
+fn dataset_dir(app: &AppHandle, dataset_id: &str) -> PathBuf {
+    analysis_dir(app).join(dataset_id)
+}
+
+fn run_dir(app: &AppHandle, dataset_id: &str, run_id: &str) -> PathBuf {
+    dataset_dir(app, dataset_id).join("runs").join(run_id)
+}
+
+fn omit_code_blocks_for_analysis(text: &str) -> (String, usize, usize) {
+    let mut out = String::new();
+    let mut in_fence = false;
+    let mut omitted_blocks = 0usize;
+    let mut omitted_chars = 0usize;
+    let mut current_omitted = 0usize;
+
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            if in_fence {
+                omitted_blocks += 1;
+                out.push_str(&format!(
+                    "\n[omitted code/output block: {} chars]\n",
+                    current_omitted
+                ));
+                current_omitted = 0;
+            }
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            current_omitted += line.len() + 1;
+            omitted_chars += line.len() + 1;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+
+    if in_fence {
+        omitted_blocks += 1;
+        out.push_str(&format!(
+            "\n[omitted unterminated code/output block: {} chars]\n",
+            current_omitted
+        ));
+    }
+
+    (out.trim().to_string(), omitted_blocks, omitted_chars)
+}
+
+fn timestamp_from_message(obj: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    obj.get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn push_record(
+    records: &mut Vec<Value>,
+    source_path: &str,
+    obj: &serde_json::Map<String, Value>,
+    content_idx: Option<usize>,
+    text: &str,
+    start_timestamp: Option<String>,
+    stop_timestamp: Option<String>,
+) {
+    let clean = text.trim();
+    if clean.is_empty() {
+        return;
+    }
+
+    let uuid = obj
+        .get("uuid")
+        .or_else(|| obj.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let sender = obj
+        .get("sender")
+        .or_else(|| obj.get("role"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let created_at = timestamp_from_message(obj, "created_at")
+        .or_else(|| timestamp_from_message(obj, "createdAt"))
+        .or_else(|| start_timestamp.clone())
+        .unwrap_or_default();
+    let record_key = format!(
+        "{}:{}:{}:{}",
+        uuid,
+        content_idx.map(|i| i.to_string()).unwrap_or_else(|| "text".into()),
+        created_at,
+        clean
+    );
+    let (analysis_text, omitted_blocks, omitted_chars) = omit_code_blocks_for_analysis(clean);
+
+    records.push(json!({
+        "record_id": format!("rec_{}", stable_hash(&record_key)),
+        "source_message_uuid": uuid,
+        "sender": sender,
+        "created_at": created_at,
+        "updated_at": timestamp_from_message(obj, "updated_at").unwrap_or_default(),
+        "start_timestamp": start_timestamp.unwrap_or_else(|| created_at.clone()),
+        "stop_timestamp": stop_timestamp.unwrap_or_default(),
+        "parent_message_uuid": obj.get("parent_message_uuid").and_then(Value::as_str).unwrap_or(""),
+        "source_path": source_path,
+        "content_index": content_idx,
+        "text": clean,
+        "analysis_text": analysis_text,
+        "omitted_code_blocks": omitted_blocks,
+        "omitted_code_chars": omitted_chars
+    }));
+}
+
+fn extract_records_from_value(value: &Value, source_path: &str, records: &mut Vec<Value>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                extract_records_from_value(item, source_path, records);
+            }
+        }
+        Value::Object(obj) => {
+            let has_message_shape = obj.contains_key("sender")
+                || obj.contains_key("role")
+                || obj.contains_key("uuid")
+                || obj.contains_key("id")
+                || obj.contains_key("content");
+
+            if has_message_shape {
+                if let Some(content) = obj.get("content").and_then(Value::as_array) {
+                    let mut emitted = false;
+                    for (idx, item) in content.iter().enumerate() {
+                        if let Some(text) = item.get("text").and_then(Value::as_str) {
+                            push_record(
+                                records,
+                                source_path,
+                                obj,
+                                Some(idx),
+                                text,
+                                item.get("start_timestamp")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string),
+                                item.get("stop_timestamp")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string),
+                            );
+                            emitted = true;
+                        }
+                    }
+                    if !emitted {
+                        if let Some(text) = obj.get("text").and_then(Value::as_str) {
+                            push_record(records, source_path, obj, None, text, None, None);
+                        }
+                    }
+                } else if let Some(text) = obj.get("text").and_then(Value::as_str) {
+                    push_record(records, source_path, obj, None, text, None, None);
+                }
+            }
+
+            for child in obj.values() {
+                match child {
+                    Value::Array(_) | Value::Object(_) => {
+                        extract_records_from_value(child, source_path, records)
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn analysis_manifest_path(app: &AppHandle, dataset_id: &str) -> PathBuf {
+    dataset_dir(app, dataset_id).join("manifest.json")
+}
+
+fn chunks_path(app: &AppHandle, dataset_id: &str) -> PathBuf {
+    dataset_dir(app, dataset_id).join("normalized").join("chunks.jsonl")
+}
+
+fn records_path(app: &AppHandle, dataset_id: &str) -> PathBuf {
+    dataset_dir(app, dataset_id).join("normalized").join("records.jsonl")
+}
+
+fn count_jsonl(path: &Path) -> usize {
+    read_jsonl(path).map(|v| v.len()).unwrap_or(0)
+}
+
+fn unique_chunk_count(path: &Path) -> usize {
+    read_jsonl(path)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("chunk_id").and_then(Value::as_str).map(str::to_string))
+                .collect::<BTreeSet<_>>()
+                .len()
+        })
+        .unwrap_or(0)
+}
+
 async fn post_stream(
     window: WebviewWindow,
     state: tauri::State<'_, AppState>,
@@ -710,6 +970,14 @@ async fn post_stream(
         .filter(|&n| n > 0)
     {
         body["max_tokens"] = json!(v);
+    }
+    if options
+        .as_ref()
+        .and_then(|o| o.get("responseFormatJson"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        body["response_format"] = json!({ "type": "json_object" });
     }
 
     dev_log(
@@ -924,6 +1192,561 @@ fn chat_cancel(state: tauri::State<'_, AppState>) -> Result<Value, String> {
         let _ = cancel.send(());
     }
     Ok(json!({ "cancelled": true }))
+}
+
+#[tauri::command]
+fn analysis_import(app: AppHandle, source_path: String) -> Result<Value, String> {
+    let source = PathBuf::from(source_path.trim().trim_matches('"'));
+    if !source.exists() {
+        return Err(format!("File not found: {}", source.display()));
+    }
+    let source_text = fs::read_to_string(&source).map_err(|e| e.to_string())?;
+    let parsed: Value = serde_json::from_str(&source_text)
+        .map_err(|e| format!("Could not parse JSON: {e}"))?;
+    let source_name = source
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("dataset");
+    let dataset_id = format!(
+        "{}_{}",
+        sanitize_id_part(source_name),
+        stable_hash(&format!("{}:{}:{}", source.display(), source_text.len(), now_ms()))
+            .chars()
+            .take(8)
+            .collect::<String>()
+    );
+    let root = dataset_dir(&app, &dataset_id);
+    ensure_dir(&root.join("source"))?;
+    ensure_dir(&root.join("normalized"))?;
+    fs::copy(&source, root.join("source").join("original.json")).map_err(|e| e.to_string())?;
+
+    let mut records = Vec::new();
+    extract_records_from_value(&parsed, &source.display().to_string(), &mut records);
+    records.sort_by(|a, b| {
+        a.get("start_timestamp")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .cmp(b.get("start_timestamp").and_then(Value::as_str).unwrap_or(""))
+    });
+
+    let records_file = records_path(&app, &dataset_id);
+    fs::write(&records_file, "").map_err(|e| e.to_string())?;
+    let mut omitted_blocks = 0usize;
+    let mut omitted_chars = 0usize;
+    for record in &records {
+        omitted_blocks += record
+            .get("omitted_code_blocks")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        omitted_chars += record
+            .get("omitted_code_chars")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        jsonl_append(&records_file, record)?;
+    }
+
+    let time_start = records
+        .first()
+        .and_then(|r| r.get("start_timestamp"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let time_end = records
+        .last()
+        .and_then(|r| r.get("stop_timestamp").or_else(|| r.get("start_timestamp")))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let manifest = json!({
+        "dataset_id": dataset_id,
+        "adapter": "conversation_export_v1",
+        "schema_version": "0.1.0",
+        "source_file": source.display().to_string(),
+        "imported_at_ms": now_ms() as u64,
+        "record_count": records.len(),
+        "chunk_count": 0,
+        "omitted_code_blocks": omitted_blocks,
+        "omitted_code_chars": omitted_chars,
+        "time_start": time_start,
+        "time_end": time_end
+    });
+    fs::write(
+        analysis_manifest_path(&app, manifest["dataset_id"].as_str().unwrap()),
+        serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(manifest)
+}
+
+#[tauri::command]
+fn analysis_list(app: AppHandle) -> Result<Value, String> {
+    let root = analysis_dir(&app);
+    ensure_dir(&root)?;
+    let mut items = Vec::new();
+    for entry in fs::read_dir(root).map_err(|e| e.to_string())?.flatten() {
+        let path = entry.path().join("manifest.json");
+        if path.exists() {
+            if let Ok(text) = fs::read_to_string(path) {
+                if let Ok(mut manifest) = serde_json::from_str::<Value>(&text) {
+                    if let Some(id) = manifest.get("dataset_id").and_then(Value::as_str) {
+                        manifest["chunk_count"] = json!(count_jsonl(&chunks_path(&app, id)));
+                    }
+                    items.push(manifest);
+                }
+            }
+        }
+    }
+    items.sort_by(|a, b| {
+        b.get("imported_at_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .cmp(&a.get("imported_at_ms").and_then(Value::as_u64).unwrap_or(0))
+    });
+    Ok(Value::Array(items))
+}
+
+#[tauri::command]
+fn analysis_build_chunks(
+    app: AppHandle,
+    dataset_id: String,
+    target_chars: Option<usize>,
+) -> Result<Value, String> {
+    let target = target_chars.unwrap_or(18_000).clamp(4_000, 80_000);
+    let records = read_jsonl(&records_path(&app, &dataset_id))?;
+    if records.is_empty() {
+        return Err("Dataset has no normalized records.".to_string());
+    }
+
+    let out_path = chunks_path(&app, &dataset_id);
+    fs::write(&out_path, "").map_err(|e| e.to_string())?;
+    let mut chunks = Vec::<Value>::new();
+    let mut current_records = Vec::<String>::new();
+    let mut current_text = String::new();
+    let mut time_start = String::new();
+    let mut time_end = String::new();
+    let mut idx = 0usize;
+
+    let flush = |chunks: &mut Vec<Value>,
+                 out_path: &Path,
+                 idx: &mut usize,
+                 current_records: &mut Vec<String>,
+                 current_text: &mut String,
+                 time_start: &mut String,
+                 time_end: &mut String|
+     -> Result<(), String> {
+        if current_text.trim().is_empty() {
+            return Ok(());
+        }
+        let chunk_id = format!("chunk_{:06}", *idx);
+        let chunk = json!({
+            "chunk_id": chunk_id,
+            "time_start": time_start.as_str(),
+            "time_end": time_end.as_str(),
+            "record_ids": current_records.clone(),
+            "char_count": current_text.len(),
+            "input_hash": stable_hash(current_text.as_str()),
+            "text": current_text.trim()
+        });
+        jsonl_append(out_path, &chunk)?;
+        chunks.push(chunk);
+        *idx += 1;
+        current_records.clear();
+        current_text.clear();
+        time_start.clear();
+        time_end.clear();
+        Ok(())
+    };
+
+    for record in records {
+        let record_id = record
+            .get("record_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let text = record
+            .get("analysis_text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if text.is_empty() {
+            continue;
+        }
+        let sender = record.get("sender").and_then(Value::as_str).unwrap_or("unknown");
+        let ts = record
+            .get("start_timestamp")
+            .and_then(Value::as_str)
+            .or_else(|| record.get("created_at").and_then(Value::as_str))
+            .unwrap_or("");
+        let entry = format!("[{}] {} ({})\n{}\n\n", ts, sender, record_id, text);
+        if !current_text.is_empty() && current_text.len() + entry.len() > target {
+            flush(
+                &mut chunks,
+                &out_path,
+                &mut idx,
+                &mut current_records,
+                &mut current_text,
+                &mut time_start,
+                &mut time_end,
+            )?;
+        }
+        if time_start.is_empty() {
+            time_start = ts.to_string();
+        }
+        time_end = ts.to_string();
+        current_records.push(record_id);
+        current_text.push_str(&entry);
+    }
+
+    flush(
+        &mut chunks,
+        &out_path,
+        &mut idx,
+        &mut current_records,
+        &mut current_text,
+        &mut time_start,
+        &mut time_end,
+    )?;
+
+    let manifest_path = analysis_manifest_path(&app, &dataset_id);
+    if let Ok(text) = fs::read_to_string(&manifest_path) {
+        if let Ok(mut manifest) = serde_json::from_str::<Value>(&text) {
+            manifest["chunk_count"] = json!(chunks.len());
+            manifest["chunk_target_chars"] = json!(target);
+            let _ = fs::write(
+                manifest_path,
+                serde_json::to_string_pretty(&manifest).unwrap_or_default(),
+            );
+        }
+    }
+
+    Ok(json!({ "dataset_id": dataset_id, "chunk_count": chunks.len(), "target_chars": target }))
+}
+
+#[tauri::command]
+fn analysis_create_run(
+    app: AppHandle,
+    dataset_id: String,
+    settings: Option<Value>,
+) -> Result<Value, String> {
+    let chunks = read_jsonl(&chunks_path(&app, &dataset_id))?;
+    if chunks.is_empty() {
+        return Err("Build chunks before creating a run.".to_string());
+    }
+    let run_id = format!("run_{}", radix36(now_ms() as u64));
+    let dir = run_dir(&app, &dataset_id, &run_id);
+    ensure_dir(&dir)?;
+    let manifest = json!({
+        "run_id": run_id,
+        "dataset_id": dataset_id,
+        "pipeline_version": "0.1.0",
+        "created_at_ms": now_ms() as u64,
+        "settings": settings.unwrap_or_else(|| json!({})),
+        "status": "ready",
+        "chunk_count": chunks.len()
+    });
+    fs::write(
+        dir.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    fs::write(dir.join("pass_topic_chunks.jsonl"), "").map_err(|e| e.to_string())?;
+    fs::write(dir.join("errors.jsonl"), "").map_err(|e| e.to_string())?;
+    Ok(manifest)
+}
+
+#[tauri::command]
+fn analysis_list_runs(app: AppHandle, dataset_id: String) -> Result<Value, String> {
+    let root = dataset_dir(&app, &dataset_id).join("runs");
+    ensure_dir(&root)?;
+    let mut runs = Vec::new();
+    for entry in fs::read_dir(root).map_err(|e| e.to_string())?.flatten() {
+        let manifest_path = entry.path().join("manifest.json");
+        if let Ok(text) = fs::read_to_string(&manifest_path) {
+            if let Ok(mut manifest) = serde_json::from_str::<Value>(&text) {
+                let run_id = manifest
+                    .get("run_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let result_count = unique_chunk_count(
+                    &run_dir(&app, &dataset_id, &run_id).join("pass_topic_chunks.jsonl"),
+                );
+                manifest["processed_count"] = json!(result_count);
+                runs.push(manifest);
+            }
+        }
+    }
+    runs.sort_by(|a, b| {
+        b.get("created_at_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .cmp(&a.get("created_at_ms").and_then(Value::as_u64).unwrap_or(0))
+    });
+    Ok(Value::Array(runs))
+}
+
+#[tauri::command]
+fn analysis_run_state(app: AppHandle, dataset_id: String, run_id: String) -> Result<Value, String> {
+    let chunks = read_jsonl(&chunks_path(&app, &dataset_id))?;
+    let results = read_jsonl(&run_dir(&app, &dataset_id, &run_id).join("pass_topic_chunks.jsonl"))?;
+    let done_set: BTreeSet<String> = results
+        .iter()
+        .filter_map(|r| r.get("chunk_id").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    let done_ids: Vec<Value> = done_set.iter().cloned().map(Value::String).collect();
+    Ok(json!({
+        "dataset_id": dataset_id,
+        "run_id": run_id,
+        "chunk_count": chunks.len(),
+        "processed_count": done_ids.len(),
+        "result_line_count": results.len(),
+        "done_chunk_ids": done_ids,
+        "chunks": chunks
+    }))
+}
+
+#[tauri::command]
+fn analysis_save_topic_result(
+    app: AppHandle,
+    dataset_id: String,
+    run_id: String,
+    result: Value,
+) -> Result<Value, String> {
+    let path = run_dir(&app, &dataset_id, &run_id).join("pass_topic_chunks.jsonl");
+    jsonl_append(&path, &result)?;
+    Ok(json!({ "ok": true }))
+}
+
+#[tauri::command]
+fn analysis_save_error(
+    app: AppHandle,
+    dataset_id: String,
+    run_id: String,
+    error: Value,
+) -> Result<Value, String> {
+    let path = run_dir(&app, &dataset_id, &run_id).join("errors.jsonl");
+    jsonl_append(&path, &error)?;
+    Ok(json!({ "ok": true }))
+}
+
+#[tauri::command]
+fn analysis_load_topic_results(
+    app: AppHandle,
+    dataset_id: String,
+    run_id: String,
+) -> Result<Value, String> {
+    Ok(Value::Array(read_jsonl(
+        &run_dir(&app, &dataset_id, &run_id).join("pass_topic_chunks.jsonl"),
+    )?))
+}
+
+#[tauri::command]
+fn analysis_save_canon_batch(
+    app: AppHandle,
+    dataset_id: String,
+    run_id: String,
+    batch_id: String,
+    graph: Value,
+) -> Result<Value, String> {
+    let dir = run_dir(&app, &dataset_id, &run_id).join("canonization");
+    ensure_dir(&dir)?;
+    let safe_batch = sanitize_id_part(&batch_id);
+    let path = dir.join(format!("{safe_batch}.json"));
+    fs::write(
+        &path,
+        serde_json::to_string_pretty(&graph).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(json!({ "ok": true, "path": path.display().to_string() }))
+}
+
+#[tauri::command]
+fn analysis_list_canon_batches(
+    app: AppHandle,
+    dataset_id: String,
+    run_id: String,
+) -> Result<Value, String> {
+    let dir = run_dir(&app, &dataset_id, &run_id).join("canonization");
+    ensure_dir(&dir)?;
+    let mut items = Vec::new();
+    for entry in fs::read_dir(dir).map_err(|e| e.to_string())?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        if let Ok(text) = fs::read_to_string(&path) {
+            if let Ok(mut graph) = serde_json::from_str::<Value>(&text) {
+                graph["_path"] = json!(path.display().to_string());
+                graph["_batch_id"] = json!(
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_string()
+                );
+                items.push(graph);
+            }
+        }
+    }
+    items.sort_by(|a, b| {
+        a.get("_batch_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .cmp(b.get("_batch_id").and_then(Value::as_str).unwrap_or(""))
+    });
+    Ok(Value::Array(items))
+}
+
+#[tauri::command]
+fn analysis_save_graph(
+    app: AppHandle,
+    dataset_id: String,
+    run_id: String,
+    graph: Value,
+) -> Result<Value, String> {
+    let dir = run_dir(&app, &dataset_id, &run_id);
+    ensure_dir(&dir)?;
+    let path = dir.join("output_graph.json");
+    fs::write(
+        &path,
+        serde_json::to_string_pretty(&graph).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(json!({ "ok": true, "path": path.display().to_string() }))
+}
+
+fn run_log_path(app: &AppHandle, dataset_id: &str, run_id: &str, log_kind: &str) -> PathBuf {
+    let safe_kind = sanitize_id_part(log_kind);
+    run_dir(app, dataset_id, run_id)
+        .join("logs")
+        .join(format!("{safe_kind}_{run_id}.txt"))
+}
+
+#[tauri::command]
+fn analysis_append_log(
+    app: AppHandle,
+    dataset_id: String,
+    run_id: String,
+    log_kind: String,
+    line: String,
+) -> Result<Value, String> {
+    let path = run_log_path(&app, &dataset_id, &run_id, &log_kind);
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    let exists = path.exists();
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| e.to_string())?;
+    if !exists {
+        writeln!(
+            file,
+            "Local LLM Chat data analysis log\nkind: {log_kind}\ndataset: {dataset_id}\nrun: {run_id}\ncreated: {}\n",
+            now_ms()
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    writeln!(file, "{line}").map_err(|e| e.to_string())?;
+    Ok(json!({ "ok": true, "path": path.display().to_string() }))
+}
+
+#[tauri::command]
+fn analysis_paths(app: AppHandle, dataset_id: String, run_id: String) -> Result<Value, String> {
+    let dir = run_dir(&app, &dataset_id, &run_id);
+    Ok(json!({
+        "runDir": dir.display().to_string(),
+        "outputGraph": dir.join("output_graph.json").display().to_string(),
+        "canonizationDir": dir.join("canonization").display().to_string(),
+        "logsDir": dir.join("logs").display().to_string(),
+        "analysisLog": run_log_path(&app, &dataset_id, &run_id, "analysis").display().to_string(),
+        "testLog": run_log_path(&app, &dataset_id, &run_id, "test").display().to_string()
+    }))
+}
+
+#[tauri::command]
+fn analysis_open_path(path: String) -> Result<(), String> {
+    let path = PathBuf::from(path.trim().trim_matches('"'));
+    if !path.exists() {
+        return Err(format!("Path not found: {}", path.display()));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let arg = if path.is_file() {
+            format!("/select,{}", path.display())
+        } else {
+            path.display().to_string()
+        };
+        Command::new("explorer")
+            .arg(arg)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(if path.is_file() {
+                path.parent().unwrap_or(&path)
+            } else {
+                &path
+            })
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Command::new("xdg-open")
+            .arg(if path.is_file() {
+                path.parent().unwrap_or(&path)
+            } else {
+                &path
+            })
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn analysis_reset_topics(app: AppHandle, dataset_id: String, run_id: String) -> Result<Value, String> {
+    let dir = run_dir(&app, &dataset_id, &run_id);
+    ensure_dir(&dir)?;
+    fs::write(dir.join("pass_topic_chunks.jsonl"), "").map_err(|e| e.to_string())?;
+    fs::write(dir.join("errors.jsonl"), "").map_err(|e| e.to_string())?;
+    let canon_dir = dir.join("canonization");
+    if canon_dir.exists() {
+        fs::remove_dir_all(&canon_dir).map_err(|e| e.to_string())?;
+    }
+    let graph_path = dir.join("output_graph.json");
+    if graph_path.exists() {
+        fs::remove_file(&graph_path).map_err(|e| e.to_string())?;
+    }
+    Ok(json!({
+        "ok": true,
+        "cleared": ["pass_topic_chunks.jsonl", "errors.jsonl", "canonization", "output_graph.json"]
+    }))
+}
+
+#[tauri::command]
+fn analysis_reset_canonization(
+    app: AppHandle,
+    dataset_id: String,
+    run_id: String,
+) -> Result<Value, String> {
+    let dir = run_dir(&app, &dataset_id, &run_id);
+    ensure_dir(&dir)?;
+    let canon_dir = dir.join("canonization");
+    if canon_dir.exists() {
+        fs::remove_dir_all(&canon_dir).map_err(|e| e.to_string())?;
+    }
+    let graph_path = dir.join("output_graph.json");
+    if graph_path.exists() {
+        fs::remove_file(&graph_path).map_err(|e| e.to_string())?;
+    }
+    Ok(json!({
+        "ok": true,
+        "cleared": ["canonization", "output_graph.json"]
+    }))
 }
 
 fn text_has_vision_hint(value: &str) -> bool {
@@ -1588,6 +2411,23 @@ pub fn run() {
             chat_set_branch_group,
             chat_meta_record,
             chat_meta_load,
+            analysis_import,
+            analysis_list,
+            analysis_build_chunks,
+            analysis_create_run,
+            analysis_list_runs,
+            analysis_run_state,
+            analysis_save_topic_result,
+            analysis_save_error,
+            analysis_load_topic_results,
+            analysis_save_canon_batch,
+            analysis_list_canon_batches,
+            analysis_save_graph,
+            analysis_append_log,
+            analysis_paths,
+            analysis_open_path,
+            analysis_reset_topics,
+            analysis_reset_canonization,
             get_models,
             load_model,
             exa_search,

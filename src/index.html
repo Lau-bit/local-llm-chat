@@ -38,6 +38,7 @@
       <div id="sidebar-area">
         <aside id="sidebar">
           <button id="new-chat-btn">+ New Chat</button>
+          <button id="data-analysis-btn">Data Analysis</button>
           <div id="chat-list"></div>
           <div id="sidebar-footer">
             <select id="model-select" title="Select model"></select>
@@ -203,6 +204,129 @@
         <div id="messages"></div>
         <button id="scroll-top-btn" title="Scroll to top">▲</button>
         <button id="scroll-bottom-btn" title="Scroll to bottom">▼</button>
+      </div>
+
+      <div id="analysis-container" class="hidden">
+        <div class="analysis-header">
+          <div>
+            <h1>Data Analysis</h1>
+            <p>Import conversation JSON, chunk it, run resumable topic extraction, then canonize concepts into graph JSON.</p>
+          </div>
+          <button id="analysis-back-chat">Chat</button>
+        </div>
+
+        <div class="analysis-grid">
+          <section class="analysis-panel analysis-import-panel">
+            <h2>Dataset</h2>
+            <div class="analysis-path-row">
+              <input id="analysis-source-path" type="text" placeholder="Paste JSON file path..." spellcheck="false">
+              <button id="analysis-import-btn">Import</button>
+            </div>
+            <div class="analysis-actions-row">
+              <select id="analysis-dataset-select"></select>
+              <button id="analysis-refresh-btn">Refresh</button>
+              <button id="analysis-chunk-btn">Build Chunks</button>
+            </div>
+            <div id="analysis-dataset-summary" class="analysis-summary"></div>
+          </section>
+
+          <section class="analysis-panel">
+            <h2>Run</h2>
+            <div class="analysis-settings-grid">
+              <label>
+                Analysis profile
+                <select id="analysis-profile">
+                  <option value="fast" selected>Fast</option>
+                  <option value="quality">Quality</option>
+                </select>
+              </label>
+              <label>
+                Chunk target chars
+                <input id="analysis-chunk-target" type="number" min="4000" max="25000" step="1000" value="25000">
+              </label>
+              <label>
+                Max topics per chunk
+                <input id="analysis-max-topics" type="number" min="3" max="50" step="1" value="40">
+              </label>
+              <label>
+                LLM call max chars
+                <input id="analysis-call-char-limit" type="number" min="20000" max="30000" step="1000" value="30000">
+              </label>
+              <label>
+                Topic density
+                <select id="analysis-density">
+                  <option value="rich">Rich</option>
+                  <option value="normal" selected>Normal</option>
+                  <option value="sparse">Sparse</option>
+                </select>
+              </label>
+              <label>
+                Temperature
+                <input id="analysis-temp" type="number" min="0" max="2" step="0.05" value="0.2">
+              </label>
+            </div>
+            <div class="analysis-actions-row">
+              <button id="analysis-new-run-btn">New Run</button>
+              <select id="analysis-run-select"></select>
+              <button id="analysis-run-refresh-btn">Load Run</button>
+            </div>
+            <div class="analysis-actions-row">
+              <button id="analysis-process-btn">Process Topics</button>
+              <button id="analysis-reprocess-btn" class="analysis-danger-btn">Re-process Topics</button>
+              <button id="analysis-canonize-btn">Canonize + Export</button>
+              <button id="analysis-recanonize-btn" class="analysis-danger-btn">Re-canonize All</button>
+              <button id="analysis-stop-btn">Stop</button>
+            </div>
+          </section>
+        </div>
+
+        <section class="analysis-panel analysis-test-panel">
+          <div class="analysis-test-header">
+            <h2>Test Slice</h2>
+            <button id="analysis-test-run-btn">Run Test Slice</button>
+          </div>
+          <div class="analysis-settings-grid">
+            <label>
+              Slice mode
+              <select id="analysis-test-mode">
+                <option value="random" selected>Random chunks</option>
+                <option value="first">First chunks</option>
+                <option value="around">Around chunk</option>
+              </select>
+            </label>
+            <label>
+              Chunk count
+              <input id="analysis-test-count" type="number" min="1" max="30" step="1" value="5">
+            </label>
+            <label>
+              Start / center chunk
+              <input id="analysis-test-start" type="number" min="0" step="1" value="0">
+            </label>
+          </div>
+          <div class="analysis-summary">Creates a temporary run, processes only the selected slice, then canonizes it for fast prompt iteration.</div>
+        </section>
+
+        <section class="analysis-panel analysis-progress-panel">
+          <div class="analysis-progress-top">
+            <h2>Progress</h2>
+            <span id="analysis-status-pill">Idle</span>
+          </div>
+          <div class="analysis-progress-bar"><div id="analysis-progress-fill"></div></div>
+          <div id="analysis-progress-text">No dataset loaded.</div>
+          <div id="analysis-metrics"></div>
+          <div id="analysis-output-path"></div>
+          <div class="analysis-actions-row analysis-open-row">
+            <button id="analysis-open-output-btn">Open Output</button>
+            <button id="analysis-open-run-folder-btn">Open Run Folder</button>
+            <button id="analysis-open-log-btn">Open Log</button>
+          </div>
+          <div id="analysis-results"></div>
+        </section>
+
+        <section class="analysis-panel analysis-log-panel">
+          <h2>Log</h2>
+          <div id="analysis-log"></div>
+        </section>
       </div>
     </div>
 

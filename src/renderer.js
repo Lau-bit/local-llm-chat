@@ -7,6 +7,43 @@ function renderMarkdown(text) {
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 
 const messagesEl        = document.getElementById('messages');
+const analysisContainer = document.getElementById('analysis-container');
+const dataAnalysisBtn   = document.getElementById('data-analysis-btn');
+const analysisBackChat  = document.getElementById('analysis-back-chat');
+const analysisSourcePath = document.getElementById('analysis-source-path');
+const analysisImportBtn = document.getElementById('analysis-import-btn');
+const analysisDatasetSelect = document.getElementById('analysis-dataset-select');
+const analysisRefreshBtn = document.getElementById('analysis-refresh-btn');
+const analysisChunkBtn = document.getElementById('analysis-chunk-btn');
+const analysisDatasetSummary = document.getElementById('analysis-dataset-summary');
+const analysisChunkTarget = document.getElementById('analysis-chunk-target');
+const analysisMaxTopics = document.getElementById('analysis-max-topics');
+const analysisCallCharLimit = document.getElementById('analysis-call-char-limit');
+const analysisDensity = document.getElementById('analysis-density');
+const analysisProfile = document.getElementById('analysis-profile');
+const analysisTemp = document.getElementById('analysis-temp');
+const analysisNewRunBtn = document.getElementById('analysis-new-run-btn');
+const analysisRunSelect = document.getElementById('analysis-run-select');
+const analysisRunRefreshBtn = document.getElementById('analysis-run-refresh-btn');
+const analysisProcessBtn = document.getElementById('analysis-process-btn');
+const analysisReprocessBtn = document.getElementById('analysis-reprocess-btn');
+const analysisCanonizeBtn = document.getElementById('analysis-canonize-btn');
+const analysisRecanonizeBtn = document.getElementById('analysis-recanonize-btn');
+const analysisStopBtn = document.getElementById('analysis-stop-btn');
+const analysisTestRunBtn = document.getElementById('analysis-test-run-btn');
+const analysisTestMode = document.getElementById('analysis-test-mode');
+const analysisTestCount = document.getElementById('analysis-test-count');
+const analysisTestStart = document.getElementById('analysis-test-start');
+const analysisStatusPill = document.getElementById('analysis-status-pill');
+const analysisProgressFill = document.getElementById('analysis-progress-fill');
+const analysisProgressText = document.getElementById('analysis-progress-text');
+const analysisMetrics = document.getElementById('analysis-metrics');
+const analysisOutputPath = document.getElementById('analysis-output-path');
+const analysisOpenOutputBtn = document.getElementById('analysis-open-output-btn');
+const analysisOpenRunFolderBtn = document.getElementById('analysis-open-run-folder-btn');
+const analysisOpenLogBtn = document.getElementById('analysis-open-log-btn');
+const analysisResults = document.getElementById('analysis-results');
+const analysisLog = document.getElementById('analysis-log');
 const inputEl           = document.getElementById('message-input');
 const sendBtn           = document.getElementById('send-btn');
 const chatListEl        = document.getElementById('chat-list');
@@ -88,6 +125,15 @@ let modelLoadRequestId = 0;
 let webSearchEnabled = localStorage.getItem('webSearchEnabled') === '1';
 let exaApiKey = localStorage.getItem('exaApiKey') || '';
 let exaNumResults = parseInt(localStorage.getItem('exaNumResults') || '5');
+let analysisDatasets = [];
+let analysisRuns = [];
+let activeAnalysisDatasetId = localStorage.getItem('activeAnalysisDatasetId') || '';
+let activeAnalysisRunId = localStorage.getItem('activeAnalysisRunId') || '';
+let analysisStopRequested = false;
+let densityChanged = false;
+let activeAnalysisLogKind = '';
+let activeAnalysisPaths = null;
+const analysisJsonModeRejectedKeys = new Set();
 
 const STOP_GRACE_MS = 2500;
 const IMAGE_ANALYSIS_MAX_TOKENS = 8192;
@@ -236,6 +282,2189 @@ webSearchToggle?.addEventListener('click', () => {
 
 applyWebSearchToggle();
 
+// ── Data analysis mode ─────────────────────────────────────────────────────────
+
+function setAnalysisMode(enabled) {
+  analysisContainer?.classList.toggle('hidden', !enabled);
+  document.body.classList.toggle('analysis-mode', enabled);
+  if (enabled) {
+    try {
+      closeSettings();
+    } catch (err) {
+      console.error('Failed to close settings before analysis mode:', err);
+    }
+    setAnalysisStatus('Loading', 0);
+    if (analysisProgressText) analysisProgressText.textContent = 'Loading data analysis workspace...';
+    Promise.resolve(loadAnalysisDatasets()).catch((err) => {
+      console.error('Failed to load analysis datasets:', err);
+      analysisLogLine(`Failed to load datasets: ${err?.message || err}`, 'error');
+      setAnalysisStatus('Load failed', 0);
+      if (analysisProgressText) analysisProgressText.textContent = 'Data analysis opened, but dataset loading failed.';
+    });
+  }
+}
+
+function analysisLogLine(text, type = 'info') {
+  const line = `[${new Date().toLocaleTimeString()}] ${text}`;
+  if (analysisLog) {
+    const row = document.createElement('div');
+    row.className = `analysis-log-row ${type}`;
+    row.textContent = line;
+    analysisLog.appendChild(row);
+    analysisLog.scrollTop = analysisLog.scrollHeight;
+  }
+  if (activeAnalysisDatasetId && activeAnalysisRunId && activeAnalysisLogKind) {
+    window.api.analysisAppendLog(activeAnalysisDatasetId, activeAnalysisRunId, activeAnalysisLogKind, line)
+      .then((res) => {
+        if (!activeAnalysisPaths) activeAnalysisPaths = {};
+        activeAnalysisPaths[activeAnalysisLogKind === 'test' ? 'testLog' : 'analysisLog'] = res.path;
+      })
+      .catch(() => {});
+  }
+}
+
+async function refreshAnalysisPaths() {
+  if (!activeAnalysisDatasetId || !activeAnalysisRunId) return null;
+  activeAnalysisPaths = await window.api.analysisPaths(activeAnalysisDatasetId, activeAnalysisRunId).catch(() => null);
+  return activeAnalysisPaths;
+}
+
+function clearAnalysisView(logKind = '') {
+  if (analysisLog) analysisLog.innerHTML = '';
+  if (analysisResults) analysisResults.innerHTML = '';
+  if (analysisMetrics) analysisMetrics.innerHTML = '';
+  if (analysisOutputPath) analysisOutputPath.textContent = '';
+  activeAnalysisLogKind = logKind;
+}
+
+function analysisResultLine(title, details = []) {
+  if (!analysisResults) return;
+  const row = document.createElement('div');
+  row.className = 'analysis-result-row';
+  const heading = document.createElement('strong');
+  heading.textContent = title;
+  row.appendChild(heading);
+  for (const detail of details.filter(Boolean)) {
+    const span = document.createElement('span');
+    span.textContent = detail;
+    row.appendChild(span);
+  }
+  analysisResults.appendChild(row);
+}
+
+function setAnalysisStatus(text, pct = null) {
+  if (analysisStatusPill) analysisStatusPill.textContent = text;
+  if (analysisProgressFill && pct !== null) {
+    analysisProgressFill.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+  }
+}
+
+function compactNumber(value) {
+  const n = Number(value) || 0;
+  if (Math.abs(n) >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (Math.abs(n) >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return `${Math.round(n)}`;
+}
+
+function formatDuration(ms) {
+  const total = Math.max(0, Math.round((Number(ms) || 0) / 1000));
+  const min = Math.floor(total / 60);
+  const sec = total % 60;
+  return min ? `${min}m ${sec}s` : `${sec}s`;
+}
+
+function estimatedTokenCount(chars) {
+  return Math.ceil((Number(chars) || 0) / 3.5);
+}
+
+function chunkCharCount(chunk) {
+  return Number(chunk?.char_count || chunk?.text?.length || 0);
+}
+
+function totalChunkChars(chunks) {
+  return (chunks || []).reduce((sum, chunk) => sum + chunkCharCount(chunk), 0);
+}
+
+function updateAnalysisMetrics(metrics = {}) {
+  if (!analysisMetrics) return;
+  const rows = [];
+  if (metrics.coverage) {
+    rows.push(['Selected chunks', `${metrics.coverage.selectedChunks}/${metrics.coverage.totalChunks} (${metrics.coverage.chunkPct.toFixed(2)}%)`]);
+    rows.push(['Selected chars', `${compactNumber(metrics.coverage.selectedChars)}/${compactNumber(metrics.coverage.totalChars)} (${metrics.coverage.charPct.toFixed(2)}%)`]);
+    rows.push(['Full corpus scale', `~${metrics.coverage.multiplier.toFixed(1)}x selected chars`]);
+  }
+  if (metrics.item) rows.push(['Current item', metrics.item]);
+  if (metrics.sourceCharCount != null) rows.push(['Source chars', compactNumber(metrics.sourceCharCount)]);
+  if (metrics.promptCharCount != null) rows.push(['Prompt', `${compactNumber(metrics.promptCharCount)} chars (~${compactNumber(metrics.estimatedPromptTokens)} tok)`]);
+  if (metrics.responseCharCount != null) rows.push(['Response', `${compactNumber(metrics.responseCharCount)} chars (~${compactNumber(metrics.estimatedResponseTokens)} tok)`]);
+  if (metrics.durationMs != null) rows.push(['Duration', formatDuration(metrics.durationMs)]);
+  if (metrics.phaseElapsedMs != null) rows.push(['Phase elapsed', formatDuration(metrics.phaseElapsedMs)]);
+  if (metrics.totalElapsedMs != null) rows.push(['Total elapsed', formatDuration(metrics.totalElapsedMs)]);
+  if (metrics.lastPhaseName && metrics.lastPhaseDurationMs != null) rows.push([`${metrics.lastPhaseName} duration`, formatDuration(metrics.lastPhaseDurationMs)]);
+  if (metrics.elapsedMs != null && metrics.coverage?.charPct > 0) {
+    rows.push(['Projected full stage', formatDuration(metrics.elapsedMs / (metrics.coverage.charPct / 100))]);
+  }
+  analysisMetrics.innerHTML = rows.map(([label, value]) => (
+    `<div><span>${label}</span><strong>${value}</strong></div>`
+  )).join('');
+}
+
+function startAnalysisMetricsTicker(getMetrics) {
+  const timer = window.setInterval(() => updateAnalysisMetrics(getMetrics()), 1000);
+  return () => window.clearInterval(timer);
+}
+
+const ANALYSIS_PROFILE_DEFAULTS = {
+  fast: { chunkTargetChars: '25000', maxTopics: '40', callCharLimit: '30000', density: 'normal', temperature: '0.15' },
+  quality: { chunkTargetChars: '18000', maxTopics: '24', callCharLimit: '24000', density: 'rich', temperature: '0.2' }
+};
+
+function applyAnalysisProfileDefaults(profile, force = false) {
+  const defaults = ANALYSIS_PROFILE_DEFAULTS[profile] || ANALYSIS_PROFILE_DEFAULTS.fast;
+  if (analysisChunkTarget && (force || !analysisChunkTarget.value)) analysisChunkTarget.value = defaults.chunkTargetChars;
+  if (analysisMaxTopics && (force || !analysisMaxTopics.value)) analysisMaxTopics.value = defaults.maxTopics;
+  if (analysisCallCharLimit && (force || !analysisCallCharLimit.value)) analysisCallCharLimit.value = defaults.callCharLimit;
+  if (analysisDensity && (force || !analysisDensity.value)) analysisDensity.value = defaults.density;
+  if (analysisTemp && (force || !analysisTemp.value)) analysisTemp.value = defaults.temperature;
+  if (force) densityChanged = false;
+}
+
+function initAnalysisProfile() {
+  if (!analysisProfile) return;
+  const saved = localStorage.getItem('analysisProfile') || 'fast';
+  analysisProfile.value = ANALYSIS_PROFILE_DEFAULTS[saved] ? saved : 'fast';
+  localStorage.setItem('analysisProfile', analysisProfile.value);
+  applyAnalysisProfileDefaults(analysisProfile.value, saved !== 'fast');
+}
+
+function currentAnalysisSettings() {
+  const profile = analysisProfile?.value || 'fast';
+  const density = analysisDensity?.value || (profile === 'quality' ? 'rich' : 'normal');
+  const densityDefaults = profile === 'quality'
+    ? { sparse: 10, normal: 18, rich: 30 }
+    : { sparse: 25, normal: 40, rich: 50 };
+  const requestedTopics = parseInt(analysisMaxTopics?.value || `${densityDefaults[density] || 24}`) || densityDefaults[density] || 24;
+  const defaultLimit = Number(ANALYSIS_PROFILE_DEFAULTS[profile]?.callCharLimit || ANALYSIS_PROFILE_DEFAULTS.fast.callCharLimit);
+  const callCharLimit = Math.min(30000, Math.max(20000, parseInt(analysisCallCharLimit?.value || `${defaultLimit}`) || defaultLimit));
+  const chunkDefault = Number(ANALYSIS_PROFILE_DEFAULTS[profile]?.chunkTargetChars || ANALYSIS_PROFILE_DEFAULTS.fast.chunkTargetChars);
+  const maxChunkTarget = Math.max(4000, callCharLimit - 6000);
+  return {
+    model: currentModel || '',
+    analysisProfile: profile,
+    maxTopicsPerChunk: Math.min(50, Math.max(3, requestedTopics)),
+    topicDensity: density,
+    chunkTargetChars: Math.min(25000, maxChunkTarget, Math.max(4000, parseInt(analysisChunkTarget?.value || `${chunkDefault}`) || chunkDefault)),
+    llmCallCharLimit: callCharLimit,
+    temperature: Math.min(2, Math.max(0, parseFloat(analysisTemp?.value || '0.2') || 0.2)),
+    includeCodeBlocks: false,
+    responseFormatJson: profile === 'quality',
+    fastPromptCharBudget: callCharLimit,
+    fastMinPromptCharBudget: 20000,
+    fastMaxTokens: 6144,
+    deterministicCanonization: profile !== 'quality',
+    adapter: 'conversation_export_v1'
+  };
+}
+
+function renderAnalysisDatasetSummary(dataset) {
+  if (!analysisDatasetSummary) return;
+  if (!dataset) {
+    analysisDatasetSummary.textContent = 'No dataset selected.';
+    return;
+  }
+  const parts = [
+    `records: ${dataset.record_count ?? 0}`,
+    `chunks: ${dataset.chunk_count ?? 0}`,
+    `omitted blocks: ${dataset.omitted_code_blocks ?? 0}`,
+  ];
+  if (dataset.time_start || dataset.time_end) {
+    parts.push(`${dataset.time_start || '?'} -> ${dataset.time_end || '?'}`);
+  }
+  analysisDatasetSummary.textContent = parts.join(' | ');
+}
+
+async function loadAnalysisDatasets() {
+  if (!window.api?.analysisList) return;
+  analysisDatasets = await window.api.analysisList().catch((err) => {
+    analysisLogLine(`Failed to list datasets: ${err?.message || err}`, 'error');
+    return [];
+  });
+  if (!analysisDatasetSelect) return;
+  analysisDatasetSelect.innerHTML = '';
+  for (const dataset of analysisDatasets) {
+    const opt = document.createElement('option');
+    opt.value = dataset.dataset_id;
+    opt.textContent = `${dataset.dataset_id} (${dataset.record_count || 0} records)`;
+    analysisDatasetSelect.appendChild(opt);
+  }
+  if (activeAnalysisDatasetId && analysisDatasets.some(d => d.dataset_id === activeAnalysisDatasetId)) {
+    analysisDatasetSelect.value = activeAnalysisDatasetId;
+  } else if (analysisDatasets[0]) {
+    activeAnalysisDatasetId = analysisDatasets[0].dataset_id;
+    analysisDatasetSelect.value = activeAnalysisDatasetId;
+  }
+  localStorage.setItem('activeAnalysisDatasetId', activeAnalysisDatasetId || '');
+  renderAnalysisDatasetSummary(analysisDatasets.find(d => d.dataset_id === activeAnalysisDatasetId));
+  await loadAnalysisRuns();
+}
+
+async function loadAnalysisRuns() {
+  if (!activeAnalysisDatasetId || !analysisRunSelect) return;
+  analysisRuns = await window.api.analysisListRuns(activeAnalysisDatasetId).catch((err) => {
+    analysisLogLine(`Failed to list runs: ${err?.message || err}`, 'error');
+    return [];
+  });
+  analysisRunSelect.innerHTML = '';
+  for (const run of analysisRuns) {
+    const opt = document.createElement('option');
+    opt.value = run.run_id;
+    opt.textContent = `${run.run_id} (${run.processed_count || 0}/${run.chunk_count || 0})`;
+    analysisRunSelect.appendChild(opt);
+  }
+  if (activeAnalysisRunId && analysisRuns.some(r => r.run_id === activeAnalysisRunId)) {
+    analysisRunSelect.value = activeAnalysisRunId;
+  } else if (analysisRuns[0]) {
+    activeAnalysisRunId = analysisRuns[0].run_id;
+    analysisRunSelect.value = activeAnalysisRunId;
+  } else {
+    activeAnalysisRunId = '';
+  }
+  localStorage.setItem('activeAnalysisRunId', activeAnalysisRunId || '');
+  await refreshAnalysisPaths();
+  await refreshAnalysisRunProgress();
+}
+
+async function refreshAnalysisRunProgress() {
+  if (!activeAnalysisDatasetId || !activeAnalysisRunId) {
+    if (analysisProgressText) analysisProgressText.textContent = 'No run selected.';
+    setAnalysisStatus('Idle', 0);
+    return null;
+  }
+  const state = await window.api.analysisRunState(activeAnalysisDatasetId, activeAnalysisRunId).catch((err) => {
+    analysisLogLine(`Failed to load run state: ${err?.message || err}`, 'error');
+    return null;
+  });
+  if (!state) return null;
+  const pct = state.chunk_count ? (state.processed_count / state.chunk_count) * 100 : 0;
+  setAnalysisStatus(state.processed_count >= state.chunk_count ? 'Topic pass done' : 'Ready', pct);
+  if (analysisProgressText) {
+    analysisProgressText.textContent = `${state.processed_count}/${state.chunk_count} chunks processed`;
+  }
+  return state;
+}
+
+function extractJsonObject(text) {
+  const raw = (text || '').trim();
+  if (!raw) throw new Error('empty model response');
+  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = fenced ? fenced[1].trim() : raw;
+  try {
+    return JSON.parse(candidate);
+  } catch (_) {
+    const first = candidate.indexOf('{');
+    const last = candidate.lastIndexOf('}');
+    if (first >= 0 && last > first) return JSON.parse(candidate.slice(first, last + 1));
+    throw new Error('model response was not parseable JSON');
+  }
+}
+
+function messageCharCount(messages) {
+  return (messages || []).reduce((sum, message) => {
+    if (typeof message?.content === 'string') return sum + message.content.length;
+    return sum + JSON.stringify(message?.content || '').length;
+  }, 0);
+}
+
+async function runAnalysisModelDetailed(messages, temperature, analysisOptions = {}) {
+  if (!currentModel) throw new Error('No model selected.');
+  let text = '';
+  const maxTokens = analysisOptions.maxTokens ?? (currentMaxTokens > 0 ? currentMaxTokens : undefined);
+  const jsonModeKey = `${serverUrl}::${currentModel || ''}`;
+  const requestedJsonMode = analysisOptions.responseFormatJson === true;
+  const responseFormatJson = requestedJsonMode && !analysisJsonModeRejectedKeys.has(jsonModeKey);
+  const promptCharCount = messageCharCount(messages);
+  const startedAt = performance.now();
+  const result = await window.api.sendMessage(
+    messages,
+    {
+      model: currentModel,
+      temperature,
+      maxTokens,
+      responseFormatJson,
+    },
+    (chunk) => { text += chunk; }
+  );
+  if (result?.error && responseFormatJson) {
+    analysisJsonModeRejectedKeys.add(jsonModeKey);
+    analysisLogLine('JSON response mode was rejected by this server/model; disabling it for the rest of this app session.', 'warn');
+    return runAnalysisModelDetailed(messages, temperature, { ...analysisOptions, responseFormatJson: false });
+  }
+  if (result?.error) throw new Error(result.error);
+  if (result?.cancelled) throw new Error('cancelled');
+  const finalText = text || result?.content || '';
+  const durationMs = Math.round(performance.now() - startedAt);
+  return {
+    text: finalText,
+    metrics: {
+      model: currentModel || '',
+      prompt_char_count: promptCharCount,
+      response_char_count: finalText.length,
+      estimated_prompt_tokens: estimatedTokenCount(promptCharCount),
+      estimated_response_tokens: estimatedTokenCount(finalText.length),
+      duration_ms: durationMs,
+      max_tokens: maxTokens || null,
+      response_format_json_requested: requestedJsonMode,
+      response_format_json_used: responseFormatJson,
+      created_at: new Date().toISOString()
+    }
+  };
+}
+
+async function runAnalysisModel(messages, temperature, analysisOptions = {}) {
+  const result = await runAnalysisModelDetailed(messages, temperature, analysisOptions);
+  return result.text;
+}
+
+function hashString(value) {
+  let hash = 2166136261;
+  const text = String(value || '');
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function normalizeConceptId(value) {
+  const clean = String(value || 'concept')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 64);
+  return clean || `concept_${hashString(value).slice(0, 6)}`;
+}
+
+function truncateForPrompt(value, max = 420) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+function compactStringArray(values, maxItems = 4, maxChars = 80) {
+  if (!Array.isArray(values)) return [];
+  return values
+    .filter(Boolean)
+    .slice(0, maxItems)
+    .map(v => truncateForPrompt(v, maxChars));
+}
+
+async function parseAnalysisJsonWithRepair(raw, contextLabel, schemaHint) {
+  try {
+    return extractJsonObject(raw);
+  } catch (firstErr) {
+    analysisLogLine(`${contextLabel} returned malformed JSON; attempting repair.`, 'warn');
+    const repairRaw = await runAnalysisModel([
+      {
+        role: 'system',
+        content: 'You repair malformed JSON. Return only valid JSON. Do not add markdown, commentary, or new information.'
+      },
+      {
+        role: 'user',
+        content: `Repair this malformed JSON so it parses cleanly. Preserve the original data and shape as much as possible.
+
+Expected shape:
+${schemaHint}
+
+Parser error:
+${firstErr.message}
+
+Malformed JSON:
+${raw}`
+      }
+    ], 0, { maxTokens: 8192, responseFormatJson: true });
+    try {
+      return extractJsonObject(repairRaw);
+    } catch (repairErr) {
+      const err = new Error(`${contextLabel} JSON parse failed after repair: ${repairErr.message}. Original error: ${firstErr.message}`);
+      err.rawResponse = raw;
+      err.repairResponse = repairRaw;
+      throw err;
+    }
+  }
+}
+
+function topicExtractionPrompt(chunk, settings) {
+  const densityGuide = {
+    sparse: 'Extract only the strongest recurring themes.',
+    normal: 'Extract a balanced set of recurring and specific topics.',
+    rich: 'Extract a rich, high-recall set of distinct topics, subtopics, motifs, project ideas, values, tensions, and user intents.'
+  }[settings.topicDensity || 'rich'];
+  return `You are analyzing a chronological conversation export chunk for a later concept-map app.
+
+Return ONLY valid JSON with this shape:
+{
+  "chunk_id": "${chunk.chunk_id}",
+  "time_start": "${chunk.time_start || ''}",
+  "time_end": "${chunk.time_end || ''}",
+  "topics": [
+    {
+      "label": "short topic label",
+      "summary": "one or two sentence topic summary",
+      "level": "macro | topic | subtopic | motif",
+      "parent_label": "broader parent topic if useful",
+      "aliases": ["similar phrasings"],
+      "subtopics": ["optional subtopic"],
+      "evidence_record_ids": ["record ids from the chunk"],
+      "confidence": 0.0
+    }
+  ],
+  "events": [
+    {
+      "timestamp": "ISO timestamp if available",
+      "summary": "timeline-relevant conceptual event",
+      "record_ids": ["record ids"]
+    }
+  ]
+}
+
+Rules:
+- Discovery mode: ${densityGuide}
+- Extract conceptual/user-intent topics, not every sentence, but prefer specificity over over-compression.
+- Code/output blocks may be omitted; do not reconstruct omitted code.
+- User prompts around code are valuable; generated code bodies are not.
+- Do not merge distinct sibling topics into one parent. A parent can exist, but children should remain separate topics.
+- Include project/app ideas, recurring technical problems, philosophical themes, emotional arcs, political/social concepts, and self-model changes when present.
+- Prefer distinct useful topics over generic grand themes.
+- Max topics: ${settings.maxTopicsPerChunk}.
+
+Chunk text:
+${chunk.text}`;
+}
+
+function fastTopicExtractionPrompt(chunks, settings) {
+  const densityGuide = {
+    sparse: 'Extract only the strongest recurring themes.',
+    normal: 'Extract a compact balanced set of recurring and specific topics.',
+    rich: 'Extract a high-recall set of useful topics, but keep each line short.'
+  }[settings.topicDensity || 'normal'];
+  const includeEvents = settings.analysisProfile === 'fast' && settings.topicDensity === 'rich';
+  const chunkBlocks = chunks.map(chunk => (
+    `CHUNK ${chunk.chunk_id}
+TIME ${chunk.time_start || ''} TO ${chunk.time_end || ''}
+RECORDS ${(chunk.record_ids || []).slice(0, 40).join(',')}
+TEXT
+${chunk.text}
+END CHUNK ${chunk.chunk_id}`
+  )).join('\n\n');
+  return `Analyze these chronological conversation chunks for a later concept-map app.
+
+Return plain text lines only. Do not return JSON. Do not use markdown.
+Use exactly these pipe-delimited formats:
+TOPIC|chunk_id|level|label|parent_label|summary|record_id1,record_id2
+${includeEvents ? 'EVENT|chunk_id|timestamp|summary|record_id1,record_id2' : ''}
+
+Rules:
+- Discovery mode: ${densityGuide}
+- Max TOPIC lines per chunk: ${settings.maxTopicsPerChunk}.
+- Valid levels: macro, topic, subtopic, motif.
+- Keep labels under 6 words.
+- Keep summaries under 12 words.
+- Use record ids from the chunk when visible. If none are clear, leave the last field empty.
+- Do not put the pipe character inside fields.
+- Prefer broad useful coverage over detail. Every chunk should get at least 1 TOPIC line unless it is empty.
+- User prompts around code are valuable; generated code bodies are not.
+${includeEvents ? '- EVENT lines are optional; include only major timeline-relevant events.' : '- Do not output EVENT lines.'}
+
+Chunks:
+${chunkBlocks}`;
+}
+
+function sanitizeFastField(value, max = 300) {
+  return String(value || '')
+    .replace(/\|/g, '/')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, max);
+}
+
+function parseFastRecordIds(value) {
+  return String(value || '')
+    .split(',')
+    .map(v => sanitizeFastField(v, 80))
+    .filter(Boolean)
+    .slice(0, 6);
+}
+
+function blankTopicResultForChunk(chunk) {
+  return {
+    chunk_id: chunk.chunk_id,
+    time_start: chunk.time_start,
+    time_end: chunk.time_end,
+    topics: [],
+    events: []
+  };
+}
+
+function parseFastTopicLines(raw, chunks) {
+  const byChunk = new Map((chunks || []).map(chunk => [chunk.chunk_id, blankTopicResultForChunk(chunk)]));
+  const errors = [];
+  const lines = String(raw || '').split(/\r?\n/);
+  for (const originalLine of lines) {
+    const line = originalLine.trim().replace(/^[\s>*-]*(?:\d+[.)]\s*)?/, '');
+    if (!line) continue;
+    const upper = line.toUpperCase();
+    if (!upper.startsWith('TOPIC|') && !upper.startsWith('EVENT|')) continue;
+    const parts = line.split('|').map(part => part.trim());
+    const kind = parts[0]?.toUpperCase();
+    const chunkId = sanitizeFastField(parts[1], 80);
+    const result = byChunk.get(chunkId);
+    if (!result) {
+      errors.push({ line: originalLine, error: 'unknown_chunk_id' });
+      continue;
+    }
+    if (kind === 'TOPIC') {
+      const label = sanitizeFastField(parts[3], 120);
+      if (!label) {
+        errors.push({ line: originalLine, error: 'missing_topic_label' });
+        continue;
+      }
+      result.topics.push({
+        label,
+        level: sanitizeFastField(parts[2] || 'topic', 24).toLowerCase() || 'topic',
+        parent_label: sanitizeFastField(parts[4], 120),
+        summary: sanitizeFastField(parts[5] || label, 260),
+        aliases: [],
+        subtopics: [],
+        evidence_record_ids: parseFastRecordIds(parts[6]),
+        confidence: 0.65
+      });
+    } else if (kind === 'EVENT') {
+      const summary = sanitizeFastField(parts[3], 260);
+      if (!summary) {
+        errors.push({ line: originalLine, error: 'missing_event_summary' });
+        continue;
+      }
+      result.events.push({
+        timestamp: sanitizeFastField(parts[2], 60),
+        summary,
+        record_ids: parseFastRecordIds(parts[4])
+      });
+    }
+  }
+  return {
+    results: [...byChunk.values()],
+    errors
+  };
+}
+
+function compactTopicResult(r) {
+  return {
+    chunk_id: r.chunk_id,
+    time_start: r.time_start,
+    time_end: r.time_end,
+    topics: (r.topics || []).slice(0, 35).map(t => ({
+      label: truncateForPrompt(t.label, 90),
+      summary: truncateForPrompt(t.summary, 260),
+      level: truncateForPrompt(t.level, 24),
+      parent_label: truncateForPrompt(t.parent_label, 90),
+      aliases: compactStringArray(t.aliases, 3, 70),
+      subtopics: compactStringArray(t.subtopics, 5, 80),
+      evidence_record_ids: compactStringArray(t.evidence_record_ids, 4, 60),
+      confidence: typeof t.confidence === 'number' ? t.confidence : undefined
+    })),
+    events: (r.events || []).slice(0, 10).map(e => ({
+      timestamp: truncateForPrompt(e.timestamp, 40),
+      summary: truncateForPrompt(e.summary, 220),
+      record_ids: compactStringArray(e.record_ids, 3, 60)
+    }))
+  };
+}
+
+function compactGraphFragment(graph) {
+  return {
+    batch_id: graph._batch_id || graph.batch_id || graph.graph_id || '',
+    concepts: (graph.concepts || []).slice(0, 220).map(c => ({
+      concept_id: truncateForPrompt(c.concept_id, 80),
+      canonical_label: truncateForPrompt(c.canonical_label, 100),
+      level: truncateForPrompt(c.level, 24),
+      parent_id: truncateForPrompt(c.parent_id, 80),
+      aliases: compactStringArray(c.aliases, 5, 80),
+      summary: truncateForPrompt(c.summary, 320),
+      subtopics: compactStringArray(c.subtopics, 8, 90),
+      evidence: (c.evidence || []).slice(0, 4).map(ev => ({
+        chunk_id: truncateForPrompt(ev.chunk_id, 40),
+        record_ids: compactStringArray(ev.record_ids, 3, 60)
+      }))
+    })),
+    events: (graph.events || []).slice(0, 180).map(e => ({
+      event_id: truncateForPrompt(e.event_id, 80),
+      timestamp: truncateForPrompt(e.timestamp, 40),
+      concept_ids: compactStringArray(e.concept_ids, 5, 80),
+      summary: truncateForPrompt(e.summary, 240)
+    })),
+    edges: (graph.edges || []).slice(0, 260).map(edge => ({
+      source: truncateForPrompt(edge.source, 80),
+      target: truncateForPrompt(edge.target, 80),
+      relationship: truncateForPrompt(edge.relationship, 40),
+      weight: typeof edge.weight === 'number' ? edge.weight : undefined
+    }))
+  };
+}
+
+function uniqueTopicResults(results) {
+  const byChunk = new Map();
+  for (const result of results || []) {
+    if (!result?.chunk_id) continue;
+    byChunk.set(result.chunk_id, result);
+  }
+  return [...byChunk.values()].sort((a, b) => String(a.chunk_id).localeCompare(String(b.chunk_id)));
+}
+
+function splitByPromptBudget(items, maxChars, stringifyItem) {
+  const batches = [];
+  let current = [];
+  let currentChars = 0;
+  for (const item of items) {
+    const size = stringifyItem(item).length + 2;
+    if (current.length && currentChars + size > maxChars) {
+      batches.push(current);
+      current = [];
+      currentChars = 0;
+    }
+    current.push(item);
+    currentChars += size;
+  }
+  if (current.length) batches.push(current);
+  return batches;
+}
+
+function canonBatchId(kind, index, items, stringifyItem) {
+  const digest = hashString(items.map(stringifyItem).join('\n')).slice(0, 8);
+  return `c4_${kind}_${String(index).padStart(4, '0')}_${digest}`;
+}
+
+function normalizeGraph(graph, fallbackId) {
+  const normalized = graph && typeof graph === 'object' ? graph : {};
+  normalized.schema_version = normalized.schema_version || '0.1.0';
+  normalized.concepts = Array.isArray(normalized.concepts) ? normalized.concepts : [];
+  normalized.events = Array.isArray(normalized.events) ? normalized.events : [];
+  normalized.edges = Array.isArray(normalized.edges) ? normalized.edges : [];
+  normalized.graph_id = normalized.graph_id || fallbackId;
+  return normalized;
+}
+
+function fallbackGraphFromTopicBatch(datasetId, runId, batchId, batch) {
+  const concepts = new Map();
+  const events = [];
+  for (const result of batch.map(compactTopicResult)) {
+    for (const topic of result.topics || []) {
+      const label = topic.label || 'Untitled concept';
+      const conceptId = normalizeConceptId(label);
+      const existing = concepts.get(conceptId) || {
+        concept_id: conceptId,
+        canonical_label: label,
+        level: topic.level || 'topic',
+        parent_id: topic.parent_label ? normalizeConceptId(topic.parent_label) : '',
+        aliases: [],
+        summary: topic.summary || label,
+        subtopics: [],
+        evidence: []
+      };
+      existing.aliases = [...new Set([...existing.aliases, ...(topic.aliases || [])])].slice(0, 5);
+      existing.subtopics = [...new Set([...existing.subtopics, ...(topic.subtopics || [])])].slice(0, 7);
+      if (topic.evidence_record_ids?.length) {
+        existing.evidence.push({
+          chunk_id: result.chunk_id,
+          record_ids: topic.evidence_record_ids.slice(0, 3)
+        });
+        existing.evidence = existing.evidence.slice(0, 3);
+      }
+      concepts.set(conceptId, existing);
+    }
+    for (const event of result.events || []) {
+      events.push({
+        event_id: normalizeConceptId(`${result.chunk_id}_${event.timestamp || events.length}`),
+        timestamp: event.timestamp || result.time_start || '',
+        concept_ids: [],
+        summary: event.summary || ''
+      });
+      if (events.length >= 18) break;
+    }
+  }
+  return {
+    schema_version: '0.1.0',
+    dataset: { id: datasetId, run_id: runId },
+    graph_id: batchId,
+    batch_id: batchId,
+    concepts: [...concepts.values()].slice(0, 80),
+    events: events.slice(0, 100),
+    edges: [],
+    generated_at: new Date().toISOString(),
+    fallback: true,
+    fallback_reason: 'model_json_failed'
+  };
+}
+
+function fallbackGraphFromFragments(datasetId, runId, batchId, fragments) {
+  const concepts = new Map();
+  const events = [];
+  const edges = [];
+  for (const fragment of fragments.map(compactGraphFragment)) {
+    for (const concept of fragment.concepts || []) {
+      const label = concept.canonical_label || concept.concept_id || 'Untitled concept';
+      const conceptId = normalizeConceptId(concept.concept_id || label);
+      const existing = concepts.get(conceptId) || {
+        concept_id: conceptId,
+        canonical_label: label,
+        level: concept.level || 'topic',
+        parent_id: concept.parent_id || '',
+        aliases: [],
+        summary: concept.summary || label,
+        subtopics: [],
+        evidence: []
+      };
+      existing.aliases = [...new Set([...existing.aliases, ...(concept.aliases || [])])].slice(0, 6);
+      existing.subtopics = [...new Set([...existing.subtopics, ...(concept.subtopics || [])])].slice(0, 10);
+      existing.evidence = [...existing.evidence, ...(concept.evidence || [])].slice(0, 5);
+      concepts.set(conceptId, existing);
+    }
+    events.push(...(fragment.events || []));
+    edges.push(...(fragment.edges || []));
+  }
+  return {
+    schema_version: '0.1.0',
+    dataset: { id: datasetId, run_id: runId },
+    graph_id: batchId,
+    batch_id: batchId,
+    concepts: [...concepts.values()].slice(0, 300),
+    events: events.slice(0, 320),
+    edges: edges.slice(0, 360),
+    generated_at: new Date().toISOString(),
+    fallback: true,
+    fallback_reason: 'model_json_failed'
+  };
+}
+
+function aggregateGraphMetrics(graphs) {
+  const metrics = (graphs || []).map(g => g?.metrics).filter(Boolean);
+  return {
+    graph_count: graphs?.length || 0,
+    prompt_char_count: metrics.reduce((sum, m) => sum + (Number(m.prompt_char_count) || 0), 0),
+    response_char_count: metrics.reduce((sum, m) => sum + (Number(m.response_char_count) || 0), 0),
+    estimated_prompt_tokens: metrics.reduce((sum, m) => sum + (Number(m.estimated_prompt_tokens) || 0), 0),
+    estimated_response_tokens: metrics.reduce((sum, m) => sum + (Number(m.estimated_response_tokens) || 0), 0),
+    duration_ms: metrics.reduce((sum, m) => sum + (Number(m.duration_ms) || 0), 0),
+    fallback_count: (graphs || []).filter(g => g?.fallback).length
+  };
+}
+
+function graphSchemaInstruction(datasetId, runId) {
+  return `Return ONLY minified valid JSON. No markdown. No comments. No trailing commas.
+{
+  "schema_version": "0.1.0",
+  "dataset": { "id": "${datasetId}", "run_id": "${runId}" },
+  "graph_id": "short batch or merge id",
+  "concepts": [
+    {
+      "concept_id": "stable_snake_case_id",
+      "canonical_label": "main topic",
+      "level": "macro | topic | subtopic | motif",
+      "parent_id": "optional broader concept_id",
+      "aliases": ["merged similar labels"],
+      "summary": "concept summary",
+      "subtopics": ["clustered subtopics"],
+      "evidence": [{"chunk_id": "...", "record_ids": ["..."]}]
+    }
+  ],
+  "events": [
+    {
+      "event_id": "stable_snake_case_id",
+      "timestamp": "ISO timestamp if available",
+      "concept_ids": ["..."],
+      "summary": "timeline event"
+    }
+  ],
+  "edges": [
+    {
+      "source": "concept_id",
+      "target": "concept_id",
+      "relationship": "supports | contrasts | develops | related",
+      "weight": 0.0
+    }
+  ]
+}`;
+}
+
+function canonizationBatchPrompt(datasetId, runId, batchId, results) {
+  const compact = results.map(compactTopicResult);
+  return `Canonize this batch of chunk-level topic extraction results into graph JSON for a concept-map app.
+
+${graphSchemaInstruction(datasetId, runId)}
+
+Batch id: ${batchId}
+
+Canonization rules:
+- Merge similar/duplicate topics into one canonical concept.
+- Put narrower repeated variations under subtopics.
+- Do not create separate concepts just because labels differ.
+- Preserve distinct sibling topics. A broad parent concept should not replace its children.
+- Use level and parent_id to keep macro/topic/subtopic/motif hierarchy visible.
+- Preserve evidence references.
+- Keep IDs stable, lowercase snake_case, and readable.
+- Prefer compact summaries; this graph will be merged with other batch graphs later.
+- Output caps: max 80 concepts, max 100 events, max 120 edges.
+- Per concept: max 5 aliases, max 7 subtopics, max 3 evidence objects.
+- For small/test batches, preserving 50-100 distinct useful concepts is acceptable when the input supports it.
+- Use short strings. Summaries should usually be one sentence.
+
+Chunk topic results:
+${JSON.stringify(compact)}`;
+}
+
+function canonizationMergePrompt(datasetId, runId, batchId, fragments) {
+  const compact = fragments.map(compactGraphFragment);
+  return `Merge these already-canonized graph fragments into a smaller canonical concept graph.
+
+${graphSchemaInstruction(datasetId, runId)}
+
+Merge id: ${batchId}
+
+Merge rules:
+- Merge concepts that mean the same thing even if labels differ.
+- Preserve useful aliases, subtopics, evidence, and timeline events.
+- Preserve distinct sibling topics; do not collapse a child into a parent unless it is only a duplicate phrasing.
+- Use level and parent_id to keep hierarchy visible.
+- Collapse duplicate or near-duplicate events.
+- Keep edges only when they add useful concept-map structure.
+- Keep concept IDs stable, lowercase snake_case, and readable.
+- Prefer one strong canonical concept over several duplicate phrasings, but keep distinct child concepts.
+- Output caps: max 300 concepts, max 320 events, max 360 edges.
+- Per concept: max 6 aliases, max 10 subtopics, max 5 evidence objects.
+- Use short strings. Do not include long excerpts.
+
+Graph fragments:
+${JSON.stringify(compact)}`;
+}
+
+function selectAnalysisTestChunks(chunks) {
+  const count = Math.min(chunks.length, Math.max(1, parseInt(analysisTestCount?.value || '5') || 5));
+  const mode = analysisTestMode?.value || 'random';
+  const start = Math.max(0, parseInt(analysisTestStart?.value || '0') || 0);
+  if (mode === 'first') return chunks.slice(0, count);
+  if (mode === 'around') {
+    const half = Math.floor(count / 2);
+    const from = Math.max(0, Math.min(chunks.length - count, start - half));
+    return chunks.slice(from, from + count);
+  }
+  const keyed = chunks
+    .map(chunk => ({ chunk, sort: hashString(`${chunk.chunk_id}:${Date.now()}:${Math.random()}`) }))
+    .sort((a, b) => a.sort.localeCompare(b.sort));
+  return keyed.slice(0, count).map(item => item.chunk).sort((a, b) => String(a.chunk_id).localeCompare(String(b.chunk_id)));
+}
+
+function analysisCoverage(selectedChunks, allChunks) {
+  const selectedChars = totalChunkChars(selectedChunks);
+  const totalChars = totalChunkChars(allChunks);
+  const selectedCount = selectedChunks.length;
+  const totalCount = allChunks.length;
+  const chunkPct = totalCount ? (selectedCount / totalCount) * 100 : 0;
+  const charPct = totalChars ? (selectedChars / totalChars) * 100 : 0;
+  return {
+    selectedChunks: selectedCount,
+    totalChunks: totalCount,
+    selectedChars,
+    totalChars,
+    chunkPct,
+    charPct,
+    multiplier: charPct > 0 ? 100 / charPct : 0
+  };
+}
+
+function splitChunksForFastPrompts(chunks, settings) {
+  const maxChars = Math.max(20000, settings.llmCallCharLimit || settings.fastPromptCharBudget || 65000);
+  const batches = [];
+  let current = [];
+  let currentChars = 0;
+  for (const chunk of chunks || []) {
+    const size = chunkCharCount(chunk) + 500;
+    if (current.length && currentChars + size > maxChars) {
+      batches.push(current);
+      current = [];
+      currentChars = 0;
+    }
+    current.push(chunk);
+    currentChars += size;
+  }
+  if (current.length) batches.push(current);
+  return batches;
+}
+
+function splitTextForLimit(text, maxChars) {
+  const raw = String(text || '');
+  if (raw.length <= maxChars) return [raw];
+  const parts = [];
+  let cursor = 0;
+  while (cursor < raw.length) {
+    let end = Math.min(raw.length, cursor + maxChars);
+    if (end < raw.length) {
+      const newline = raw.lastIndexOf('\n\n', end);
+      if (newline > cursor + Math.floor(maxChars * 0.55)) end = newline + 2;
+    }
+    parts.push(raw.slice(cursor, end).trim());
+    cursor = end;
+  }
+  return parts.filter(Boolean);
+}
+
+function prepareFastWorkChunks(chunks, settings) {
+  const limit = settings.llmCallCharLimit || settings.fastPromptCharBudget || 65000;
+  const textBudget = Math.max(8000, limit - 3500);
+  const workChunks = [];
+  const aggregates = new Map();
+  for (const chunk of chunks || []) {
+    const onePromptLength = fastTopicExtractionPrompt([chunk], settings).length + 120;
+    const parts = onePromptLength <= limit
+      ? [String(chunk.text || '')]
+      : splitTextForLimit(chunk.text || '', textBudget);
+    aggregates.set(chunk.chunk_id, {
+      original: chunk,
+      expected: parts.length,
+      received: 0,
+      topics: [],
+      events: [],
+      promptCharCount: 0,
+      responseCharCount: 0,
+      estimatedPromptTokens: 0,
+      estimatedResponseTokens: 0,
+      durationMs: 0,
+      callCount: 0,
+      splitCount: 0
+    });
+    for (let i = 0; i < parts.length; i++) {
+      const partId = parts.length === 1
+        ? chunk.chunk_id
+        : `${chunk.chunk_id}__part_${String(i + 1).padStart(3, '0')}`;
+      workChunks.push({
+        ...chunk,
+        chunk_id: partId,
+        original_chunk_id: chunk.chunk_id,
+        segment_index: i + 1,
+        segment_count: parts.length,
+        char_count: parts[i].length,
+        input_hash: `${chunk.input_hash || hashString(chunk.text || '')}:${i + 1}`,
+        text: parts[i]
+      });
+    }
+  }
+  return { workChunks, aggregates };
+}
+
+function aggregateFastBatchMetrics(items) {
+  const metrics = items.map(item => item?.metrics).filter(Boolean);
+  return {
+    prompt_char_count: metrics.reduce((sum, m) => sum + (Number(m.prompt_char_count) || 0), 0),
+    response_char_count: metrics.reduce((sum, m) => sum + (Number(m.response_char_count) || 0), 0),
+    estimated_prompt_tokens: metrics.reduce((sum, m) => sum + (Number(m.estimated_prompt_tokens) || 0), 0),
+    estimated_response_tokens: metrics.reduce((sum, m) => sum + (Number(m.estimated_response_tokens) || 0), 0),
+    duration_ms: metrics.reduce((sum, m) => sum + (Number(m.duration_ms) || 0), 0),
+    model: currentModel || '',
+    max_tokens: metrics.reduce((max, m) => Math.max(max, Number(m.max_tokens) || 0), 0) || null,
+    response_format_json_requested: false,
+    response_format_json_used: false,
+    created_at: new Date().toISOString()
+  };
+}
+
+async function runFastTopicBatchAdaptive(batch, settings, batchId, depth = 0) {
+  const prompt = fastTopicExtractionPrompt(batch, settings);
+  const limit = settings.llmCallCharLimit || settings.fastPromptCharBudget || 65000;
+  if (prompt.length > limit && batch.length > 1) {
+    analysisLogLine(`${batchId}: estimated prompt ${compactNumber(prompt.length)} chars exceeds LLM call limit ${compactNumber(limit)}; splitting before send.`, 'warn');
+    const mid = Math.ceil(batch.length / 2);
+    const left = await runFastTopicBatchAdaptive(batch.slice(0, mid), settings, `${batchId}a`, depth + 1);
+    const right = await runFastTopicBatchAdaptive(batch.slice(mid), settings, `${batchId}b`, depth + 1);
+    return {
+      results: [...left.results, ...right.results],
+      errors: [...left.errors, ...right.errors],
+      metrics: aggregateFastBatchMetrics([left, right]),
+      callCount: left.callCount + right.callCount,
+      splitCount: left.splitCount + right.splitCount + 1
+    };
+  }
+  if (prompt.length > limit) {
+    analysisLogLine(`${batchId}: single chunk prompt ${compactNumber(prompt.length)} chars exceeds LLM call limit ${compactNumber(limit)}. Rebuild chunks at or below ${compactNumber(Math.max(4000, limit - 6000))} chars for a strict cap.`, 'warn');
+  }
+  const messages = [
+    { role: 'system', content: 'Return only compact pipe-delimited TOPIC lines. No JSON. No markdown.' },
+    { role: 'user', content: prompt }
+  ];
+  try {
+    const modelResult = await runAnalysisModelDetailed(messages, Math.min(0.15, settings.temperature), {
+      maxTokens: settings.fastMaxTokens || 6144,
+      responseFormatJson: false
+    });
+    const parsed = parseFastTopicLines(modelResult.text, batch);
+    const topicCount = parsed.results.reduce((sum, result) => sum + (result.topics || []).length, 0);
+    const missingChunks = parsed.results.filter(result => !(result.topics || []).length);
+    const missingRatio = batch.length ? missingChunks.length / batch.length : 0;
+    if (batch.length > 1 && (topicCount === 0 || missingRatio > 0.4)) {
+      analysisLogLine(`${batchId}: model under-filled a ${batch.length}-chunk batch; splitting for coverage.`, 'warn');
+      const mid = Math.ceil(batch.length / 2);
+      const left = await runFastTopicBatchAdaptive(batch.slice(0, mid), settings, `${batchId}a`, depth + 1);
+      const right = await runFastTopicBatchAdaptive(batch.slice(mid), settings, `${batchId}b`, depth + 1);
+      return {
+        results: [...left.results, ...right.results],
+        errors: [...left.errors, ...right.errors],
+        metrics: aggregateFastBatchMetrics([left, right]),
+        callCount: left.callCount + right.callCount,
+        splitCount: left.splitCount + right.splitCount + 1
+      };
+    }
+    return {
+      results: parsed.results,
+      errors: parsed.errors,
+      metrics: modelResult.metrics,
+      callCount: 1,
+      splitCount: 0
+    };
+  } catch (err) {
+    const tooLarge = batch.length > 1;
+    if (tooLarge) {
+      analysisLogLine(`${batchId}: large batch failed (${err?.message || err}); splitting and retrying.`, 'warn');
+      const mid = Math.ceil(batch.length / 2);
+      const left = await runFastTopicBatchAdaptive(batch.slice(0, mid), settings, `${batchId}a`, depth + 1);
+      const right = await runFastTopicBatchAdaptive(batch.slice(mid), settings, `${batchId}b`, depth + 1);
+      return {
+        results: [...left.results, ...right.results],
+        errors: [...left.errors, ...right.errors],
+        metrics: aggregateFastBatchMetrics([left, right]),
+        callCount: left.callCount + right.callCount,
+        splitCount: left.splitCount + right.splitCount + 1
+      };
+    }
+    throw err;
+  }
+}
+
+async function processFastAnalysisTopics(options = {}, settingsOverride = null, totalStartedAtOverride = null) {
+  const totalStartedAt = totalStartedAtOverride || options.totalStartedAt || performance.now();
+  const phaseStartedAt = performance.now();
+  const settings = settingsOverride || currentAnalysisSettings();
+  let state = await refreshAnalysisRunProgress();
+  if (!state) return;
+  const done = new Set(state.done_chunk_ids || []);
+  const chunks = options.chunks || state.chunks || [];
+  const pendingChunks = chunks.filter(chunk => !done.has(chunk.chunk_id));
+  const coverage = options.coverage || analysisCoverage(chunks, state.chunks || chunks);
+  const selectedChars = totalChunkChars(chunks);
+  const { workChunks, aggregates } = prepareFastWorkChunks(pendingChunks, settings);
+  const oversizedCount = [...aggregates.values()].filter(item => item.expected > 1).length;
+  const batches = splitChunksForFastPrompts(workChunks, settings);
+  analysisLogLine(`Starting ${settings.analysisProfile} topic pass with ${pendingChunks.length} remaining chunks (${workChunks.length} LLM work units) in ${batches.length} model calls${options.label ? ` (${options.label})` : ''}. Selected ${chunks.length}/${state.chunk_count || chunks.length} chunks, ${compactNumber(selectedChars)} chars, max ${settings.maxTopicsPerChunk} topics/chunk, LLM call limit ${compactNumber(settings.llmCallCharLimit)}, ${oversizedCount} oversized chunks split, JSON mode off, model ${currentModel || 'none'}.`);
+  const liveMetrics = { coverage };
+  updateAnalysisMetrics({
+    ...liveMetrics,
+    phaseElapsedMs: 0,
+    totalElapsedMs: performance.now() - totalStartedAt
+  });
+  const stopMetricsTicker = startAnalysisMetricsTicker(() => ({
+    ...liveMetrics,
+    phaseElapsedMs: performance.now() - phaseStartedAt,
+    totalElapsedMs: performance.now() - totalStartedAt,
+    elapsedMs: performance.now() - phaseStartedAt
+  }));
+
+  try {
+    for (let i = 0; i < batches.length; i++) {
+      if (analysisStopRequested) {
+        analysisLogLine('Stopped by user.', 'warn');
+        break;
+      }
+      const batch = batches[i];
+      const batchId = `fast_topics_${String(i + 1).padStart(4, '0')}`;
+      const doneInSelection = chunks.filter(c => done.has(c.chunk_id)).length;
+      setAnalysisStatus('Fast processing', chunks.length ? (doneInSelection / chunks.length) * 100 : 0);
+      if (analysisProgressText) analysisProgressText.textContent = `Processing ${batchId} (${batch.length} chunks, ${i + 1}/${batches.length} calls)`;
+      const promptCharCount = fastTopicExtractionPrompt(batch, settings).length + 120;
+      Object.assign(liveMetrics, {
+        item: batchId,
+        sourceCharCount: totalChunkChars(batch),
+        promptCharCount,
+        estimatedPromptTokens: estimatedTokenCount(promptCharCount)
+      });
+      updateAnalysisMetrics({
+        ...liveMetrics,
+        coverage,
+        elapsedMs: performance.now() - phaseStartedAt,
+        phaseElapsedMs: performance.now() - phaseStartedAt,
+        totalElapsedMs: performance.now() - totalStartedAt
+      });
+      const batchResult = await runFastTopicBatchAdaptive(batch, settings, batchId);
+      if (batchResult.errors.length) {
+        await window.api.analysisSaveError(activeAnalysisDatasetId, activeAnalysisRunId, {
+          created_at: new Date().toISOString(),
+          stage: 'fast_topic_extraction_parse',
+          batch_id: batchId,
+          error_count: batchResult.errors.length,
+          errors: batchResult.errors.slice(0, 25)
+        }).catch(() => {});
+        analysisLogLine(`${batchId}: skipped ${batchResult.errors.length} malformed or unmatched lines.`, 'warn');
+      }
+      for (const result of batchResult.results) {
+        const chunk = batch.find(c => c.chunk_id === result.chunk_id) || {};
+        const originalChunkId = chunk.original_chunk_id || result.chunk_id;
+        const aggregate = aggregates.get(originalChunkId);
+        if (!aggregate) continue;
+        aggregate.received += 1;
+        aggregate.topics.push(...((result.topics || []).map(topic => ({ ...topic }))));
+        aggregate.events.push(...((result.events || []).map(event => ({ ...event }))));
+        aggregate.promptCharCount += Number(batchResult.metrics.prompt_char_count) || 0;
+        aggregate.responseCharCount += Number(batchResult.metrics.response_char_count) || 0;
+        aggregate.estimatedPromptTokens += Number(batchResult.metrics.estimated_prompt_tokens) || 0;
+        aggregate.estimatedResponseTokens += Number(batchResult.metrics.estimated_response_tokens) || 0;
+        aggregate.durationMs += Number(batchResult.metrics.duration_ms) || 0;
+        aggregate.callCount += Number(batchResult.callCount) || 0;
+        aggregate.splitCount += Number(batchResult.splitCount) || 0;
+        if (aggregate.received < aggregate.expected) continue;
+        const original = aggregate.original;
+        const savedResult = {
+          chunk_id: original.chunk_id,
+          time_start: original.time_start,
+          time_end: original.time_end,
+          topics: aggregate.topics,
+          events: aggregate.events,
+          input_hash: original.input_hash,
+          processed_at: new Date().toISOString(),
+          analysis_profile: settings.analysisProfile,
+          llm_work_unit_count: aggregate.expected
+        };
+        result.input_hash = chunk.input_hash;
+        savedResult.metrics = {
+          stage: 'fast_topic_extraction',
+          batch_id: batchId,
+          chunk_id: original.chunk_id,
+          source_char_count: chunkCharCount(original),
+          prompt_char_count: aggregate.promptCharCount,
+          response_char_count: aggregate.responseCharCount,
+          estimated_prompt_tokens: aggregate.estimatedPromptTokens,
+          estimated_response_tokens: aggregate.estimatedResponseTokens,
+          duration_ms: aggregate.durationMs,
+          model: batchResult.metrics.model || currentModel || '',
+          max_tokens: batchResult.metrics.max_tokens,
+          llm_call_char_limit: settings.llmCallCharLimit,
+          work_unit_count: aggregate.expected,
+          response_format_json_requested: false,
+          response_format_json_used: false,
+          adaptive_call_count: aggregate.callCount,
+          adaptive_split_count: aggregate.splitCount,
+          created_at: batchResult.metrics.created_at
+        };
+        await window.api.analysisSaveTopicResult(activeAnalysisDatasetId, activeAnalysisRunId, savedResult);
+        done.add(original.chunk_id);
+      }
+      Object.assign(liveMetrics, {
+        item: batchId,
+        sourceCharCount: totalChunkChars(batch),
+        promptCharCount: batchResult.metrics.prompt_char_count,
+        responseCharCount: batchResult.metrics.response_char_count,
+        estimatedPromptTokens: batchResult.metrics.estimated_prompt_tokens,
+        estimatedResponseTokens: batchResult.metrics.estimated_response_tokens,
+        durationMs: batchResult.metrics.duration_ms
+      });
+      updateAnalysisMetrics({
+        ...liveMetrics,
+        coverage,
+        elapsedMs: performance.now() - phaseStartedAt,
+        phaseElapsedMs: performance.now() - phaseStartedAt,
+        totalElapsedMs: performance.now() - totalStartedAt
+      });
+      const savedTopicCount = batchResult.results.reduce((sum, r) => sum + (r.topics || []).length, 0);
+      analysisLogLine(`Saved ${batchId}: ${batch.length} chunks, ${savedTopicCount} topics | ${batchResult.callCount} model call${batchResult.callCount === 1 ? '' : 's'}${batchResult.splitCount ? `, ${batchResult.splitCount} split retry` : ''} | source ${compactNumber(totalChunkChars(batch))} chars | prompt ${compactNumber(batchResult.metrics.prompt_char_count)} | response ${compactNumber(batchResult.metrics.response_char_count)} | ${formatDuration(batchResult.metrics.duration_ms)}`);
+    }
+  } catch (err) {
+    stopMetricsTicker();
+    analysisLogLine(`Fast topic pass failed: ${err?.message || err}`, 'error');
+    setAnalysisStatus('Fast processing failed', 100);
+    return;
+  }
+
+  stopMetricsTicker();
+  const phaseDurationMs = performance.now() - phaseStartedAt;
+  analysisLogLine(`Fast topic phase finished in ${formatDuration(phaseDurationMs)}. Total elapsed ${formatDuration(performance.now() - totalStartedAt)}.`);
+  analysisResultLine('Fast topic phase complete', [
+    `duration ${formatDuration(phaseDurationMs)}`,
+    `total ${formatDuration(performance.now() - totalStartedAt)}`,
+    `${chunks.filter(c => done.has(c.chunk_id)).length}/${chunks.length} selected chunks done`,
+    `${batches.length} model calls`
+  ]);
+  updateAnalysisMetrics({
+    coverage,
+    phaseElapsedMs: phaseDurationMs,
+    totalElapsedMs: performance.now() - totalStartedAt,
+    lastPhaseName: 'Fast topic phase',
+    lastPhaseDurationMs: phaseDurationMs
+  });
+  await loadAnalysisRuns();
+}
+
+async function processAnalysisTopics(options = {}) {
+  if (options instanceof Event) options = {};
+  if (options.logKind) activeAnalysisLogKind = options.logKind;
+  if (!activeAnalysisDatasetId || !activeAnalysisRunId) {
+    analysisLogLine('Select a dataset and run first.', 'error');
+    return;
+  }
+  if (!currentModel) {
+    analysisLogLine('Select a model before processing.', 'error');
+    return;
+  }
+  analysisStopRequested = false;
+  const totalStartedAt = options.totalStartedAt || performance.now();
+  const phaseStartedAt = performance.now();
+  const settings = currentAnalysisSettings();
+  if (settings.deterministicCanonization) {
+    return processFastAnalysisTopics(options, settings, totalStartedAt);
+  }
+  let state = await refreshAnalysisRunProgress();
+  if (!state) return;
+  const done = new Set(state.done_chunk_ids || []);
+  const chunks = options.chunks || state.chunks || [];
+  const coverage = options.coverage || analysisCoverage(chunks, state.chunks || chunks);
+  const remaining = chunks.filter(chunk => !done.has(chunk.chunk_id)).length;
+  const selectedChars = totalChunkChars(chunks);
+  const alreadyDone = chunks.length - remaining;
+  analysisLogLine(`Starting topic pass with ${remaining} remaining chunks${options.label ? ` (${options.label})` : ''}. Selected ${chunks.length}/${state.chunk_count || chunks.length} chunks, ${compactNumber(selectedChars)} chars, ${alreadyDone} already done. Density ${settings.topicDensity}, max ${settings.maxTopicsPerChunk} topics/chunk, model ${currentModel || 'none'}.`);
+  const liveMetrics = { coverage };
+  Object.assign(liveMetrics, {
+    phaseElapsedMs: 0,
+    totalElapsedMs: performance.now() - totalStartedAt
+  });
+  updateAnalysisMetrics(liveMetrics);
+  const stopMetricsTicker = startAnalysisMetricsTicker(() => ({
+    ...liveMetrics,
+    phaseElapsedMs: performance.now() - phaseStartedAt,
+    totalElapsedMs: performance.now() - totalStartedAt,
+    elapsedMs: performance.now() - phaseStartedAt
+  }));
+
+  for (let i = 0; i < chunks.length; i++) {
+    if (analysisStopRequested) {
+      analysisLogLine('Stopped by user.', 'warn');
+      break;
+    }
+    const chunk = chunks[i];
+    if (done.has(chunk.chunk_id)) continue;
+    const subsetDone = chunks.filter(c => done.has(c.chunk_id)).length;
+    setAnalysisStatus('Processing', chunks.length ? (subsetDone / chunks.length) * 100 : 0);
+    if (analysisProgressText) analysisProgressText.textContent = `Processing ${chunk.chunk_id} (${subsetDone}/${chunks.length} selected chunks done)`;
+    try {
+      const prompt = topicExtractionPrompt(chunk, settings);
+      const promptCharCount = messageCharCount([
+        { role: 'system', content: 'You extract structured conceptual analysis from exported chat data. You return valid JSON only.' },
+        { role: 'user', content: prompt }
+      ]);
+      Object.assign(liveMetrics, {
+        item: chunk.chunk_id,
+        sourceCharCount: chunkCharCount(chunk),
+        promptCharCount,
+        estimatedPromptTokens: estimatedTokenCount(promptCharCount)
+      });
+      updateAnalysisMetrics({
+        ...liveMetrics,
+        item: chunk.chunk_id,
+        sourceCharCount: chunkCharCount(chunk),
+        promptCharCount,
+        estimatedPromptTokens: estimatedTokenCount(promptCharCount),
+        coverage,
+        elapsedMs: performance.now() - phaseStartedAt,
+        phaseElapsedMs: performance.now() - phaseStartedAt,
+        totalElapsedMs: performance.now() - totalStartedAt
+      });
+      const modelResult = await runAnalysisModelDetailed([
+        { role: 'system', content: 'You extract structured conceptual analysis from exported chat data. You return valid JSON only.' },
+        { role: 'user', content: prompt }
+      ], settings.temperature, { maxTokens: 6144, responseFormatJson: true });
+      const raw = modelResult.text;
+      let parsed;
+      try {
+        parsed = extractJsonObject(raw);
+      } catch (parseErr) {
+        parsed = {
+          chunk_id: chunk.chunk_id,
+          time_start: chunk.time_start,
+          time_end: chunk.time_end,
+          topics: [],
+          events: [],
+          parse_error: parseErr.message,
+          raw_response: raw
+        };
+        await window.api.analysisSaveError(activeAnalysisDatasetId, activeAnalysisRunId, {
+          created_at: new Date().toISOString(),
+          chunk_id: chunk.chunk_id,
+          error: parseErr.message,
+          raw_response: raw
+        });
+      }
+      parsed.chunk_id = parsed.chunk_id || chunk.chunk_id;
+      parsed.time_start = parsed.time_start || chunk.time_start;
+      parsed.time_end = parsed.time_end || chunk.time_end;
+      parsed.input_hash = chunk.input_hash;
+      parsed.processed_at = new Date().toISOString();
+      parsed.metrics = {
+        stage: 'topic_extraction',
+        chunk_id: chunk.chunk_id,
+        source_char_count: chunkCharCount(chunk),
+        prompt_char_count: modelResult.metrics.prompt_char_count,
+        response_char_count: modelResult.metrics.response_char_count,
+        estimated_prompt_tokens: modelResult.metrics.estimated_prompt_tokens,
+        estimated_response_tokens: modelResult.metrics.estimated_response_tokens,
+        duration_ms: modelResult.metrics.duration_ms,
+        model: modelResult.metrics.model,
+        max_tokens: modelResult.metrics.max_tokens,
+        response_format_json_requested: modelResult.metrics.response_format_json_requested,
+        response_format_json_used: modelResult.metrics.response_format_json_used,
+        created_at: modelResult.metrics.created_at
+      };
+      await window.api.analysisSaveTopicResult(activeAnalysisDatasetId, activeAnalysisRunId, parsed);
+      done.add(chunk.chunk_id);
+      Object.assign(liveMetrics, {
+        item: chunk.chunk_id,
+        sourceCharCount: parsed.metrics.source_char_count,
+        promptCharCount: parsed.metrics.prompt_char_count,
+        responseCharCount: parsed.metrics.response_char_count,
+        estimatedPromptTokens: parsed.metrics.estimated_prompt_tokens,
+        estimatedResponseTokens: parsed.metrics.estimated_response_tokens,
+        durationMs: parsed.metrics.duration_ms
+      });
+      updateAnalysisMetrics({
+        ...liveMetrics,
+        item: chunk.chunk_id,
+        sourceCharCount: parsed.metrics.source_char_count,
+        promptCharCount: parsed.metrics.prompt_char_count,
+        responseCharCount: parsed.metrics.response_char_count,
+        estimatedPromptTokens: parsed.metrics.estimated_prompt_tokens,
+        estimatedResponseTokens: parsed.metrics.estimated_response_tokens,
+        durationMs: parsed.metrics.duration_ms,
+        coverage,
+        elapsedMs: performance.now() - phaseStartedAt,
+        phaseElapsedMs: performance.now() - phaseStartedAt,
+        totalElapsedMs: performance.now() - totalStartedAt
+      });
+      analysisLogLine(`Saved ${chunk.chunk_id}: ${(parsed.topics || []).length} topics | source ${compactNumber(parsed.metrics.source_char_count)} chars | prompt ${compactNumber(parsed.metrics.prompt_char_count)} | response ${compactNumber(parsed.metrics.response_char_count)} | ${formatDuration(parsed.metrics.duration_ms)}`);
+      const updatedSubsetDone = chunks.filter(c => done.has(c.chunk_id)).length;
+      setAnalysisStatus('Processing', chunks.length ? (updatedSubsetDone / chunks.length) * 100 : 0);
+    } catch (err) {
+      analysisLogLine(`Failed ${chunk.chunk_id}: ${err?.message || err}`, 'error');
+      await window.api.analysisSaveError(activeAnalysisDatasetId, activeAnalysisRunId, {
+        created_at: new Date().toISOString(),
+        chunk_id: chunk.chunk_id,
+        error: err?.message || String(err)
+      }).catch(() => {});
+      break;
+    }
+  }
+  stopMetricsTicker();
+  const phaseDurationMs = performance.now() - phaseStartedAt;
+  analysisLogLine(`Topic phase finished in ${formatDuration(phaseDurationMs)}. Total elapsed ${formatDuration(performance.now() - totalStartedAt)}.`);
+  analysisResultLine('Topic phase complete', [
+    `duration ${formatDuration(phaseDurationMs)}`,
+    `total ${formatDuration(performance.now() - totalStartedAt)}`,
+    `${chunks.filter(c => done.has(c.chunk_id)).length}/${chunks.length} selected chunks done`,
+    `${compactNumber(totalChunkChars(chunks))} selected chars`
+  ]);
+  updateAnalysisMetrics({
+    coverage,
+    phaseElapsedMs: phaseDurationMs,
+    totalElapsedMs: performance.now() - totalStartedAt,
+    lastPhaseName: 'Topic phase',
+    lastPhaseDurationMs: phaseDurationMs
+  });
+  await loadAnalysisRuns();
+}
+
+const CONCEPT_KEY_STOPWORDS = new Set([
+  'a', 'an', 'and', 'are', 'as', 'for', 'from', 'in', 'into', 'of', 'on', 'or', 'the', 'to', 'with',
+  'app', 'apps', 'project', 'system', 'tool', 'feature', 'idea', 'discussion', 'analysis'
+]);
+
+function conceptMergeKey(value) {
+  const words = String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .split(/\s+/)
+    .filter(word => word && !CONCEPT_KEY_STOPWORDS.has(word));
+  return (words.length ? words : String(value || '').toLowerCase().split(/\s+/).filter(Boolean))
+    .slice(0, 7)
+    .join('_') || normalizeConceptId(value);
+}
+
+function chooseCanonicalLabel(existingLabel, nextLabel) {
+  const current = String(existingLabel || '').trim();
+  const next = String(nextLabel || '').trim();
+  if (!current) return next;
+  if (!next) return current;
+  if (next.length < current.length && next.length >= 4) return next;
+  return current;
+}
+
+function addUniqueLimited(values, additions, limit) {
+  const out = [...(values || [])];
+  for (const value of additions || []) {
+    const clean = sanitizeFastField(value, 160);
+    if (clean && !out.some(v => v.toLowerCase() === clean.toLowerCase())) out.push(clean);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+function deterministicGraphFromTopicResults(datasetId, runId, results, profile) {
+  const concepts = new Map();
+  const parentEdges = new Map();
+  const events = [];
+  const chunkConceptIds = new Map();
+
+  for (const result of results || []) {
+    const chunkIdsForEvent = [];
+    for (const topic of result.topics || []) {
+      const label = sanitizeFastField(topic.label || topic.canonical_label, 120);
+      if (!label) continue;
+      const key = conceptMergeKey(label);
+      const conceptId = normalizeConceptId(key);
+      const existing = concepts.get(conceptId) || {
+        concept_id: conceptId,
+        canonical_label: label,
+        level: sanitizeFastField(topic.level || 'topic', 24) || 'topic',
+        parent_id: '',
+        aliases: [],
+        summary: '',
+        subtopics: [],
+        evidence: [],
+        _count: 0,
+        _summary_chars: 0
+      };
+      existing._count += 1;
+      existing.canonical_label = chooseCanonicalLabel(existing.canonical_label, label);
+      existing.aliases = addUniqueLimited(existing.aliases, [label, ...(topic.aliases || [])], 8);
+      const summary = sanitizeFastField(topic.summary || label, 260);
+      if (summary && (!existing.summary || summary.length > existing._summary_chars)) {
+        existing.summary = summary;
+        existing._summary_chars = summary.length;
+      }
+      existing.subtopics = addUniqueLimited(existing.subtopics, topic.subtopics || [], 12);
+      if (topic.parent_label) {
+        const parentId = normalizeConceptId(conceptMergeKey(topic.parent_label));
+        existing.parent_id = existing.parent_id || parentId;
+        parentEdges.set(`${parentId}->${conceptId}`, {
+          source: parentId,
+          target: conceptId,
+          relationship: 'develops',
+          weight: 0.55
+        });
+        if (!concepts.has(parentId)) {
+          concepts.set(parentId, {
+            concept_id: parentId,
+            canonical_label: sanitizeFastField(topic.parent_label, 120),
+            level: 'macro',
+            parent_id: '',
+            aliases: [sanitizeFastField(topic.parent_label, 120)],
+            summary: sanitizeFastField(topic.parent_label, 180),
+            subtopics: [label],
+            evidence: [],
+            _count: 0,
+            _summary_chars: 0
+          });
+        } else {
+          const parent = concepts.get(parentId);
+          parent.subtopics = addUniqueLimited(parent.subtopics, [label], 12);
+        }
+      }
+      if (topic.evidence_record_ids?.length) {
+        existing.evidence.push({
+          chunk_id: result.chunk_id,
+          record_ids: topic.evidence_record_ids.slice(0, 4)
+        });
+        existing.evidence = existing.evidence.slice(0, 8);
+      }
+      concepts.set(conceptId, existing);
+      chunkIdsForEvent.push(conceptId);
+    }
+    chunkConceptIds.set(result.chunk_id, chunkIdsForEvent.slice(0, 8));
+
+    for (const event of result.events || []) {
+      const summary = sanitizeFastField(event.summary, 260);
+      if (!summary) continue;
+      events.push({
+        event_id: normalizeConceptId(`${result.chunk_id}_${event.timestamp || events.length}_${summary}`),
+        timestamp: sanitizeFastField(event.timestamp || result.time_start, 60),
+        concept_ids: chunkConceptIds.get(result.chunk_id) || [],
+        summary
+      });
+      if (events.length >= 500) break;
+    }
+  }
+
+  const conceptList = [...concepts.values()]
+    .map(concept => {
+      const clean = { ...concept };
+      clean.aliases = (clean.aliases || []).filter(alias => alias && alias !== clean.canonical_label).slice(0, 8);
+      clean.summary = clean.summary || clean.canonical_label;
+      delete clean._count;
+      delete clean._summary_chars;
+      return clean;
+    })
+    .sort((a, b) => {
+      const ac = (a.evidence || []).length + (a.aliases || []).length;
+      const bc = (b.evidence || []).length + (b.aliases || []).length;
+      return bc - ac || a.canonical_label.localeCompare(b.canonical_label);
+    })
+    .slice(0, 900);
+
+  const conceptIds = new Set(conceptList.map(c => c.concept_id));
+  const edges = [...parentEdges.values()]
+    .filter(edge => conceptIds.has(edge.source) && conceptIds.has(edge.target))
+    .slice(0, 1000);
+
+  return {
+    schema_version: '0.1.0',
+    dataset: { id: datasetId, run_id: runId },
+    graph_id: `deterministic_${profile}_${hashString(`${datasetId}:${runId}:${results.length}`).slice(0, 8)}`,
+    concepts: conceptList,
+    events: events.slice(0, 500),
+    edges,
+    generated_at: new Date().toISOString(),
+    source_result_count: results.length,
+    canonization_mode: `deterministic_${profile}`,
+    metrics: {
+      stage: 'final_graph',
+      source_result_count: results.length,
+      concept_count: conceptList.length,
+      event_count: Math.min(events.length, 500),
+      edge_count: edges.length,
+      model: currentModel || '',
+      response_format_json_used: false,
+      generated_at: new Date().toISOString()
+    }
+  };
+}
+
+async function canonizeAnalysisRunFast(options = {}) {
+  const totalStartedAt = options.totalStartedAt || performance.now();
+  const canonStartedAt = performance.now();
+  const settings = currentAnalysisSettings();
+  const allResults = await window.api.analysisLoadTopicResults(activeAnalysisDatasetId, activeAnalysisRunId);
+  const results = uniqueTopicResults(allResults);
+  if (!results.length) {
+    analysisLogLine('No topic results to canonize yet.', 'error');
+    return;
+  }
+  setAnalysisStatus('Fast exporting', 90);
+  if (analysisProgressText) analysisProgressText.textContent = `Canonizing ${results.length} topic results locally`;
+  analysisLogLine(`Starting deterministic ${settings.analysisProfile} canonization/export for ${results.length} unique chunk results. No JSON mode, no canonization model calls.`);
+  const graph = deterministicGraphFromTopicResults(activeAnalysisDatasetId, activeAnalysisRunId, results, settings.analysisProfile);
+  graph.ignored_duplicate_result_lines = Math.max(0, allResults.length - results.length);
+  graph.metrics = {
+    ...(graph.metrics || {}),
+    duplicate_result_lines: graph.ignored_duplicate_result_lines,
+    canonization_duration_ms: performance.now() - canonStartedAt,
+    total_elapsed_ms: performance.now() - totalStartedAt
+  };
+  const saved = await window.api.analysisSaveGraph(activeAnalysisDatasetId, activeAnalysisRunId, graph);
+  if (analysisOutputPath) analysisOutputPath.textContent = `Output: ${saved.path}`;
+  const durationMs = performance.now() - canonStartedAt;
+  analysisLogLine(`Saved graph: ${saved.path}`);
+  analysisLogLine(`Deterministic canonization finished in ${formatDuration(durationMs)}. Total elapsed ${formatDuration(performance.now() - totalStartedAt)}.`);
+  analysisResultLine('Fast canonization complete', [
+    `duration ${formatDuration(durationMs)}`,
+    `total ${formatDuration(performance.now() - totalStartedAt)}`,
+    `${(graph.concepts || []).length} concepts`,
+    `${(graph.events || []).length} events`,
+    `${(graph.edges || []).length} edges`
+  ]);
+  updateAnalysisMetrics({
+    totalElapsedMs: performance.now() - totalStartedAt,
+    lastPhaseName: 'Fast canonization',
+    lastPhaseDurationMs: durationMs
+  });
+  setAnalysisStatus('Exported', 100);
+}
+
+async function canonizeAnalysisRun(options = {}) {
+  if (options instanceof Event) options = {};
+  if (options.logKind) activeAnalysisLogKind = options.logKind;
+  if (!activeAnalysisDatasetId || !activeAnalysisRunId) {
+    analysisLogLine('Select a dataset and run first.', 'error');
+    return;
+  }
+  const settings = currentAnalysisSettings();
+  if (settings.deterministicCanonization) {
+    return canonizeAnalysisRunFast(options);
+  }
+  if (!currentModel) {
+    analysisLogLine('Select a model before canonization.', 'error');
+    return;
+  }
+  analysisStopRequested = false;
+  const totalStartedAt = options.totalStartedAt || performance.now();
+  const canonStartedAt = performance.now();
+  const allResults = await window.api.analysisLoadTopicResults(activeAnalysisDatasetId, activeAnalysisRunId);
+  const results = uniqueTopicResults(allResults);
+  if (!results.length) {
+    analysisLogLine('No topic results to canonize yet.', 'error');
+    return;
+  }
+  const duplicateCount = Math.max(0, allResults.length - results.length);
+  const batchCharBudget = 22_000;
+  const mergeCharBudget = 24_000;
+  const batches = splitByPromptBudget(
+    results,
+    batchCharBudget,
+    (item) => JSON.stringify(compactTopicResult(item))
+  );
+  setAnalysisStatus('Canonizing', 0);
+  analysisLogLine(`Starting batched canonization: ${results.length} unique chunk results, ${batches.length} batches${duplicateCount ? `, ${duplicateCount} duplicate result lines ignored` : ''}. Batch budget ${compactNumber(batchCharBudget)} chars, merge budget ${compactNumber(mergeCharBudget)} chars, model ${currentModel || 'none'}.`);
+  const liveCanonMetrics = {};
+  let currentCanonPhaseStartedAt = canonStartedAt;
+  Object.assign(liveCanonMetrics, {
+    phaseElapsedMs: 0,
+    totalElapsedMs: performance.now() - totalStartedAt
+  });
+  updateAnalysisMetrics(liveCanonMetrics);
+  const stopCanonTicker = startAnalysisMetricsTicker(() => ({
+    ...liveCanonMetrics,
+    phaseElapsedMs: performance.now() - currentCanonPhaseStartedAt,
+    totalElapsedMs: performance.now() - totalStartedAt
+  }));
+
+  try {
+    const existing = await window.api.analysisListCanonBatches(activeAnalysisDatasetId, activeAnalysisRunId).catch(() => []);
+    const existingById = new Map(existing.map(g => [g._batch_id, g]));
+    const graphs = [];
+    const batchPhaseStartedAt = performance.now();
+    currentCanonPhaseStartedAt = batchPhaseStartedAt;
+    for (let i = 0; i < batches.length; i++) {
+      if (analysisStopRequested) {
+        analysisLogLine('Canonization stopped by user.', 'warn');
+        stopCanonTicker();
+        return;
+      }
+      const batchId = canonBatchId('batch', i, batches[i], (item) => JSON.stringify(compactTopicResult(item)));
+      const existingGraph = existingById.get(batchId);
+      if (existingGraph) {
+        graphs.push(existingGraph);
+        analysisLogLine(`Using saved ${batchId}`);
+      } else {
+        const pct = batches.length ? (i / batches.length) * 60 : 0;
+        setAnalysisStatus('Canonizing batches', pct);
+        if (analysisProgressText) analysisProgressText.textContent = `Canonizing ${batchId} (${i + 1}/${batches.length})`;
+        const prompt = canonizationBatchPrompt(activeAnalysisDatasetId, activeAnalysisRunId, batchId, batches[i]);
+        const promptCharCount = messageCharCount([
+          { role: 'system', content: 'You merge topic candidates into a canonical concept graph. You return valid JSON only.' },
+          { role: 'user', content: prompt }
+        ]);
+        Object.assign(liveCanonMetrics, {
+          item: batchId,
+          promptCharCount,
+          estimatedPromptTokens: estimatedTokenCount(promptCharCount)
+        });
+        updateAnalysisMetrics({
+          ...liveCanonMetrics,
+          item: batchId,
+          promptCharCount,
+          estimatedPromptTokens: estimatedTokenCount(promptCharCount),
+          phaseElapsedMs: performance.now() - batchPhaseStartedAt,
+          totalElapsedMs: performance.now() - totalStartedAt
+        });
+        const modelResult = await runAnalysisModelDetailed([
+          { role: 'system', content: 'You merge topic candidates into a canonical concept graph. You return valid JSON only.' },
+          { role: 'user', content: prompt }
+        ], Math.min(0.1, currentAnalysisSettings().temperature), { maxTokens: 8192, responseFormatJson: true });
+        const raw = modelResult.text;
+        let graph;
+        try {
+          graph = await parseAnalysisJsonWithRepair(raw, batchId, graphSchemaInstruction(activeAnalysisDatasetId, activeAnalysisRunId));
+        } catch (err) {
+          await window.api.analysisSaveError(activeAnalysisDatasetId, activeAnalysisRunId, {
+            created_at: new Date().toISOString(),
+            stage: 'canonization_batch',
+            batch_id: batchId,
+            error: err?.message || String(err),
+            raw_response: err?.rawResponse || raw,
+            repair_response: err?.repairResponse || ''
+          }).catch(() => {});
+          if (err?.message === 'cancelled') throw err;
+          analysisLogLine(`${batchId} could not be repaired; saving deterministic fallback graph.`, 'warn');
+          graph = fallbackGraphFromTopicBatch(activeAnalysisDatasetId, activeAnalysisRunId, batchId, batches[i]);
+        }
+        graph = normalizeGraph(graph, batchId);
+        graph.dataset = graph.dataset || { id: activeAnalysisDatasetId, run_id: activeAnalysisRunId };
+        graph.graph_id = graph.graph_id || batchId;
+        graph.batch_id = batchId;
+        graph.source_result_count = batches[i].length;
+        graph.generated_at = new Date().toISOString();
+        graph.metrics = {
+          stage: 'canonization_batch',
+          batch_id: batchId,
+          input_item_count: batches[i].length,
+          input_char_count: JSON.stringify(batches[i].map(compactTopicResult)).length,
+          prompt_char_count: modelResult.metrics.prompt_char_count,
+          response_char_count: modelResult.metrics.response_char_count,
+          estimated_prompt_tokens: modelResult.metrics.estimated_prompt_tokens,
+          estimated_response_tokens: modelResult.metrics.estimated_response_tokens,
+          duration_ms: modelResult.metrics.duration_ms,
+          model: modelResult.metrics.model,
+          max_tokens: modelResult.metrics.max_tokens,
+          response_format_json_requested: modelResult.metrics.response_format_json_requested,
+          response_format_json_used: modelResult.metrics.response_format_json_used,
+          concept_count: (graph.concepts || []).length,
+          event_count: (graph.events || []).length,
+          edge_count: (graph.edges || []).length,
+          fallback: graph.fallback === true,
+          created_at: modelResult.metrics.created_at
+        };
+        await window.api.analysisSaveCanonBatch(activeAnalysisDatasetId, activeAnalysisRunId, batchId, graph);
+        graphs.push(graph);
+        Object.assign(liveCanonMetrics, {
+          item: batchId,
+          promptCharCount: graph.metrics.prompt_char_count,
+          responseCharCount: graph.metrics.response_char_count,
+          estimatedPromptTokens: graph.metrics.estimated_prompt_tokens,
+          estimatedResponseTokens: graph.metrics.estimated_response_tokens,
+          durationMs: graph.metrics.duration_ms
+        });
+        updateAnalysisMetrics({
+          ...liveCanonMetrics,
+          item: batchId,
+          promptCharCount: graph.metrics.prompt_char_count,
+          responseCharCount: graph.metrics.response_char_count,
+          estimatedPromptTokens: graph.metrics.estimated_prompt_tokens,
+          estimatedResponseTokens: graph.metrics.estimated_response_tokens,
+          durationMs: graph.metrics.duration_ms,
+          phaseElapsedMs: performance.now() - batchPhaseStartedAt,
+          totalElapsedMs: performance.now() - totalStartedAt
+        });
+        analysisLogLine(`Saved ${batchId}: ${(graph.concepts || []).length} concepts | prompt ${compactNumber(graph.metrics.prompt_char_count)} | response ${compactNumber(graph.metrics.response_char_count)} | ${formatDuration(graph.metrics.duration_ms)}`);
+      }
+    }
+    const batchPhaseDurationMs = performance.now() - batchPhaseStartedAt;
+    analysisLogLine(`Canonization batch phase finished in ${formatDuration(batchPhaseDurationMs)} for ${graphs.length} graph fragments. Total elapsed ${formatDuration(performance.now() - totalStartedAt)}.`);
+    analysisResultLine('Canonization batch phase complete', [
+      `duration ${formatDuration(batchPhaseDurationMs)}`,
+      `${graphs.length} fragments`,
+      `total ${formatDuration(performance.now() - totalStartedAt)}`
+    ]);
+    updateAnalysisMetrics({
+      phaseElapsedMs: batchPhaseDurationMs,
+      totalElapsedMs: performance.now() - totalStartedAt,
+      lastPhaseName: 'Batch phase',
+      lastPhaseDurationMs: batchPhaseDurationMs
+    });
+
+    let round = 1;
+    let fragments = graphs;
+    while (fragments.length > 1) {
+      if (analysisStopRequested) {
+        analysisLogLine('Canonization stopped by user.', 'warn');
+        stopCanonTicker();
+        return;
+      }
+      const mergeBatches = splitByPromptBudget(
+        fragments,
+        mergeCharBudget,
+        (item) => JSON.stringify(compactGraphFragment(item))
+      );
+      analysisLogLine(`Merge round ${round}: ${fragments.length} fragments -> ${mergeBatches.length} batches`);
+      const roundStartedAt = performance.now();
+      currentCanonPhaseStartedAt = roundStartedAt;
+      const next = [];
+      const savedRound = await window.api.analysisListCanonBatches(activeAnalysisDatasetId, activeAnalysisRunId).catch(() => []);
+      const savedById = new Map(savedRound.map(g => [g._batch_id, g]));
+      for (let i = 0; i < mergeBatches.length; i++) {
+        if (analysisStopRequested) {
+          analysisLogLine('Canonization stopped by user.', 'warn');
+          stopCanonTicker();
+          return;
+        }
+        const mergeId = canonBatchId(`round_${String(round).padStart(2, '0')}`, i, mergeBatches[i], (item) => JSON.stringify(compactGraphFragment(item)));
+        const existingGraph = savedById.get(mergeId);
+        if (existingGraph) {
+          next.push(existingGraph);
+          analysisLogLine(`Using saved ${mergeId}`);
+          continue;
+        }
+        const pct = 60 + Math.min(35, ((round - 1) * 10) + (i / Math.max(1, mergeBatches.length)) * 10);
+        setAnalysisStatus('Merging concepts', pct);
+        if (analysisProgressText) analysisProgressText.textContent = `Merging ${mergeId} (${i + 1}/${mergeBatches.length})`;
+        const prompt = canonizationMergePrompt(activeAnalysisDatasetId, activeAnalysisRunId, mergeId, mergeBatches[i]);
+        const promptCharCount = messageCharCount([
+          { role: 'system', content: 'You merge canonical concept graph fragments. You return valid JSON only.' },
+          { role: 'user', content: prompt }
+        ]);
+        Object.assign(liveCanonMetrics, {
+          item: mergeId,
+          promptCharCount,
+          estimatedPromptTokens: estimatedTokenCount(promptCharCount)
+        });
+        updateAnalysisMetrics({
+          ...liveCanonMetrics,
+          item: mergeId,
+          promptCharCount,
+          estimatedPromptTokens: estimatedTokenCount(promptCharCount),
+          phaseElapsedMs: performance.now() - roundStartedAt,
+          totalElapsedMs: performance.now() - totalStartedAt
+        });
+        const modelResult = await runAnalysisModelDetailed([
+          { role: 'system', content: 'You merge canonical concept graph fragments. You return valid JSON only.' },
+          { role: 'user', content: prompt }
+        ], Math.min(0.1, currentAnalysisSettings().temperature), { maxTokens: 8192, responseFormatJson: true });
+        const raw = modelResult.text;
+        let merged;
+        try {
+          merged = await parseAnalysisJsonWithRepair(raw, mergeId, graphSchemaInstruction(activeAnalysisDatasetId, activeAnalysisRunId));
+        } catch (err) {
+          await window.api.analysisSaveError(activeAnalysisDatasetId, activeAnalysisRunId, {
+            created_at: new Date().toISOString(),
+            stage: 'canonization_merge',
+            batch_id: mergeId,
+            error: err?.message || String(err),
+            raw_response: err?.rawResponse || raw,
+            repair_response: err?.repairResponse || ''
+          }).catch(() => {});
+          if (err?.message === 'cancelled') throw err;
+          analysisLogLine(`${mergeId} could not be repaired; saving deterministic fallback graph.`, 'warn');
+          merged = fallbackGraphFromFragments(activeAnalysisDatasetId, activeAnalysisRunId, mergeId, mergeBatches[i]);
+        }
+        merged = normalizeGraph(merged, mergeId);
+        merged.dataset = merged.dataset || { id: activeAnalysisDatasetId, run_id: activeAnalysisRunId };
+        merged.graph_id = merged.graph_id || mergeId;
+        merged.batch_id = mergeId;
+        merged.generated_at = new Date().toISOString();
+        merged.metrics = {
+          stage: 'canonization_merge',
+          batch_id: mergeId,
+          input_item_count: mergeBatches[i].length,
+          input_char_count: JSON.stringify(mergeBatches[i].map(compactGraphFragment)).length,
+          prompt_char_count: modelResult.metrics.prompt_char_count,
+          response_char_count: modelResult.metrics.response_char_count,
+          estimated_prompt_tokens: modelResult.metrics.estimated_prompt_tokens,
+          estimated_response_tokens: modelResult.metrics.estimated_response_tokens,
+          duration_ms: modelResult.metrics.duration_ms,
+          model: modelResult.metrics.model,
+          max_tokens: modelResult.metrics.max_tokens,
+          response_format_json_requested: modelResult.metrics.response_format_json_requested,
+          response_format_json_used: modelResult.metrics.response_format_json_used,
+          concept_count: (merged.concepts || []).length,
+          event_count: (merged.events || []).length,
+          edge_count: (merged.edges || []).length,
+          fallback: merged.fallback === true,
+          created_at: modelResult.metrics.created_at
+        };
+        await window.api.analysisSaveCanonBatch(activeAnalysisDatasetId, activeAnalysisRunId, mergeId, merged);
+        next.push(merged);
+        Object.assign(liveCanonMetrics, {
+          item: mergeId,
+          promptCharCount: merged.metrics.prompt_char_count,
+          responseCharCount: merged.metrics.response_char_count,
+          estimatedPromptTokens: merged.metrics.estimated_prompt_tokens,
+          estimatedResponseTokens: merged.metrics.estimated_response_tokens,
+          durationMs: merged.metrics.duration_ms
+        });
+        updateAnalysisMetrics({
+          ...liveCanonMetrics,
+          item: mergeId,
+          promptCharCount: merged.metrics.prompt_char_count,
+          responseCharCount: merged.metrics.response_char_count,
+          estimatedPromptTokens: merged.metrics.estimated_prompt_tokens,
+          estimatedResponseTokens: merged.metrics.estimated_response_tokens,
+          durationMs: merged.metrics.duration_ms,
+          phaseElapsedMs: performance.now() - roundStartedAt,
+          totalElapsedMs: performance.now() - totalStartedAt
+        });
+        analysisLogLine(`Saved ${mergeId}: ${(merged.concepts || []).length} concepts | prompt ${compactNumber(merged.metrics.prompt_char_count)} | response ${compactNumber(merged.metrics.response_char_count)} | ${formatDuration(merged.metrics.duration_ms)}`);
+      }
+      const roundDurationMs = performance.now() - roundStartedAt;
+      analysisLogLine(`Merge round ${round} finished in ${formatDuration(roundDurationMs)}. Total elapsed ${formatDuration(performance.now() - totalStartedAt)}.`);
+      analysisResultLine(`Merge round ${round} complete`, [
+        `duration ${formatDuration(roundDurationMs)}`,
+        `${next.length} fragments`,
+        `total ${formatDuration(performance.now() - totalStartedAt)}`
+      ]);
+      updateAnalysisMetrics({
+        phaseElapsedMs: roundDurationMs,
+        totalElapsedMs: performance.now() - totalStartedAt,
+        lastPhaseName: `Merge round ${round}`,
+        lastPhaseDurationMs: roundDurationMs
+      });
+      fragments = next;
+      round += 1;
+    }
+
+    const graph = fragments[0];
+    graph.schema_version = graph.schema_version || '0.1.0';
+    graph.dataset = graph.dataset || { id: activeAnalysisDatasetId, run_id: activeAnalysisRunId };
+    graph.generated_at = new Date().toISOString();
+    graph.source_result_count = results.length;
+    graph.ignored_duplicate_result_lines = duplicateCount;
+    graph.canonization_mode = 'batched';
+    const canonDurationMs = performance.now() - canonStartedAt;
+    graph.metrics = {
+      ...(graph.metrics || {}),
+      stage: 'final_graph',
+      source_result_count: results.length,
+      duplicate_result_lines: duplicateCount,
+      concept_count: (graph.concepts || []).length,
+      event_count: (graph.events || []).length,
+      edge_count: (graph.edges || []).length,
+      aggregate_canonization: aggregateGraphMetrics(graphs),
+      canonization_duration_ms: canonDurationMs,
+      total_elapsed_ms: performance.now() - totalStartedAt,
+      generated_at: new Date().toISOString()
+    };
+    const saved = await window.api.analysisSaveGraph(activeAnalysisDatasetId, activeAnalysisRunId, graph);
+    stopCanonTicker();
+    if (analysisOutputPath) analysisOutputPath.textContent = `Output: ${saved.path}`;
+    analysisLogLine(`Saved graph: ${saved.path}`);
+    analysisLogLine(`Canonization finished in ${formatDuration(canonDurationMs)}. Total elapsed ${formatDuration(performance.now() - totalStartedAt)}.`);
+    analysisResultLine('Canonization complete', [
+      `duration ${formatDuration(canonDurationMs)}`,
+      `total ${formatDuration(performance.now() - totalStartedAt)}`,
+      `${(graph.concepts || []).length} concepts`,
+      `${(graph.events || []).length} events`,
+      `${(graph.edges || []).length} edges`
+    ]);
+    updateAnalysisMetrics({
+      totalElapsedMs: performance.now() - totalStartedAt,
+      lastPhaseName: 'Canonization',
+      lastPhaseDurationMs: canonDurationMs
+    });
+    setAnalysisStatus('Exported', 100);
+  } catch (err) {
+    stopCanonTicker();
+    if ((err?.message || String(err)) === 'cancelled') {
+      analysisLogLine(`Canonization stopped after ${formatDuration(performance.now() - canonStartedAt)}. Total elapsed ${formatDuration(performance.now() - totalStartedAt)}.`, 'warn');
+      setAnalysisStatus('Stopped', 100);
+      return;
+    }
+    analysisLogLine(`Canonization failed: ${err?.message || err}`, 'error');
+    setAnalysisStatus('Canonize failed', 100);
+  }
+}
+
+initAnalysisProfile();
+
+dataAnalysisBtn?.addEventListener('click', () => setAnalysisMode(true));
+analysisBackChat?.addEventListener('click', () => setAnalysisMode(false));
+analysisRefreshBtn?.addEventListener('click', loadAnalysisDatasets);
+analysisRunRefreshBtn?.addEventListener('click', loadAnalysisRuns);
+analysisDatasetSelect?.addEventListener('change', async () => {
+  activeAnalysisDatasetId = analysisDatasetSelect.value;
+  localStorage.setItem('activeAnalysisDatasetId', activeAnalysisDatasetId);
+  renderAnalysisDatasetSummary(analysisDatasets.find(d => d.dataset_id === activeAnalysisDatasetId));
+  activeAnalysisRunId = '';
+  await loadAnalysisRuns();
+});
+analysisRunSelect?.addEventListener('change', async () => {
+  activeAnalysisRunId = analysisRunSelect.value;
+  localStorage.setItem('activeAnalysisRunId', activeAnalysisRunId);
+  await refreshAnalysisPaths();
+  await refreshAnalysisRunProgress();
+});
+analysisOpenOutputBtn?.addEventListener('click', async () => {
+  const paths = activeAnalysisPaths || await refreshAnalysisPaths();
+  const target = paths?.outputGraph || paths?.runDir;
+  if (!target) return analysisLogLine('No run output path available.', 'error');
+  window.api.analysisOpenPath(target).catch((err) => analysisLogLine(`Open output failed: ${err?.message || err}`, 'error'));
+});
+analysisOpenRunFolderBtn?.addEventListener('click', async () => {
+  const paths = activeAnalysisPaths || await refreshAnalysisPaths();
+  if (!paths?.runDir) return analysisLogLine('No run folder available.', 'error');
+  window.api.analysisOpenPath(paths.runDir).catch((err) => analysisLogLine(`Open run folder failed: ${err?.message || err}`, 'error'));
+});
+analysisOpenLogBtn?.addEventListener('click', async () => {
+  const paths = activeAnalysisPaths || await refreshAnalysisPaths();
+  const target = activeAnalysisLogKind === 'test' ? paths?.testLog : paths?.analysisLog;
+  if (!target) return analysisLogLine('No log path available.', 'error');
+  window.api.analysisOpenPath(target).catch((err) => analysisLogLine(`Open log failed: ${err?.message || err}`, 'error'));
+});
+analysisImportBtn?.addEventListener('click', async () => {
+  const path = analysisSourcePath?.value?.trim();
+  if (!path) return analysisLogLine('Paste a JSON file path first.', 'error');
+  setAnalysisStatus('Importing', 0);
+  try {
+    const dataset = await window.api.analysisImport(path);
+    activeAnalysisDatasetId = dataset.dataset_id;
+    localStorage.setItem('activeAnalysisDatasetId', activeAnalysisDatasetId);
+    analysisLogLine(`Imported ${dataset.dataset_id}: ${dataset.record_count} records`);
+    await loadAnalysisDatasets();
+  } catch (err) {
+    analysisLogLine(`Import failed: ${err?.message || err}`, 'error');
+    setAnalysisStatus('Import failed', 0);
+  }
+});
+analysisChunkBtn?.addEventListener('click', async () => {
+  if (!activeAnalysisDatasetId) return analysisLogLine('Import or select a dataset first.', 'error');
+  const target = currentAnalysisSettings().chunkTargetChars;
+  setAnalysisStatus('Chunking', 0);
+  try {
+    const result = await window.api.analysisBuildChunks(activeAnalysisDatasetId, target);
+    analysisLogLine(`Built ${result.chunk_count} chunks at target ${result.target_chars} chars`);
+    await loadAnalysisDatasets();
+    setAnalysisStatus('Chunks ready', 0);
+  } catch (err) {
+    analysisLogLine(`Chunking failed: ${err?.message || err}`, 'error');
+    setAnalysisStatus('Chunking failed', 0);
+  }
+});
+analysisNewRunBtn?.addEventListener('click', async () => {
+  if (!activeAnalysisDatasetId) return analysisLogLine('Select a dataset first.', 'error');
+  try {
+    const run = await window.api.analysisCreateRun(activeAnalysisDatasetId, currentAnalysisSettings());
+    activeAnalysisRunId = run.run_id;
+    localStorage.setItem('activeAnalysisRunId', activeAnalysisRunId);
+    analysisLogLine(`Created ${run.run_id}`);
+    await loadAnalysisRuns();
+  } catch (err) {
+    analysisLogLine(`Run creation failed: ${err?.message || err}`, 'error');
+  }
+});
+analysisProfile?.addEventListener('change', () => {
+  localStorage.setItem('analysisProfile', analysisProfile.value || 'fast');
+  applyAnalysisProfileDefaults(analysisProfile.value || 'fast', true);
+  analysisLogLine(`Analysis profile set to ${analysisProfile.value || 'fast'}.`);
+});
+analysisDensity?.addEventListener('change', () => {
+  const profile = analysisProfile?.value || 'fast';
+  const defaults = profile === 'quality'
+    ? { sparse: 10, normal: 18, rich: 30 }
+    : { sparse: 25, normal: 40, rich: 50 };
+  if (analysisMaxTopics && !densityChanged) {
+    analysisMaxTopics.value = defaults[analysisDensity.value] || 24;
+  }
+});
+analysisMaxTopics?.addEventListener('input', () => { densityChanged = true; });
+analysisProcessBtn?.addEventListener('click', () => {
+  clearAnalysisView('analysis');
+  refreshAnalysisPaths();
+  processAnalysisTopics({ logKind: 'analysis' });
+});
+analysisTestRunBtn?.addEventListener('click', async () => {
+  clearAnalysisView('test');
+  if (!activeAnalysisDatasetId) {
+    analysisLogLine('Import or select a dataset first.', 'error');
+    return;
+  }
+  if (!currentModel) {
+    analysisLogLine('Select a model before running a test slice.', 'error');
+    return;
+  }
+  try {
+    analysisStopRequested = false;
+    const settings = {
+      ...currentAnalysisSettings(),
+      testSlice: {
+        mode: analysisTestMode?.value || 'random',
+        count: Math.max(1, parseInt(analysisTestCount?.value || '5') || 5),
+        start: Math.max(0, parseInt(analysisTestStart?.value || '0') || 0)
+      }
+    };
+    const run = await window.api.analysisCreateRun(activeAnalysisDatasetId, settings);
+    activeAnalysisRunId = run.run_id;
+    localStorage.setItem('activeAnalysisRunId', activeAnalysisRunId);
+    await loadAnalysisRuns();
+    await refreshAnalysisPaths();
+    activeAnalysisLogKind = 'test';
+    const state = await window.api.analysisRunState(activeAnalysisDatasetId, activeAnalysisRunId);
+    const selected = selectAnalysisTestChunks(state.chunks || []);
+    if (!selected.length) {
+      analysisLogLine('No chunks available. Build chunks first.', 'error');
+      return;
+    }
+    const coverage = analysisCoverage(selected, state.chunks || []);
+    const testStartedAt = performance.now();
+    updateAnalysisMetrics({ coverage });
+    analysisLogLine(`Created test run ${activeAnalysisRunId} with ${selected.length} selected chunks: ${selected.map(c => c.chunk_id).join(', ')}`);
+    analysisLogLine(`Test coverage: ${coverage.selectedChunks}/${coverage.totalChunks} chunks (${coverage.chunkPct.toFixed(2)}%), ${compactNumber(coverage.selectedChars)}/${compactNumber(coverage.totalChars)} chars (${coverage.charPct.toFixed(2)}%), full corpus ~${coverage.multiplier.toFixed(1)}x this slice by chars.`);
+    await processAnalysisTopics({ chunks: selected, label: 'test slice', coverage, totalStartedAt: testStartedAt, logKind: 'test' });
+    if (!analysisStopRequested) await canonizeAnalysisRun({ totalStartedAt: testStartedAt, logKind: 'test' });
+    if (!analysisStopRequested) {
+      analysisLogLine(`Test slice finished in ${formatDuration(performance.now() - testStartedAt)}. Full corpus rough estimate: ${formatDuration((performance.now() - testStartedAt) * coverage.multiplier)} by selected-char multiplier.`);
+      analysisResultLine('Test slice complete', [
+        `duration ${formatDuration(performance.now() - testStartedAt)}`,
+        `full estimate ${formatDuration((performance.now() - testStartedAt) * coverage.multiplier)}`,
+        `${coverage.selectedChunks}/${coverage.totalChunks} chunks`,
+        `${coverage.charPct.toFixed(2)}% chars`
+      ]);
+      updateAnalysisMetrics({
+        coverage,
+        totalElapsedMs: performance.now() - testStartedAt,
+        lastPhaseName: 'Test slice',
+        lastPhaseDurationMs: performance.now() - testStartedAt
+      });
+    }
+  } catch (err) {
+    analysisLogLine(`Test slice failed: ${err?.message || err}`, 'error');
+    setAnalysisStatus('Test failed', 0);
+  }
+});
+analysisReprocessBtn?.addEventListener('click', () => {
+  if (!activeAnalysisDatasetId || !activeAnalysisRunId) {
+    analysisLogLine('Select a dataset and run first.', 'error');
+    return;
+  }
+  showConfirmDialog(
+    'Re-process topics for this run? This clears saved topic results, errors, canonization batches, and the exported graph, then starts the topic pass again. This can take a very long time.',
+    async () => {
+      try {
+        clearAnalysisView('analysis');
+        analysisStopRequested = false;
+        setAnalysisStatus('Resetting topics', 0);
+        await window.api.analysisResetTopics(activeAnalysisDatasetId, activeAnalysisRunId);
+        if (analysisOutputPath) analysisOutputPath.textContent = '';
+        analysisLogLine('Cleared topic results and dependent canonization outputs.');
+        await loadAnalysisRuns();
+        await refreshAnalysisPaths();
+        await processAnalysisTopics({ logKind: 'analysis' });
+      } catch (err) {
+        analysisLogLine(`Re-process reset failed: ${err?.message || err}`, 'error');
+        setAnalysisStatus('Reset failed', 0);
+      }
+    },
+    'Re-process'
+  );
+});
+analysisCanonizeBtn?.addEventListener('click', () => {
+  clearAnalysisView('analysis');
+  refreshAnalysisPaths();
+  canonizeAnalysisRun({ logKind: 'analysis' });
+});
+analysisRecanonizeBtn?.addEventListener('click', () => {
+  if (!activeAnalysisDatasetId || !activeAnalysisRunId) {
+    analysisLogLine('Select a dataset and run first.', 'error');
+    return;
+  }
+  showConfirmDialog(
+    'Re-canonize all topic results for this run? This clears saved canonization batches and the exported graph, then starts canonization again. This can take a very long time.',
+    async () => {
+      try {
+        clearAnalysisView('analysis');
+        analysisStopRequested = false;
+        setAnalysisStatus('Resetting canonization', 0);
+        await window.api.analysisResetCanonization(activeAnalysisDatasetId, activeAnalysisRunId);
+        if (analysisOutputPath) analysisOutputPath.textContent = '';
+        analysisLogLine('Cleared canonization batches and exported graph.');
+        await refreshAnalysisPaths();
+        await canonizeAnalysisRun({ logKind: 'analysis' });
+      } catch (err) {
+        analysisLogLine(`Re-canonize reset failed: ${err?.message || err}`, 'error');
+        setAnalysisStatus('Reset failed', 0);
+      }
+    },
+    'Re-canonize'
+  );
+});
+analysisStopBtn?.addEventListener('click', () => {
+  analysisStopRequested = true;
+  window.api.cancelMessage().catch(() => {});
+});
+
 settingsServerConnect.addEventListener('click', () => {
   const url = settingsServerUrl.value.trim();
   if (!url) return;
@@ -259,7 +2488,7 @@ if (settingsReadMarkerToggle) {
 
 // ── Confirm dialog ─────────────────────────────────────────────────────────────
 
-function showConfirmDialog(message, onConfirm) {
+function showConfirmDialog(message, onConfirm, confirmText = 'Delete') {
   const existing = document.getElementById('confirm-overlay');
   if (existing) existing.remove();
 
@@ -282,7 +2511,7 @@ function showConfirmDialog(message, onConfirm) {
 
   const confirmBtn = document.createElement('button');
   confirmBtn.className = 'confirm-ok';
-  confirmBtn.textContent = 'Delete';
+  confirmBtn.textContent = confirmText;
   confirmBtn.addEventListener('click', () => { overlay.remove(); onConfirm(); });
 
   btnRow.appendChild(cancelBtn);

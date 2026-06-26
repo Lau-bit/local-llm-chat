@@ -1278,6 +1278,21 @@ async fn post_stream(
     {
         body["response_format"] = json!({ "type": "json_object" });
     }
+    let reasoning_preference = options
+        .as_ref()
+        .and_then(|o| o.get("reasoningRequested"))
+        .and_then(Value::as_bool);
+    if let Some(enabled) = reasoning_preference {
+        if enabled {
+            body["reasoning_effort"] = json!("medium");
+            body["enable_thinking"] = json!(true);
+            body["thinking"] = json!(true);
+        } else {
+            body["reasoning_effort"] = json!("none");
+            body["enable_thinking"] = json!(false);
+            body["thinking"] = json!(false);
+        }
+    }
 
     dev_log(
         &window,
@@ -1288,7 +1303,9 @@ async fn post_stream(
             "model": model,
             "messageCount": effective.as_array().map(|a| a.len()).unwrap_or(0),
             "messages": summarize_messages(&effective),
-            "streaming": true
+            "streaming": true,
+            "reasoningRequested": reasoning_preference,
+            "reasoningMode": match reasoning_preference { Some(true) => "ask_on", Some(false) => "explicit_off", None => "unspecified" }
         }),
     );
 
@@ -1310,7 +1327,7 @@ async fn post_stream(
         r = request => r
     };
 
-    let response = match response {
+    let mut response = match response {
         Ok(r) => r,
         Err(e) => {
             let msg = format!("Connection failed: {e}");
@@ -1318,13 +1335,59 @@ async fn post_stream(
             return json!({ "error": msg });
         }
     };
+    let mut reasoning_fallback = false;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body_text = response.text().await.unwrap_or_default();
+        if reasoning_preference.is_some() {
+            let mut fallback_body = body.clone();
+            if let Some(obj) = fallback_body.as_object_mut() {
+                obj.remove("reasoning_effort");
+                obj.remove("enable_thinking");
+                obj.remove("thinking");
+            }
+            dev_log(
+                &window,
+                "response",
+                json!({
+                    "endpoint": endpoint,
+                    "model": model,
+                    "durationMs": now_ms().saturating_sub(start),
+                    "status": "reasoning_hint_rejected",
+                    "error": format!("Server returned {status}: {body_text}"),
+                    "retryingWithoutReasoning": true
+                }),
+            );
+            let retry = client.post(&endpoint).json(&fallback_body).send();
+            response = match tokio::select! {
+                _ = &mut cancel_rx => {
+                    dev_log(&window, "response", json!({ "endpoint": endpoint, "model": model, "durationMs": now_ms().saturating_sub(start), "status": "cancelled" }));
+                    return json!({ "cancelled": true });
+                }
+                r = retry => r
+            } {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = format!("Connection failed after reasoning fallback: {e}");
+                    dev_log(&window, "response", json!({ "endpoint": endpoint, "model": model, "durationMs": now_ms().saturating_sub(start), "status": "error", "error": msg }));
+                    return json!({ "error": msg, "reasoningFallback": true });
+                }
+            };
+            reasoning_fallback = true;
+        } else {
+            let msg = format!("Server error {status}: {body_text}");
+            dev_log(&window, "response", json!({ "endpoint": endpoint, "model": model, "durationMs": now_ms().saturating_sub(start), "status": "error", "error": msg }));
+            return json!({ "error": msg, "reasoningFallback": false });
+        }
+    }
 
     if !response.status().is_success() {
         let status = response.status();
         let body_text = response.text().await.unwrap_or_default();
         let msg = format!("Server error {status}: {body_text}");
         dev_log(&window, "response", json!({ "endpoint": endpoint, "model": model, "durationMs": now_ms().saturating_sub(start), "status": "error", "error": msg }));
-        return json!({ "error": msg });
+        return json!({ "error": msg, "reasoningFallback": reasoning_fallback });
     }
 
     let mut stream = response.bytes_stream();
@@ -1411,7 +1474,9 @@ async fn post_stream(
             "durationMs": now_ms().saturating_sub(start),
             "contentLength": full_content.len(),
             "chunkCount": chunk_count,
-            "status": "success"
+            "status": "success",
+            "reasoningRequested": reasoning_preference,
+            "reasoningFallback": reasoning_fallback
         }),
     );
 
@@ -1419,7 +1484,7 @@ async fn post_stream(
         *current = None;
     }
 
-    json!({ "content": full_content })
+    json!({ "content": full_content, "reasoningRequested": reasoning_preference, "reasoningFallback": reasoning_fallback })
 }
 
 async fn post_image_analysis_stream(

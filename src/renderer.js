@@ -8,7 +8,7 @@ function renderMarkdown(text) {
 
 const messagesEl        = document.getElementById('messages');
 const analysisContainer = document.getElementById('analysis-container');
-const dataAnalysisBtn   = document.getElementById('data-analysis-btn');
+const appModeTabs       = Array.from(document.querySelectorAll('.app-mode-tab'));
 const analysisBackChat  = document.getElementById('analysis-back-chat');
 const analysisSourcePath = document.getElementById('analysis-source-path');
 const analysisSourceTabs = Array.from(document.querySelectorAll('.analysis-source-tab'));
@@ -38,6 +38,8 @@ const analysisTestStart = document.getElementById('analysis-test-start');
 const analysisStatusPill = document.getElementById('analysis-status-pill');
 const analysisProgressFill = document.getElementById('analysis-progress-fill');
 const analysisProgressText = document.getElementById('analysis-progress-text');
+const analysisLoading = document.getElementById('analysis-loading');
+const analysisLoadingText = document.getElementById('analysis-loading-text');
 const analysisMetrics = document.getElementById('analysis-metrics');
 const analysisOutputPath = document.getElementById('analysis-output-path');
 const analysisOpenOutputBtn = document.getElementById('analysis-open-output-btn');
@@ -80,6 +82,10 @@ const settingsTemp      = document.getElementById('settings-temp');
 const settingsTempValue = document.getElementById('settings-temp-value');
 const settingsTempReset = document.getElementById('settings-temp-reset');
 const settingsMaxTokens = document.getElementById('settings-max-tokens');
+const reasoningChatToggle = document.getElementById('reasoning-chat-toggle');
+const reasoningAnalysisToggle = document.getElementById('reasoning-analysis-toggle');
+const reasoningInfoBtn = document.getElementById('reasoning-info-btn');
+const reasoningInlineInfo = document.getElementById('reasoning-inline-info');
 const scrollTopBtn      = document.getElementById('scroll-top-btn');
 const scrollBottomBtn   = document.getElementById('scroll-bottom-btn');
 const imagePreview      = document.getElementById('image-preview');
@@ -111,6 +117,8 @@ let serverOnline = false;
 let systemPrompt = localStorage.getItem('systemPrompt') || '';
 let currentTemp = parseFloat(localStorage.getItem('temperature') || '0.7');
 let currentMaxTokens = parseInt(localStorage.getItem('maxTokens') || '0');
+let requestChatReasoning = localStorage.getItem('requestChatReasoning') === '1';
+let requestAnalysisReasoning = localStorage.getItem('requestAnalysisReasoning') === '1';
 let currentChat = null;
 let conversationHistory = [];
 let currentChatMeta = [];
@@ -134,6 +142,8 @@ let activeAnalysisSource = ['anthropic', 'openai'].includes(localStorage.getItem
 let activeAnalysisDatasetId = localStorage.getItem(`activeAnalysisDatasetId:${activeAnalysisSource}`) || localStorage.getItem('activeAnalysisDatasetId') || '';
 let activeAnalysisRunId = localStorage.getItem(`activeAnalysisRunId:${activeAnalysisSource}`) || localStorage.getItem('activeAnalysisRunId') || '';
 let analysisBusy = false;
+let analysisModeActive = false;
+let reasoningInfoOpen = false;
 let analysisStopRequested = false;
 let densityChanged = false;
 let activeAnalysisLogKind = '';
@@ -290,9 +300,28 @@ applyWebSearchToggle();
 // ── Data analysis mode ─────────────────────────────────────────────────────────
 
 function setAnalysisMode(enabled) {
+  if (analysisModeActive === enabled) {
+    for (const tab of appModeTabs) {
+      const selected = tab.dataset.mode === (enabled ? 'analysis' : 'chat');
+      tab.classList.toggle('active', selected);
+      tab.setAttribute('aria-selected', selected ? 'true' : 'false');
+    }
+    renderReasoningInfo();
+    return;
+  }
+  analysisModeActive = enabled;
+  reasoningInfoOpen = false;
   analysisContainer?.classList.toggle('hidden', !enabled);
   document.body.classList.toggle('analysis-mode', enabled);
+  newChatBtn?.classList.toggle('hidden', enabled);
+  for (const tab of appModeTabs) {
+    const selected = tab.dataset.mode === (enabled ? 'analysis' : 'chat');
+    tab.classList.toggle('active', selected);
+    tab.setAttribute('aria-selected', selected ? 'true' : 'false');
+  }
+  renderReasoningInfo();
   if (enabled) {
+    setAnalysisLoading(true, 'Loading data analysis workspace...');
     try {
       closeSettings();
     } catch (err) {
@@ -300,12 +329,17 @@ function setAnalysisMode(enabled) {
     }
     setAnalysisStatus('Loading', 0);
     if (analysisProgressText) analysisProgressText.textContent = 'Loading data analysis workspace...';
-    Promise.resolve(loadAnalysisDatasets()).catch((err) => {
+    Promise.resolve()
+      .then(() => new Promise(resolve => requestAnimationFrame(resolve)))
+      .then(() => loadAnalysisDatasets())
+      .catch((err) => {
       console.error('Failed to load analysis datasets:', err);
       analysisLogLine(`Failed to load datasets: ${err?.message || err}`, 'error');
       setAnalysisStatus('Load failed', 0);
       if (analysisProgressText) analysisProgressText.textContent = 'Data analysis opened, but dataset loading failed.';
-    });
+    }).finally(() => setAnalysisLoading(false));
+  } else {
+    setAnalysisLoading(false);
   }
 }
 
@@ -362,6 +396,22 @@ function setAnalysisStatus(text, pct = null) {
   if (analysisProgressFill && pct !== null) {
     analysisProgressFill.style.width = `${Math.max(0, Math.min(100, pct))}%`;
   }
+}
+
+function setAnalysisLoading(visible, text = 'Loading analysis workspace...') {
+  if (analysisLoadingText) analysisLoadingText.textContent = text;
+  analysisLoading?.classList.toggle('hidden', !visible);
+}
+
+function resetAnalysisProgress(text = 'No run selected.') {
+  setAnalysisStatus('Idle', 0);
+  if (analysisProgressText) analysisProgressText.textContent = text;
+}
+
+function markAnalysisStopped(text = 'Stopped by user.') {
+  analysisStopRequested = true;
+  setAnalysisStatus('Stopped', 100);
+  if (analysisProgressText) analysisProgressText.textContent = text;
 }
 
 function compactNumber(value) {
@@ -424,6 +474,16 @@ const ANALYSIS_PROFILE_DEFAULTS = {
   quality: { chunkTargetChars: '18000', maxTopics: '24', callCharLimit: '24000', density: 'rich', temperature: '0.2' }
 };
 
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+  }[ch]));
+}
+
 function applyAnalysisProfileDefaults(profile, force = false) {
   const defaults = ANALYSIS_PROFILE_DEFAULTS[profile] || ANALYSIS_PROFILE_DEFAULTS.fast;
   if (analysisChunkTarget && (force || !analysisChunkTarget.value)) analysisChunkTarget.value = defaults.chunkTargetChars;
@@ -440,6 +500,106 @@ function initAnalysisProfile() {
   analysisProfile.value = ANALYSIS_PROFILE_DEFAULTS[saved] ? saved : 'fast';
   localStorage.setItem('analysisProfile', analysisProfile.value);
   applyAnalysisProfileDefaults(analysisProfile.value, saved !== 'fast');
+}
+
+function valueAtPath(value, path) {
+  let current = value;
+  for (const key of path) {
+    if (!current || typeof current !== 'object' || !(key in current)) return undefined;
+    current = current[key];
+  }
+  return current;
+}
+
+function findReasoningMetadata(value, depth = 0, path = []) {
+  if (!value || depth > 5) return null;
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      const found = findReasoningMetadata(value[i], depth + 1, [...path, String(i)]);
+      if (found) return found;
+    }
+    return null;
+  }
+  if (typeof value !== 'object') return null;
+  for (const [key, nested] of Object.entries(value)) {
+    const lower = key.toLowerCase();
+    if (lower.includes('reason') || lower.includes('thinking') || lower.includes('thought')) {
+      return { path: [...path, key].join('.'), value: nested };
+    }
+    const found = findReasoningMetadata(nested, depth + 1, [...path, key]);
+    if (found) return found;
+  }
+  return null;
+}
+
+function inferReasoningCapability(modelId = currentModel) {
+  if (!modelId) {
+    return { state: 'unknown', source: 'no model selected', detail: 'Select a model to see reported reasoning metadata.' };
+  }
+  const info = MODELS[modelId] || {};
+  const raw = info.raw || {};
+  const directPaths = [
+    ['reasoning'],
+    ['reasoning_capable'],
+    ['supports_reasoning'],
+    ['thinking'],
+    ['supports_thinking'],
+    ['capabilities', 'reasoning'],
+    ['capabilities', 'thinking'],
+    ['meta', 'reasoning'],
+    ['meta', 'reasoning_capable'],
+    ['meta', 'supports_reasoning'],
+    ['metadata', 'reasoning'],
+    ['metadata', 'supports_reasoning']
+  ];
+  for (const path of directPaths) {
+    const value = valueAtPath(raw, path);
+    if (value !== undefined && value !== null) {
+      if (value === true) return { state: 'reported supported', source: path.join('.'), detail: 'Server metadata explicitly reports reasoning support.' };
+      if (value === false) return { state: 'reported not supported', source: path.join('.'), detail: 'Server metadata explicitly reports no reasoning support.' };
+      return { state: 'reported metadata present', source: path.join('.'), detail: `${path.join('.')} = ${JSON.stringify(value).slice(0, 90)}` };
+    }
+  }
+
+  const metadataHit = findReasoningMetadata(raw);
+  if (metadataHit) {
+    return {
+      state: 'reported metadata present',
+      source: metadataHit.path,
+      detail: `${metadataHit.path} = ${JSON.stringify(metadataHit.value).slice(0, 90)}`
+    };
+  }
+
+  const id = modelId.toLowerCase();
+  if (/(^|[/._-])(o1|o3|o4|gpt-5|deepseek-r1|qwq|reason|reasoning|think|thinking)([/._-]|$)/i.test(id)) {
+    return { state: 'likely reasoning model', source: 'model name heuristic', detail: 'The model id contains a common reasoning-model signal.' };
+  }
+  return { state: 'unknown', source: 'no reasoning metadata found', detail: 'The server did not report a recognizable reasoning capability field.' };
+}
+
+function renderReasoningInfo() {
+  const report = inferReasoningCapability(currentModel);
+  const modelLabel = currentModel ? (currentModel.split('/').pop() || currentModel) : 'none';
+  const setButton = (btn, enabled, label) => {
+    if (!btn) return;
+    btn.classList.toggle('active', enabled);
+    btn.setAttribute('aria-pressed', enabled ? 'true' : 'false');
+    btn.title = `${label} reasoning: ${enabled ? 'ask on' : 'explicit off'}`;
+  };
+  setButton(reasoningChatToggle, requestChatReasoning, 'Chat');
+  setButton(reasoningAnalysisToggle, requestAnalysisReasoning, 'Data analysis');
+  reasoningChatToggle?.classList.toggle('hidden', analysisModeActive);
+  reasoningAnalysisToggle?.classList.toggle('hidden', !analysisModeActive);
+  reasoningInfoBtn?.classList.toggle('active', reasoningInfoOpen);
+  reasoningInfoBtn?.setAttribute('aria-expanded', reasoningInfoOpen ? 'true' : 'false');
+  if (reasoningInlineInfo) {
+    reasoningInlineInfo.classList.toggle('hidden', !reasoningInfoOpen);
+    if (reasoningInfoOpen) {
+      const currentMode = analysisModeActive ? 'Analysis' : 'Chat';
+      const currentState = analysisModeActive ? requestAnalysisReasoning : requestChatReasoning;
+      reasoningInlineInfo.innerHTML = `Model <strong>${escapeHtml(modelLabel)}</strong>: ${escapeHtml(report.state)}. ${currentMode} reasoning <strong>${currentState ? 'ask on' : 'off'}</strong>. Off sends no-thinking hints; model templates may still force thinking.`;
+    }
+  }
 }
 
 function analysisStorageKey(name, source = activeAnalysisSource) {
@@ -556,29 +716,34 @@ function renderAnalysisDatasetSummary(dataset) {
 
 async function loadAnalysisDatasets() {
   if (!window.api?.analysisList) return;
-  analysisDatasets = await window.api.analysisList(activeAnalysisSource).catch((err) => {
-    analysisLogLine(`Failed to list datasets: ${err?.message || err}`, 'error');
-    return [];
-  });
-  if (!analysisDatasetSelect) return;
-  analysisDatasetSelect.innerHTML = '';
-  for (const dataset of analysisDatasets) {
-    const opt = document.createElement('option');
-    opt.value = dataset.dataset_id;
-    opt.textContent = `${dataset.dataset_id} (${dataset.record_count || 0} records)`;
-    analysisDatasetSelect.appendChild(opt);
+  setAnalysisLoading(true, `Loading ${analysisSourceLabel()} datasets...`);
+  try {
+    analysisDatasets = await window.api.analysisList(activeAnalysisSource).catch((err) => {
+      analysisLogLine(`Failed to list datasets: ${err?.message || err}`, 'error');
+      return [];
+    });
+    if (!analysisDatasetSelect) return;
+    analysisDatasetSelect.innerHTML = '';
+    for (const dataset of analysisDatasets) {
+      const opt = document.createElement('option');
+      opt.value = dataset.dataset_id;
+      opt.textContent = `${dataset.dataset_id} (${dataset.record_count || 0} records)`;
+      analysisDatasetSelect.appendChild(opt);
+    }
+    if (activeAnalysisDatasetId && analysisDatasets.some(d => d.dataset_id === activeAnalysisDatasetId)) {
+      analysisDatasetSelect.value = activeAnalysisDatasetId;
+    } else if (analysisDatasets[0]) {
+      activeAnalysisDatasetId = analysisDatasets[0].dataset_id;
+      analysisDatasetSelect.value = activeAnalysisDatasetId;
+    } else {
+      activeAnalysisDatasetId = '';
+    }
+    localStorage.setItem(analysisStorageKey('activeAnalysisDatasetId'), activeAnalysisDatasetId || '');
+    renderAnalysisDatasetSummary(analysisDatasets.find(d => d.dataset_id === activeAnalysisDatasetId));
+    await loadAnalysisRuns();
+  } finally {
+    setAnalysisLoading(false);
   }
-  if (activeAnalysisDatasetId && analysisDatasets.some(d => d.dataset_id === activeAnalysisDatasetId)) {
-    analysisDatasetSelect.value = activeAnalysisDatasetId;
-  } else if (analysisDatasets[0]) {
-    activeAnalysisDatasetId = analysisDatasets[0].dataset_id;
-    analysisDatasetSelect.value = activeAnalysisDatasetId;
-  } else {
-    activeAnalysisDatasetId = '';
-  }
-  localStorage.setItem(analysisStorageKey('activeAnalysisDatasetId'), activeAnalysisDatasetId || '');
-  renderAnalysisDatasetSummary(analysisDatasets.find(d => d.dataset_id === activeAnalysisDatasetId));
-  await loadAnalysisRuns();
 }
 
 async function loadAnalysisRuns() {
@@ -588,37 +753,41 @@ async function loadAnalysisRuns() {
     analysisRunSelect.innerHTML = '';
     activeAnalysisRunId = '';
     localStorage.setItem(analysisStorageKey('activeAnalysisRunId'), '');
-    await refreshAnalysisRunProgress();
+    resetAnalysisProgress('Import or select a dataset first.');
     return;
   }
-  analysisRuns = await window.api.analysisListRuns(activeAnalysisDatasetId).catch((err) => {
-    analysisLogLine(`Failed to list runs: ${err?.message || err}`, 'error');
-    return [];
-  });
-  analysisRunSelect.innerHTML = '';
-  for (const run of analysisRuns) {
-    const opt = document.createElement('option');
-    opt.value = run.run_id;
-    opt.textContent = `${run.run_id} (${run.processed_count || 0}/${run.chunk_count || 0})`;
-    analysisRunSelect.appendChild(opt);
+  setAnalysisLoading(true, 'Loading analysis runs...');
+  try {
+    analysisRuns = await window.api.analysisListRuns(activeAnalysisDatasetId).catch((err) => {
+      analysisLogLine(`Failed to list runs: ${err?.message || err}`, 'error');
+      return [];
+    });
+    analysisRunSelect.innerHTML = '';
+    for (const run of analysisRuns) {
+      const opt = document.createElement('option');
+      opt.value = run.run_id;
+      opt.textContent = `${run.run_id} (${run.processed_count || 0}/${run.chunk_count || 0})`;
+      analysisRunSelect.appendChild(opt);
+    }
+    if (activeAnalysisRunId && analysisRuns.some(r => r.run_id === activeAnalysisRunId)) {
+      analysisRunSelect.value = activeAnalysisRunId;
+    } else if (analysisRuns[0]) {
+      activeAnalysisRunId = analysisRuns[0].run_id;
+      analysisRunSelect.value = activeAnalysisRunId;
+    } else {
+      activeAnalysisRunId = '';
+    }
+    localStorage.setItem(analysisStorageKey('activeAnalysisRunId'), activeAnalysisRunId || '');
+    await refreshAnalysisPaths();
+    await refreshAnalysisRunProgress();
+  } finally {
+    setAnalysisLoading(false);
   }
-  if (activeAnalysisRunId && analysisRuns.some(r => r.run_id === activeAnalysisRunId)) {
-    analysisRunSelect.value = activeAnalysisRunId;
-  } else if (analysisRuns[0]) {
-    activeAnalysisRunId = analysisRuns[0].run_id;
-    analysisRunSelect.value = activeAnalysisRunId;
-  } else {
-    activeAnalysisRunId = '';
-  }
-  localStorage.setItem(analysisStorageKey('activeAnalysisRunId'), activeAnalysisRunId || '');
-  await refreshAnalysisPaths();
-  await refreshAnalysisRunProgress();
 }
 
 async function refreshAnalysisRunProgress() {
   if (!activeAnalysisDatasetId || !activeAnalysisRunId) {
-    if (analysisProgressText) analysisProgressText.textContent = 'No run selected.';
-    setAnalysisStatus('Idle', 0);
+    resetAnalysisProgress(activeAnalysisDatasetId ? 'No run selected.' : 'Import or select a dataset first.');
     return null;
   }
   const state = await window.api.analysisRunState(activeAnalysisDatasetId, activeAnalysisRunId).catch((err) => {
@@ -672,6 +841,7 @@ async function runAnalysisModelDetailed(messages, temperature, analysisOptions =
       temperature,
       maxTokens,
       responseFormatJson,
+      reasoningRequested: requestAnalysisReasoning,
     },
     (chunk) => { text += chunk; }
   );
@@ -682,6 +852,9 @@ async function runAnalysisModelDetailed(messages, temperature, analysisOptions =
   }
   if (result?.error) throw new Error(result.error);
   if (result?.cancelled) throw new Error('cancelled');
+  if (result?.reasoningFallback) {
+    analysisLogLine('Reasoning controls were rejected by this server/model; this data-analysis request was retried without them.', 'warn');
+  }
   const finalText = text || result?.content || '';
   const durationMs = Math.round(performance.now() - startedAt);
   return {
@@ -696,6 +869,8 @@ async function runAnalysisModelDetailed(messages, temperature, analysisOptions =
       max_tokens: maxTokens || null,
       response_format_json_requested: requestedJsonMode,
       response_format_json_used: responseFormatJson,
+      reasoning_requested: requestAnalysisReasoning,
+      reasoning_fallback_used: result?.reasoningFallback === true,
       created_at: new Date().toISOString()
     }
   };
@@ -875,6 +1050,10 @@ function parseFastRecordIds(value) {
     .slice(0, 6);
 }
 
+function escapeRegExp(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 function blankTopicResultForChunk(chunk) {
   return {
     chunk_id: chunk.chunk_id,
@@ -888,27 +1067,67 @@ function blankTopicResultForChunk(chunk) {
 function parseFastTopicLines(raw, chunks) {
   const byChunk = new Map((chunks || []).map(chunk => [chunk.chunk_id, blankTopicResultForChunk(chunk)]));
   const errors = [];
-  const lines = String(raw || '').split(/\r?\n/);
+  const validChunkIds = new Set(byChunk.keys());
+  const singleChunkId = validChunkIds.size === 1 ? [...validChunkIds][0] : '';
+  const chunkPattern = [...validChunkIds].map(escapeRegExp).join('|');
+  const levelPattern = '(?:macro|topic|subtopic|motif)';
+  let normalizedRaw = String(raw || '');
+  if (chunkPattern) {
+    const malformedRows = [];
+    const withoutEchoedHeader = normalizedRaw.replace(/TOPIC\|chunk_id\|level\|label\|parent_label\|summary\|record_id1,record_id2/gi, '');
+    const malformedRowPattern = new RegExp(`(?:^|\\s)([^|\\n]{1,120})\\|(${chunkPattern})\\|(${levelPattern})\\|([^|\\n]{1,120})\\|([^|\\n]{0,120})\\|([^|\\n]{1,260})\\|([^|\\n]*?)(?=\\s+[^|\\n]{1,120}\\|(?:${chunkPattern})\\|${levelPattern}\\||\\s+TOPIC\\|(?:${chunkPattern})\\|${levelPattern}\\||$)`, 'gi');
+    withoutEchoedHeader.replace(malformedRowPattern, (_match, _category, chunkId, level, label, parentLabel, summary, recordIds) => {
+      malformedRows.push(`TOPIC|${chunkId}|${level}|${label}|${parentLabel}|${summary}|${String(recordIds || '').trim()}`);
+      return '';
+    });
+    const validRawRows = withoutEchoedHeader
+      .replace(new RegExp(`\\s+(?=TOPIC\\|(?:${chunkPattern})\\|${levelPattern}\\|)`, 'gi'), '\n')
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(line => /^(TOPIC|EVENT)\|/i.test(line));
+    normalizedRaw = [...validRawRows, ...malformedRows].join('\n');
+  }
+  const lines = normalizedRaw.split(/\r?\n/);
   for (const originalLine of lines) {
-    const line = originalLine.trim().replace(/^[\s>*-]*(?:\d+[.)]\s*)?/, '');
+    const line = originalLine
+      .trim()
+      .replace(/^```(?:\w+)?\s*$/i, '')
+      .replace(/^[\s>*-]*(?:\d+[.)]\s*)?/, '')
+      .replace(/^\|/, '')
+      .replace(/\|$/, '')
+      .replace(/\s*\|\s*/g, '|');
     if (!line) continue;
-    const upper = line.toUpperCase();
-    if (!upper.startsWith('TOPIC|') && !upper.startsWith('EVENT|')) continue;
-    const parts = line.split('|').map(part => part.trim());
-    const kind = parts[0]?.toUpperCase();
+    let parts = line.split('|').map(part => part.trim());
+    let kind = parts[0]?.toUpperCase();
+    if (kind !== 'TOPIC' && kind !== 'EVENT') {
+      const maybeChunkId = sanitizeFastField(parts[1], 80);
+      const maybeLevel = sanitizeFastField(parts[2], 24).toLowerCase();
+      if (validChunkIds.has(maybeChunkId) && ['macro', 'topic', 'subtopic', 'motif'].includes(maybeLevel)) {
+        parts = ['TOPIC', parts[1], parts[2], parts[3], parts[4], parts[5], parts[6]];
+        kind = 'TOPIC';
+      } else {
+        continue;
+      }
+    }
     const chunkId = sanitizeFastField(parts[1], 80);
+    if (chunkId.toLowerCase() === 'chunk_id') continue;
     const result = byChunk.get(chunkId);
     if (!result) {
-      errors.push({ line: originalLine, error: 'unknown_chunk_id' });
-      continue;
+      if (singleChunkId && (/^chunk[_ -]?\d+$/i.test(chunkId) || /^\d+$/.test(chunkId) || /^(chunk|current_chunk|this_chunk)$/i.test(chunkId))) {
+        parts[1] = singleChunkId;
+      } else {
+        errors.push({ line: originalLine, error: 'unknown_chunk_id' });
+        continue;
+      }
     }
+    const target = byChunk.get(parts[1]) || result;
     if (kind === 'TOPIC') {
       const label = sanitizeFastField(parts[3], 120);
       if (!label) {
         errors.push({ line: originalLine, error: 'missing_topic_label' });
         continue;
       }
-      result.topics.push({
+      target.topics.push({
         label,
         level: sanitizeFastField(parts[2] || 'topic', 24).toLowerCase() || 'topic',
         parent_label: sanitizeFastField(parts[4], 120),
@@ -924,7 +1143,7 @@ function parseFastTopicLines(raw, chunks) {
         errors.push({ line: originalLine, error: 'missing_event_summary' });
         continue;
       }
-      result.events.push({
+      target.events.push({
         timestamp: sanitizeFastField(parts[2], 60),
         summary,
         record_ids: parseFastRecordIds(parts[4])
@@ -935,6 +1154,43 @@ function parseFastTopicLines(raw, chunks) {
     results: [...byChunk.values()],
     errors
   };
+}
+
+function countFastTopics(results) {
+  return (results || []).reduce((sum, result) => sum + (result.topics || []).length, 0);
+}
+
+function previewForLog(value, max = 1000) {
+  return String(value || '').replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
+function fastTopicRepairPrompt(chunk, rawResponse, settings) {
+  return `The previous answer produced no usable TOPIC lines for chunk ${chunk.chunk_id}.
+
+Return only corrected pipe-delimited lines using this exact chunk id:
+${chunk.chunk_id}
+
+Valid format:
+TOPIC|${chunk.chunk_id}|level|label|parent_label|summary|record_id1,record_id2
+
+Rules:
+- Return 1 to ${settings.maxTopicsPerChunk} TOPIC lines.
+- Do not echo the header.
+- Do not use markdown, JSON, tables, bullets, or explanations.
+- Valid levels: macro, topic, subtopic, motif.
+- Keep labels under 6 words and summaries under 12 words.
+- Use record ids from the chunk when visible. If none are clear, leave the last field empty.
+
+Previous answer:
+${String(rawResponse || '').slice(0, 3000)}
+
+Chunk:
+CHUNK ${chunk.chunk_id}
+TIME ${chunk.time_start || ''} TO ${chunk.time_end || ''}
+RECORDS ${(chunk.record_ids || []).slice(0, 40).join(',')}
+TEXT
+${chunk.text}
+END CHUNK ${chunk.chunk_id}`;
 }
 
 function compactTopicResult(r) {
@@ -1384,7 +1640,7 @@ async function runFastTopicBatchAdaptive(batch, settings, batchId, depth = 0) {
       responseFormatJson: false
     });
     const parsed = parseFastTopicLines(modelResult.text, batch);
-    const topicCount = parsed.results.reduce((sum, result) => sum + (result.topics || []).length, 0);
+    const topicCount = countFastTopics(parsed.results);
     const missingChunks = parsed.results.filter(result => !(result.topics || []).length);
     const missingRatio = batch.length ? missingChunks.length / batch.length : 0;
     if (batch.length > 1 && (topicCount === 0 || missingRatio > 0.4)) {
@@ -1398,6 +1654,48 @@ async function runFastTopicBatchAdaptive(batch, settings, batchId, depth = 0) {
         metrics: aggregateFastBatchMetrics([left, right]),
         callCount: left.callCount + right.callCount,
         splitCount: left.splitCount + right.splitCount + 1
+      };
+    }
+    if (batch.length === 1 && topicCount === 0) {
+      analysisLogLine(`${batchId}: model returned no usable topics for ${batch[0].chunk_id}; requesting corrected pipe lines.`, 'warn');
+      const repairMessages = [
+        { role: 'system', content: 'Return only corrected TOPIC pipe lines. No markdown. No JSON. No explanations.' },
+        { role: 'user', content: fastTopicRepairPrompt(batch[0], modelResult.text, settings) }
+      ];
+      const repairResult = await runAnalysisModelDetailed(repairMessages, Math.min(0.1, settings.temperature), {
+        maxTokens: Math.min(settings.fastMaxTokens || 6144, 2048),
+        responseFormatJson: false
+      });
+      const repaired = parseFastTopicLines(repairResult.text, batch);
+      const repairedTopicCount = countFastTopics(repaired.results);
+      const metrics = aggregateFastBatchMetrics([
+        { metrics: modelResult.metrics },
+        { metrics: repairResult.metrics }
+      ]);
+      if (repairedTopicCount > 0) {
+        return {
+          results: repaired.results,
+          errors: repaired.errors,
+          metrics,
+          callCount: 2,
+          splitCount: 0
+        };
+      }
+      return {
+        results: repaired.results,
+        errors: [
+          ...parsed.errors,
+          ...repaired.errors,
+          {
+            error: 'zero_topics_after_repair',
+            chunk_id: batch[0].chunk_id,
+            raw_preview: previewForLog(modelResult.text),
+            repair_preview: previewForLog(repairResult.text)
+          }
+        ],
+        metrics,
+        callCount: 2,
+        splitCount: 0
       };
     }
     return {
@@ -1569,6 +1867,11 @@ async function processFastAnalysisTopics(options = {}, settingsOverride = null, 
   }
 
   stopMetricsTicker();
+  if (analysisStopRequested) {
+    markAnalysisStopped('Stopped during fast topic processing.');
+    await loadAnalysisRuns();
+    return;
+  }
   const phaseDurationMs = performance.now() - phaseStartedAt;
   analysisLogLine(`Fast topic phase finished in ${formatDuration(phaseDurationMs)}. Total elapsed ${formatDuration(performance.now() - totalStartedAt)}.`);
   analysisResultLine('Fast topic phase complete', [
@@ -1744,6 +2047,11 @@ async function processAnalysisTopics(options = {}) {
     }
   }
   stopMetricsTicker();
+  if (analysisStopRequested) {
+    markAnalysisStopped('Stopped during topic processing.');
+    await loadAnalysisRuns();
+    return;
+  }
   const phaseDurationMs = performance.now() - phaseStartedAt;
   analysisLogLine(`Topic phase finished in ${formatDuration(phaseDurationMs)}. Total elapsed ${formatDuration(performance.now() - totalStartedAt)}.`);
   analysisResultLine('Topic phase complete', [
@@ -2025,6 +2333,7 @@ async function canonizeAnalysisRun(options = {}) {
       if (analysisStopRequested) {
         analysisLogLine('Canonization stopped by user.', 'warn');
         stopCanonTicker();
+        markAnalysisStopped('Stopped during canonization.');
         return;
       }
       const batchId = canonBatchId('batch', i, batches[i], (item) => JSON.stringify(compactTopicResult(item)));
@@ -2145,6 +2454,7 @@ async function canonizeAnalysisRun(options = {}) {
       if (analysisStopRequested) {
         analysisLogLine('Canonization stopped by user.', 'warn');
         stopCanonTicker();
+        markAnalysisStopped('Stopped during merge.');
         return;
       }
       const mergeBatches = splitByPromptBudget(
@@ -2162,6 +2472,7 @@ async function canonizeAnalysisRun(options = {}) {
         if (analysisStopRequested) {
           analysisLogLine('Canonization stopped by user.', 'warn');
           stopCanonTicker();
+          markAnalysisStopped('Stopped during merge.');
           return;
         }
         const mergeId = canonBatchId(`round_${String(round).padStart(2, '0')}`, i, mergeBatches[i], (item) => JSON.stringify(compactGraphFragment(item)));
@@ -2332,8 +2643,26 @@ async function canonizeAnalysisRun(options = {}) {
 initAnalysisProfile();
 initAnalysisSourceTabs();
 
-dataAnalysisBtn?.addEventListener('click', () => setAnalysisMode(true));
+for (const tab of appModeTabs) {
+  tab.addEventListener('click', () => setAnalysisMode(tab.dataset.mode === 'analysis'));
+}
 analysisBackChat?.addEventListener('click', () => setAnalysisMode(false));
+reasoningChatToggle?.addEventListener('click', () => {
+  requestChatReasoning = !requestChatReasoning;
+  localStorage.setItem('requestChatReasoning', requestChatReasoning ? '1' : '0');
+  renderReasoningInfo();
+  addMessage('system', `Chat reasoning ${requestChatReasoning ? 'will be requested' : 'is explicitly off'}. ${inferReasoningCapability(currentModel).detail}`);
+});
+reasoningAnalysisToggle?.addEventListener('click', () => {
+  requestAnalysisReasoning = !requestAnalysisReasoning;
+  localStorage.setItem('requestAnalysisReasoning', requestAnalysisReasoning ? '1' : '0');
+  renderReasoningInfo();
+  analysisLogLine(`Data analysis reasoning ${requestAnalysisReasoning ? 'will be requested' : 'is explicitly off'}. ${inferReasoningCapability(currentModel).detail}`);
+});
+reasoningInfoBtn?.addEventListener('click', () => {
+  reasoningInfoOpen = !reasoningInfoOpen;
+  renderReasoningInfo();
+});
 analysisRefreshBtn?.addEventListener('click', loadAnalysisDatasets);
 analysisRunRefreshBtn?.addEventListener('click', loadAnalysisRuns);
 for (const tab of analysisSourceTabs) {
@@ -2350,7 +2679,9 @@ for (const tab of analysisSourceTabs) {
     restoreAnalysisSourceState(source);
     renderAnalysisSourceTabs();
     setAnalysisStatus('Loading', 0);
+    setAnalysisLoading(true, `Loading ${analysisSourceLabel(source)} workspace...`);
     if (analysisProgressText) analysisProgressText.textContent = `Loading ${analysisSourceLabel(source)} data analysis workspace...`;
+    await new Promise(resolve => requestAnimationFrame(resolve));
     await loadAnalysisDatasets();
   });
 }
@@ -2581,6 +2912,8 @@ analysisRecanonizeBtn?.addEventListener('click', () => {
 });
 analysisStopBtn?.addEventListener('click', () => {
   analysisStopRequested = true;
+  setAnalysisStatus('Stopping', null);
+  if (analysisProgressText) analysisProgressText.textContent = 'Stopping after the current model call finishes...';
   window.api.cancelMessage().catch(() => {});
 });
 
@@ -2909,11 +3242,13 @@ async function loadModels(forceCheck = false) {
     }
     updateContextBar();
     renderModelSettings();
+    renderReasoningInfo();
     renderSetupChecklist();
   } catch {
     setServerStatus('offline');
     populateModelSelects([]);
     populateSettingsModelSelect([]);
+    renderReasoningInfo();
     renderSetupChecklist();
   }
 }
@@ -2993,6 +3328,7 @@ function renderModelSettings() {
 
   const rows = [
     ['Context', info.contextLength ? `${info.contextLength.toLocaleString()} tokens` : 'unknown'],
+    ['Reasoning', inferReasoningCapability(modelId).state],
     ['Image capability', capability.state],
     ['Detected by', capability.source],
     ['API images', modelReceivesActualImages(modelId) ? 'actual images' : 'text placeholders'],
@@ -3224,6 +3560,7 @@ function applySelectedModel(modelId, persist = true, { preload = true } = {}) {
   }
   updateContextBar();
   renderModelSettings();
+  renderReasoningInfo();
   renderSetupChecklist();
   renderPendingImages();
   if (preload) preloadSelectedModel(modelId);
@@ -3280,6 +3617,7 @@ function toggleSettings() {
   if (!settingsPanel.classList.contains('hidden')) {
     // Refresh server URL field
     settingsServerUrl.value = serverUrl;
+    renderReasoningInfo();
   }
 }
 
@@ -4579,6 +4917,7 @@ async function streamAssistantResponse({ forceImageDescriptionsForLastUser = fal
     systemPrompt: systemPrompt || undefined,
     temperature: currentTemp,
     maxTokens: currentMaxTokens > 0 ? currentMaxTokens : undefined,
+    reasoningRequested: requestChatReasoning,
   };
   const requestHadImages = conversationHistory.some(messageHasImages);
   const apiMessages = buildApiMessagesForModel(conversationHistory, currentModel, { forceImageDescriptionsForLastUser });
@@ -4615,6 +4954,9 @@ async function streamAssistantResponse({ forceImageDescriptionsForLastUser = fal
   if (generation.stopped) return;
 
   finishStreaming();
+  if (result?.reasoningFallback) {
+    addMessage('system', 'Reasoning controls were rejected by this server/model, so the chat request was retried without them.');
+  }
 
   if (result?.error) {
     if (assistantDiv) assistantDiv.remove();

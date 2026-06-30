@@ -47,6 +47,14 @@ const analysisOpenRunFolderBtn = document.getElementById('analysis-open-run-fold
 const analysisOpenLogBtn = document.getElementById('analysis-open-log-btn');
 const analysisResults = document.getElementById('analysis-results');
 const analysisLog = document.getElementById('analysis-log');
+const analysisReconcilePathA = document.getElementById('analysis-reconcile-path-a');
+const analysisReconcilePathB = document.getElementById('analysis-reconcile-path-b');
+const analysisReconcileUseA = document.getElementById('analysis-reconcile-use-a');
+const analysisReconcileUseB = document.getElementById('analysis-reconcile-use-b');
+const analysisReconcileLlm = document.getElementById('analysis-reconcile-llm');
+const analysisReconcileRunBtn = document.getElementById('analysis-reconcile-run-btn');
+const analysisReconcileOpenBtn = document.getElementById('analysis-reconcile-open-btn');
+const analysisReconcileOutput = document.getElementById('analysis-reconcile-output');
 const inputEl           = document.getElementById('message-input');
 const sendBtn           = document.getElementById('send-btn');
 const chatListEl        = document.getElementById('chat-list');
@@ -2640,6 +2648,437 @@ async function canonizeAnalysisRun(options = {}) {
   }
 }
 
+// ── Reconcile two canonized graphs into one larger canonical vector map ──────────
+const RECONCILE_LEVEL_RANK = { macro: 0, topic: 1, subtopic: 2, motif: 3 };
+let lastReconciledPath = localStorage.getItem('analysisLastReconciledPath') || '';
+
+function reconcilePathStem(path) {
+  const clean = String(path || '').replace(/\\/g, '/').replace(/\/+$/, '');
+  const base = clean.split('/').pop() || 'graph';
+  return base.replace(/\.json$/i, '') || 'graph';
+}
+
+function reconcileSetLabel(graph, path, fallback) {
+  const ds = graph && typeof graph.dataset === 'object' && graph.dataset ? graph.dataset : null;
+  if (ds && (ds.id || ds.run_id)) {
+    return [ds.id, ds.run_id].filter(Boolean).join(' / ') || fallback;
+  }
+  if (graph?.graph_id) return String(graph.graph_id);
+  return reconcilePathStem(path) || fallback;
+}
+
+function conceptMatchTokens(concept) {
+  const tokens = new Set();
+  const add = (value) => {
+    const key = conceptMergeKey(value);
+    if (key) tokens.add(key);
+  };
+  add(concept.canonical_label || concept.concept_id);
+  for (const alias of concept.aliases || []) add(alias);
+  return tokens;
+}
+
+function reconcileConceptDigest(concepts, max) {
+  return (concepts || [])
+    .slice(0, max)
+    .map(c => ({
+      id: String(c.concept_id || ''),
+      label: truncateForPrompt(c.canonical_label || c.concept_id, 80),
+      aliases: compactStringArray(c.aliases, 4, 60),
+    }))
+    .filter(c => c.id && c.label);
+}
+
+function buildSynonymMatchPrompt(labelA, labelB, listA, listB) {
+  return `Two concept graphs were extracted from different data sources. Identify pairs of concepts — one from Set A and one from Set B — that refer to the SAME underlying concept, even when the wording differs (synonyms, abbreviations, rephrasings).
+
+Rules:
+- Only pair concepts that are genuinely the same thing.
+- Do NOT pair concepts that are merely related, sibling, or parent/child.
+- Each Set A concept pairs with at most one Set B concept, and vice versa.
+- Use the exact concept_id strings provided.
+
+Return ONLY minified JSON, no markdown:
+{"pairs":[{"a":"<Set A concept_id>","b":"<Set B concept_id>"}]}
+
+Set A (${labelA}):
+${JSON.stringify(listA)}
+
+Set B (${labelB}):
+${JSON.stringify(listB)}`;
+}
+
+async function llmMatchCrossSetSynonyms(graphA, graphB, labelA, labelB) {
+  const budget = 26000;
+  let listA = reconcileConceptDigest(graphA.concepts, 400);
+  let listB = reconcileConceptDigest(graphB.concepts, 400);
+  const size = () => JSON.stringify(listA).length + JSON.stringify(listB).length;
+  while (size() > budget && (listA.length > 40 || listB.length > 40)) {
+    if (listA.length >= listB.length) listA = listA.slice(0, Math.max(40, Math.floor(listA.length * 0.8)));
+    else listB = listB.slice(0, Math.max(40, Math.floor(listB.length * 0.8)));
+  }
+  if (listA.length < graphA.concepts.length || listB.length < graphB.concepts.length) {
+    analysisLogLine(`Synonym matching limited to the first ${listA.length}/${graphA.concepts.length} (A) and ${listB.length}/${graphB.concepts.length} (B) concepts to fit the prompt budget. The deterministic union still covers every concept.`, 'warn');
+  }
+  const raw = await runAnalysisModel([
+    { role: 'system', content: 'You match equivalent concepts across two concept graphs. You return valid JSON only.' },
+    { role: 'user', content: buildSynonymMatchPrompt(labelA, labelB, listA, listB) }
+  ], 0.1, { maxTokens: 4096, responseFormatJson: true });
+  let parsed;
+  try {
+    parsed = await parseAnalysisJsonWithRepair(raw, 'synonym-match', '{"pairs":[{"a":"A concept_id","b":"B concept_id"}]}');
+  } catch (err) {
+    if (err?.message === 'cancelled') throw err;
+    return [];
+  }
+  const aIds = new Set(listA.map(c => c.id));
+  const bIds = new Set(listB.map(c => c.id));
+  const out = [];
+  const seen = new Set();
+  for (const pair of (Array.isArray(parsed?.pairs) ? parsed.pairs : [])) {
+    const a = String(pair?.a || '').trim();
+    const b = String(pair?.b || '').trim();
+    if (!aIds.has(a) || !bIds.has(b) || seen.has(`${a}|${b}`)) continue;
+    seen.add(`${a}|${b}`);
+    out.push([`A:${a}`, `B:${b}`]);
+  }
+  return out;
+}
+
+function reconcileGraphs(graphA, graphB, options = {}) {
+  const inputs = [
+    { tag: 'A', label: options.labelA || 'A', graph: normalizeGraph(graphA, 'graph_a') },
+    { tag: 'B', label: options.labelB || 'B', graph: normalizeGraph(graphB, 'graph_b') },
+  ];
+
+  // Flatten concepts, keeping which set and original id each came from.
+  const nodes = [];
+  for (const input of inputs) {
+    for (const concept of input.graph.concepts || []) {
+      if (!concept || typeof concept !== 'object') continue;
+      const origId = String(concept.concept_id || normalizeConceptId(concept.canonical_label || 'concept'));
+      nodes.push({ set: input.tag, origId, concept });
+    }
+  }
+
+  // Union-find: group concepts that are the same across both sets.
+  const parent = nodes.map((_, i) => i);
+  const find = (i) => { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; } return i; };
+  const union = (a, b) => { const ra = find(a), rb = find(b); if (ra !== rb) parent[ra] = rb; };
+
+  // Merge on shared canonical/alias token (exact + alias-overlap duplicates).
+  const tokenOwner = new Map();
+  nodes.forEach((node, i) => {
+    for (const token of conceptMatchTokens(node.concept)) {
+      if (tokenOwner.has(token)) union(i, tokenOwner.get(token));
+      else tokenOwner.set(token, i);
+    }
+  });
+
+  // Apply optional model-found synonym links.
+  const indexByKey = new Map(nodes.map((node, i) => [`${node.set}:${node.origId}`, i]));
+  let forcedApplied = 0;
+  for (const pair of options.forcedPairs || []) {
+    const ia = indexByKey.get(pair[0]);
+    const ib = indexByKey.get(pair[1]);
+    if (ia != null && ib != null && find(ia) !== find(ib)) { union(ia, ib); forcedApplied += 1; }
+  }
+
+  const components = new Map();
+  nodes.forEach((node, i) => {
+    const root = find(i);
+    if (!components.has(root)) components.set(root, []);
+    components.get(root).push(node);
+  });
+
+  const usedIds = new Set();
+  const idMap = new Map(); // `${set}:${origId}` -> merged concept_id
+  const merged = [];
+  let matchedCount = 0;
+  const onlyCount = { A: 0, B: 0 };
+
+  for (const group of components.values()) {
+    const ranked = [...group].sort((a, b) => {
+      const score = (n) => (n.concept.evidence?.length || 0) * 2 + (n.concept.aliases?.length || 0) + (n.concept.subtopics?.length || 0);
+      return score(b) - score(a);
+    });
+    let mergedId = normalizeConceptId(ranked[0].concept.concept_id || ranked[0].concept.canonical_label || 'concept');
+    if (usedIds.has(mergedId)) {
+      mergedId = `${mergedId}_${hashString(group.map(n => `${n.set}:${n.origId}`).join('|')).slice(0, 6)}`;
+    }
+    usedIds.add(mergedId);
+
+    const sources = new Set();
+    let canonicalLabel = '';
+    let bestLevel = '';
+    let parentRef = null;
+    let summary = '';
+    let aliases = [];
+    let subtopics = [];
+    const evidence = [];
+
+    for (const node of ranked) {
+      sources.add(node.set);
+      idMap.set(`${node.set}:${node.origId}`, mergedId);
+      const c = node.concept;
+      canonicalLabel = chooseCanonicalLabel(canonicalLabel, sanitizeFastField(c.canonical_label || c.concept_id, 140));
+      const lvl = sanitizeFastField(c.level, 24);
+      if (lvl && (!bestLevel || (RECONCILE_LEVEL_RANK[lvl] ?? 9) < (RECONCILE_LEVEL_RANK[bestLevel] ?? 9))) bestLevel = lvl;
+      if (!parentRef && c.parent_id) parentRef = { set: node.set, id: String(c.parent_id) };
+      const s = sanitizeFastField(c.summary, 320);
+      if (s && s.length > summary.length) summary = s;
+      aliases = addUniqueLimited(aliases, [sanitizeFastField(c.canonical_label, 140), ...(c.aliases || [])], 16);
+      subtopics = addUniqueLimited(subtopics, c.subtopics || [], 18);
+      for (const ev of c.evidence || []) {
+        if (evidence.length >= 12) break;
+        if (ev && typeof ev === 'object') {
+          evidence.push({
+            set: node.set,
+            chunk_id: ev.chunk_id,
+            record_ids: Array.isArray(ev.record_ids) ? ev.record_ids.slice(0, 6) : [],
+          });
+        }
+      }
+    }
+
+    const sourceList = ['A', 'B'].filter(t => sources.has(t));
+    if (sourceList.length > 1) matchedCount += 1;
+    else onlyCount[sourceList[0]] += 1;
+
+    merged.push({
+      parentRef,
+      concept: {
+        concept_id: mergedId,
+        canonical_label: canonicalLabel || mergedId,
+        level: bestLevel || 'topic',
+        parent_id: '',
+        aliases: aliases.filter(a => a && a.toLowerCase() !== (canonicalLabel || '').toLowerCase()).slice(0, 14),
+        summary: summary || canonicalLabel || mergedId,
+        subtopics: subtopics.slice(0, 16),
+        evidence: evidence.slice(0, 12),
+        sources: sourceList,
+      },
+    });
+  }
+
+  // Resolve parent ids now that every concept has a merged id.
+  for (const entry of merged) {
+    const ref = entry.parentRef;
+    if (!ref || !ref.id) continue;
+    const resolved = idMap.get(`${ref.set}:${ref.id}`);
+    if (resolved && resolved !== entry.concept.concept_id) entry.concept.parent_id = resolved;
+  }
+
+  const concepts = merged
+    .map(m => m.concept)
+    .sort((a, b) => {
+      const span = (b.sources?.length || 0) - (a.sources?.length || 0);
+      if (span) return span;
+      const ac = (a.evidence?.length || 0) + (a.aliases?.length || 0);
+      const bc = (b.evidence?.length || 0) + (b.aliases?.length || 0);
+      return bc - ac || a.canonical_label.localeCompare(b.canonical_label);
+    })
+    .slice(0, 2000);
+  const keptIds = new Set(concepts.map(c => c.concept_id));
+
+  // Union events, remapping concept references per source set.
+  const events = [];
+  const seenEvents = new Set();
+  for (const input of inputs) {
+    for (const event of input.graph.events || []) {
+      if (!event || typeof event !== 'object') continue;
+      const summary = sanitizeFastField(event.summary, 320);
+      if (!summary) continue;
+      const timestamp = sanitizeFastField(event.timestamp, 60);
+      const dedupeKey = `${timestamp}|${conceptMergeKey(summary)}`;
+      if (seenEvents.has(dedupeKey)) continue;
+      seenEvents.add(dedupeKey);
+      const conceptIds = (event.concept_ids || [])
+        .map(id => idMap.get(`${input.tag}:${String(id)}`))
+        .filter(id => id && keptIds.has(id));
+      events.push({
+        event_id: normalizeConceptId(`${input.tag}_${event.event_id || dedupeKey}`),
+        timestamp,
+        concept_ids: [...new Set(conceptIds)].slice(0, 8),
+        summary,
+        sources: [input.tag],
+      });
+      if (events.length >= 1200) break;
+    }
+  }
+
+  // Union edges, remapping endpoints and keeping the strongest weight per relation.
+  const edgeByKey = new Map();
+  for (const input of inputs) {
+    for (const edge of input.graph.edges || []) {
+      if (!edge || typeof edge !== 'object') continue;
+      const source = idMap.get(`${input.tag}:${String(edge.source)}`);
+      const target = idMap.get(`${input.tag}:${String(edge.target)}`);
+      if (!source || !target || source === target || !keptIds.has(source) || !keptIds.has(target)) continue;
+      const relationship = sanitizeFastField(edge.relationship, 40) || 'related';
+      const key = `${source}->${target}:${relationship}`;
+      const weight = typeof edge.weight === 'number' ? edge.weight : undefined;
+      const existing = edgeByKey.get(key);
+      if (existing) {
+        if (weight != null && (existing.weight == null || weight > existing.weight)) existing.weight = weight;
+        if (!existing.sources.includes(input.tag)) existing.sources.push(input.tag);
+      } else {
+        edgeByKey.set(key, { source, target, relationship, weight, sources: [input.tag] });
+      }
+    }
+  }
+  const edges = [...edgeByKey.values()].slice(0, 1600);
+
+  const sourceConceptTotal = nodes.length;
+  const reconciledAt = new Date().toISOString();
+  const graphId = `reconciled_${hashString(`${options.labelA}:${options.labelB}:${sourceConceptTotal}:${reconciledAt}`).slice(0, 8)}`;
+  const inputMeta = inputs.map((input, i) => ({
+    set: input.tag,
+    label: input.label,
+    graph_id: input.graph.graph_id || '',
+    dataset: input.graph.dataset || null,
+    path: (options.inputPaths || [])[i] || '',
+    concept_count: (input.graph.concepts || []).length,
+    event_count: (input.graph.events || []).length,
+    edge_count: (input.graph.edges || []).length,
+  }));
+
+  return {
+    schema_version: '0.1.0',
+    graph_id: graphId,
+    dataset: { id: 'reconciled', run_id: graphId },
+    datasets: inputs.map(input => input.graph.dataset || null),
+    concepts,
+    events,
+    edges,
+    generated_at: reconciledAt,
+    canonization_mode: `reconcile_${options.mode || 'deterministic'}`,
+    reconciliation: {
+      reconciled_at: reconciledAt,
+      mode: options.mode || 'deterministic',
+      model: options.model || '',
+      inputs: inputMeta,
+      source_concept_total: sourceConceptTotal,
+      matched_concepts: matchedCount,
+      only_in_a: onlyCount.A,
+      only_in_b: onlyCount.B,
+      forced_pairs_applied: forcedApplied,
+      duration_ms: 0,
+    },
+    metrics: {
+      stage: 'reconciled_graph',
+      concept_count: concepts.length,
+      event_count: events.length,
+      edge_count: edges.length,
+      matched_concepts: matchedCount,
+      only_in_a: onlyCount.A,
+      only_in_b: onlyCount.B,
+      source_concept_total: sourceConceptTotal,
+      model: options.model || '',
+      generated_at: reconciledAt,
+    },
+  };
+}
+
+async function reconcileAnalysisGraphs() {
+  const pathA = (analysisReconcilePathA?.value || '').trim();
+  const pathB = (analysisReconcilePathB?.value || '').trim();
+  if (!pathA || !pathB) {
+    analysisLogLine('Provide two graph JSON paths to reconcile.', 'error');
+    return;
+  }
+  if (pathA === pathB) {
+    analysisLogLine('Choose two different graphs to reconcile.', 'warn');
+    return;
+  }
+  const useLlm = !!analysisReconcileLlm?.checked;
+  if (useLlm && !currentModel) {
+    analysisLogLine('Select a model first, or turn off cross-set synonym matching.', 'error');
+    return;
+  }
+  analysisStopRequested = false;
+  const startedAt = performance.now();
+  clearAnalysisView(activeAnalysisLogKind || '');
+  setAnalysisStatus('Reconciling', 5);
+  if (analysisProgressText) analysisProgressText.textContent = 'Loading graphs to reconcile...';
+  analysisLogLine(`Reconciling graphs:\n  A: ${pathA}\n  B: ${pathB}`);
+
+  let graphA;
+  let graphB;
+  try {
+    graphA = await window.api.analysisReadGraph(pathA);
+    graphB = await window.api.analysisReadGraph(pathB);
+  } catch (err) {
+    analysisLogLine(`Failed to read graph: ${err?.message || err}`, 'error');
+    setAnalysisStatus('Reconcile failed', 100);
+    return;
+  }
+  if (!Array.isArray(graphA?.concepts) || !Array.isArray(graphB?.concepts)) {
+    analysisLogLine('Both files must be canonized graphs with a "concepts" array. Run "Canonize + Export" first.', 'error');
+    setAnalysisStatus('Reconcile failed', 100);
+    return;
+  }
+  const labelA = reconcileSetLabel(graphA, pathA, 'A');
+  const labelB = reconcileSetLabel(graphB, pathB, 'B');
+  analysisLogLine(`Set A "${labelA}": ${graphA.concepts.length} concepts, ${(graphA.events || []).length} events, ${(graphA.edges || []).length} edges.`);
+  analysisLogLine(`Set B "${labelB}": ${graphB.concepts.length} concepts, ${(graphB.events || []).length} events, ${(graphB.edges || []).length} edges.`);
+
+  let forcedPairs = [];
+  if (useLlm) {
+    setAnalysisStatus('Matching synonyms', 35);
+    if (analysisProgressText) analysisProgressText.textContent = 'Matching cross-set synonyms with the model...';
+    try {
+      forcedPairs = await llmMatchCrossSetSynonyms(graphA, graphB, labelA, labelB);
+      analysisLogLine(`Model matched ${forcedPairs.length} cross-set synonym pair(s).`);
+    } catch (err) {
+      if ((err?.message || String(err)) === 'cancelled') {
+        markAnalysisStopped('Stopped during synonym matching.');
+        return;
+      }
+      analysisLogLine(`Cross-set synonym matching failed; continuing with deterministic union only. ${err?.message || err}`, 'warn');
+    }
+  }
+
+  setAnalysisStatus('Merging', 70);
+  if (analysisProgressText) analysisProgressText.textContent = 'Building unified canonical vector map...';
+  const graph = reconcileGraphs(graphA, graphB, {
+    labelA,
+    labelB,
+    forcedPairs,
+    mode: useLlm ? 'llm_assisted' : 'deterministic',
+    model: useLlm ? (currentModel || '') : '',
+    inputPaths: [pathA, pathB],
+  });
+  const durationMs = performance.now() - startedAt;
+  graph.reconciliation.duration_ms = Math.round(durationMs);
+  graph.metrics.total_elapsed_ms = Math.round(durationMs);
+
+  const name = `reconciled_${reconcilePathStem(pathA)}_${reconcilePathStem(pathB)}`.slice(0, 80);
+  const saved = await window.api.analysisSaveReconciliation(name, graph).catch((err) => {
+    analysisLogLine(`Failed to save reconciled graph: ${err?.message || err}`, 'error');
+    return null;
+  });
+  if (!saved) {
+    setAnalysisStatus('Reconcile failed', 100);
+    return;
+  }
+  lastReconciledPath = saved.path;
+  localStorage.setItem('analysisLastReconciledPath', saved.path);
+  if (analysisReconcileOutput) analysisReconcileOutput.textContent = `Reconciled graph: ${saved.path}`;
+  if (analysisOutputPath) analysisOutputPath.textContent = `Output: ${saved.path}`;
+  const r = graph.reconciliation;
+  analysisLogLine(`Saved reconciled graph: ${saved.path}`);
+  analysisLogLine(`Union: ${graph.concepts.length} concepts (${r.matched_concepts} merged across both sets, ${r.only_in_a} only in A, ${r.only_in_b} only in B), ${graph.events.length} events, ${graph.edges.length} edges. Finished in ${formatDuration(durationMs)}.`);
+  analysisResultLine('Reconciliation complete', [
+    `${graph.concepts.length} concepts`,
+    `${r.matched_concepts} cross-set merges`,
+    `${graph.events.length} events`,
+    `${graph.edges.length} edges`,
+    formatDuration(durationMs),
+  ]);
+  setAnalysisStatus('Reconciled', 100);
+}
+
 initAnalysisProfile();
 initAnalysisSourceTabs();
 
@@ -2718,6 +3157,35 @@ analysisOpenLogBtn?.addEventListener('click', async () => {
   if (!target) return analysisLogLine('No log path available.', 'error');
   window.api.analysisOpenPath(target).catch((err) => analysisLogLine(`Open log failed: ${err?.message || err}`, 'error'));
 });
+// Reconcile graphs panel: restore persisted state.
+if (analysisReconcilePathA) analysisReconcilePathA.value = localStorage.getItem('analysisReconcilePathA') || '';
+if (analysisReconcilePathB) analysisReconcilePathB.value = localStorage.getItem('analysisReconcilePathB') || '';
+if (analysisReconcileLlm) analysisReconcileLlm.checked = localStorage.getItem('analysisReconcileLlm') === '1';
+if (analysisReconcileOutput && lastReconciledPath) analysisReconcileOutput.textContent = `Reconciled graph: ${lastReconciledPath}`;
+
+analysisReconcilePathA?.addEventListener('input', () => localStorage.setItem('analysisReconcilePathA', analysisReconcilePathA.value || ''));
+analysisReconcilePathB?.addEventListener('input', () => localStorage.setItem('analysisReconcilePathB', analysisReconcilePathB.value || ''));
+analysisReconcileLlm?.addEventListener('change', () => localStorage.setItem('analysisReconcileLlm', analysisReconcileLlm.checked ? '1' : '0'));
+
+async function fillReconcilePathFromCurrentRun(input) {
+  if (!input) return;
+  if (!activeAnalysisDatasetId || !activeAnalysisRunId) {
+    return analysisLogLine('Select a dataset and run first, or paste a graph path manually.', 'warn');
+  }
+  const paths = activeAnalysisPaths || await refreshAnalysisPaths();
+  if (!paths?.outputGraph) return analysisLogLine('No output graph path for the active run yet. Canonize a run first.', 'warn');
+  input.value = paths.outputGraph;
+  localStorage.setItem(input === analysisReconcilePathA ? 'analysisReconcilePathA' : 'analysisReconcilePathB', input.value);
+}
+
+analysisReconcileUseA?.addEventListener('click', () => fillReconcilePathFromCurrentRun(analysisReconcilePathA));
+analysisReconcileUseB?.addEventListener('click', () => fillReconcilePathFromCurrentRun(analysisReconcilePathB));
+analysisReconcileRunBtn?.addEventListener('click', () => withAnalysisBusy(reconcileAnalysisGraphs));
+analysisReconcileOpenBtn?.addEventListener('click', () => {
+  if (!lastReconciledPath) return analysisLogLine('Reconcile two graphs first.', 'warn');
+  window.api.analysisOpenPath(lastReconciledPath).catch((err) => analysisLogLine(`Open reconciled failed: ${err?.message || err}`, 'error'));
+});
+
 analysisImportBtn?.addEventListener('click', async () => {
   await withAnalysisBusy(async () => {
     const path = analysisSourcePath?.value?.trim();

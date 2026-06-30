@@ -330,6 +330,30 @@
           <div class="analysis-summary">Creates a temporary run, processes only the selected slice, then canonizes it for fast prompt iteration.</div>
         </section>
 
+        <section class="analysis-panel analysis-reconcile-panel">
+          <div class="analysis-test-header">
+            <h2>Reconcile graphs</h2>
+            <button id="analysis-reconcile-run-btn">Reconcile + Export</button>
+          </div>
+          <div class="analysis-summary">Merge two canonized output graphs into one larger canonical vector map. Cross-set duplicates are merged (aliases, subtopics, evidence and provenance are unioned); everything distinct is kept. Paste two <code>output_graph.json</code> paths, or any graph JSON with concepts/events/edges.</div>
+          <div class="analysis-path-row">
+            <input id="analysis-reconcile-path-a" type="text" placeholder="Graph A path (output_graph.json)..." spellcheck="false">
+            <button id="analysis-reconcile-use-a" title="Fill with the active run's output graph path">Use current run</button>
+          </div>
+          <div class="analysis-path-row">
+            <input id="analysis-reconcile-path-b" type="text" placeholder="Graph B path (output_graph.json)..." spellcheck="false">
+            <button id="analysis-reconcile-use-b" title="Fill with the active run's output graph path">Use current run</button>
+          </div>
+          <label class="analysis-reconcile-toggle">
+            <input type="checkbox" id="analysis-reconcile-llm">
+            <span>Also use the loaded model to match cross-set synonyms with different wording (slower; needs a selected model)</span>
+          </label>
+          <div id="analysis-reconcile-output" class="analysis-summary"></div>
+          <div class="analysis-actions-row analysis-open-row">
+            <button id="analysis-reconcile-open-btn">Open Reconciled</button>
+          </div>
+        </section>
+
         <section class="analysis-panel analysis-progress-panel">
           <div class="analysis-progress-top">
             <h2>Progress</h2>

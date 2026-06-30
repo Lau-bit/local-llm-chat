@@ -76,6 +76,8 @@
     analysisSaveCanonBatch: (datasetId, runId, batchId, graph) => invoke('analysis_save_canon_batch', { datasetId, runId, batchId, graph }),
     analysisListCanonBatches: (datasetId, runId) => invoke('analysis_list_canon_batches', { datasetId, runId }),
     analysisSaveGraph: (datasetId, runId, graph) => invoke('analysis_save_graph', { datasetId, runId, graph }),
+    analysisReadGraph: (path) => invoke('analysis_read_graph', { path }),
+    analysisSaveReconciliation: (name, graph) => invoke('analysis_save_reconciliation', { name, graph }),
     analysisAppendLog: (datasetId, runId, logKind, line) => invoke('analysis_append_log', { datasetId, runId, logKind, line }),
     analysisPaths: (datasetId, runId) => invoke('analysis_paths', { datasetId, runId }),
     analysisOpenPath: (path) => invoke('analysis_open_path', { path }),

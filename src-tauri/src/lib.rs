@@ -2050,6 +2050,47 @@ fn analysis_save_graph(
     Ok(json!({ "ok": true, "path": path.display().to_string() }))
 }
 
+#[tauri::command]
+fn analysis_read_graph(path: String) -> Result<Value, String> {
+    let p = PathBuf::from(path.trim().trim_matches('"'));
+    if p.extension()
+        .and_then(|s| s.to_str())
+        .map(|e| e.eq_ignore_ascii_case("json"))
+        != Some(true)
+    {
+        return Err("Graph path must point to a .json file.".to_string());
+    }
+    if !p.exists() {
+        return Err(format!("Graph not found: {}", p.display()));
+    }
+    let text = fs::read_to_string(&p).map_err(|e| format!("Could not read {}: {e}", p.display()))?;
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("Could not parse {} as JSON: {e}", p.display()))?;
+    Ok(value)
+}
+
+#[tauri::command]
+fn analysis_save_reconciliation(
+    app: AppHandle,
+    name: Option<String>,
+    graph: Value,
+) -> Result<Value, String> {
+    let dir = analysis_dir(&app).join("reconciliations");
+    ensure_dir(&dir)?;
+    let base = match name {
+        Some(n) if !n.trim().is_empty() => sanitize_id_part(&n),
+        _ => "reconciled".to_string(),
+    };
+    let file = format!("{base}_{}.json", radix36(now_ms() as u64));
+    let path = dir.join(file);
+    fs::write(
+        &path,
+        serde_json::to_string_pretty(&graph).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(json!({ "ok": true, "path": path.display().to_string() }))
+}
+
 fn run_log_path(app: &AppHandle, dataset_id: &str, run_id: &str, log_kind: &str) -> PathBuf {
     let safe_kind = sanitize_id_part(log_kind);
     run_dir(app, dataset_id, run_id)
@@ -2859,6 +2900,8 @@ pub fn run() {
             analysis_save_canon_batch,
             analysis_list_canon_batches,
             analysis_save_graph,
+            analysis_read_graph,
+            analysis_save_reconciliation,
             analysis_append_log,
             analysis_paths,
             analysis_open_path,

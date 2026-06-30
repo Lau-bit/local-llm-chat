@@ -1315,6 +1315,26 @@ body.analysis-mode #analysis-container:not(.hidden) {
 
 .analysis-test-header h2 { margin: 0; }
 
+.analysis-reconcile-panel { margin-bottom: 14px; }
+
+.analysis-reconcile-toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 10px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
+  cursor: pointer;
+}
+
+.analysis-reconcile-toggle input {
+  margin: 2px 0 0;
+  flex: 0 0 auto;
+}
+
+#analysis-reconcile-output:not(:empty) { margin-top: 10px; color: var(--accent); }
+
 .analysis-progress-top {
   display: flex;
   align-items: center;

@@ -2860,6 +2860,14 @@ fn window_start_drag(window: WebviewWindow) -> Result<(), String> {
     window.start_dragging().map_err(|e| e.to_string())
 }
 
+// Windows downscales this high-res icon crisply for the taskbar; relying on the
+// embedded .ico alone looks blurry at non-100% display scaling.
+fn apply_window_icon(window: &WebviewWindow) {
+    let bytes = include_bytes!("../icons/icon.rgba");
+    let icon = tauri::image::Image::new(bytes, 1024, 1024);
+    let _ = window.set_icon(icon);
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
@@ -2870,6 +2878,9 @@ pub fn run() {
                 server_url: Mutex::new(url),
             };
             app.manage(state);
+            if let Some(window) = app.get_webview_window("main") {
+                apply_window_icon(&window);
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

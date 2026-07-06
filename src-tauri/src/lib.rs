@@ -2,7 +2,7 @@ use base64::{engine::general_purpose, Engine as _};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     fs,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
@@ -15,14 +15,42 @@ use tokio::sync::oneshot;
 
 const DEFAULT_SERVER_URL: &str = "http://localhost:1234";
 const CONNECT_TIMEOUT_SECS: u64 = 30;
+const RESPONSE_HEADERS_TIMEOUT_SECS: u64 = 120;
 const STALL_TIMEOUT_SECS: u64 = 120;
 const IMAGE_ANALYSIS_MAX_TOKENS: u64 = 8192;
 
 #[derive(Default)]
 struct AppState {
-    current_cancel: Mutex<Option<oneshot::Sender<()>>>,
+    // Keyed by generation id so one in-flight generation starting never cancels another
+    // (previously a single shared slot — starting request B silently killed request A).
+    current_cancel: Mutex<HashMap<u64, oneshot::Sender<()>>>,
+    next_generation: Mutex<u64>,
     current_model_load_cancel: Mutex<Option<oneshot::Sender<()>>>,
     server_url: Mutex<String>,
+    // Cache of chat_id -> file path so single-chat ops don't rescan the whole chats tree.
+    // Rebuilt wholesale on a lookup miss (e.g. externally-added files) to stay correct.
+    chat_index: Mutex<Option<HashMap<String, PathBuf>>>,
+}
+
+fn next_generation_id(state: &AppState) -> u64 {
+    let mut g = state.next_generation.lock().unwrap();
+    *g += 1;
+    *g
+}
+
+// Removes this generation's cancel slot on drop, covering every return path (success,
+// error, or cancelled) so a request can never leave a stale entry behind.
+struct CancelGuard<'a> {
+    state: &'a AppState,
+    generation: u64,
+}
+
+impl Drop for CancelGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.state.current_cancel.lock() {
+            map.remove(&self.generation);
+        }
+    }
 }
 
 fn now_ms() -> u128 {
@@ -231,23 +259,79 @@ fn list_chat_files(root: &Path) -> Vec<PathBuf> {
     files
 }
 
-fn find_chat_file_in(root: &Path, chat_id: &str) -> Option<PathBuf> {
-    let filename = chat_file_name(chat_id);
-    let legacy = root.join(&filename);
-    if legacy.exists() {
-        return Some(legacy);
-    }
-    for file in list_chat_files(root) {
-        if file.file_name().and_then(|s| s.to_str()) == Some(filename.as_str()) {
-            return Some(file);
+// Builds the full chat_id -> path map by walking both trees once. Only called to
+// (re)populate the cache, never on the single-chat lookup hot path. Private is scanned
+// first so a same-id collision resolves to the public copy on insert, matching the old
+// find_chat_file_in's precedence (chats_dir was always tried before private_dir).
+fn build_chat_index(app: &AppHandle) -> HashMap<String, PathBuf> {
+    let mut index = HashMap::new();
+    for path in list_chat_files(&private_dir(app)) {
+        if let Some(id) = path.file_stem().and_then(|s| s.to_str()) {
+            index.insert(id.to_string(), path);
         }
     }
-    None
+    for path in list_chat_files(&chats_dir(app)) {
+        if let Some(id) = path.file_stem().and_then(|s| s.to_str()) {
+            index.insert(id.to_string(), path);
+        }
+    }
+    index
 }
 
-fn find_chat_file(app: &AppHandle, chat_id: &str) -> Option<PathBuf> {
-    find_chat_file_in(&chats_dir(app), chat_id)
-        .or_else(|| find_chat_file_in(&private_dir(app), chat_id))
+// Looks up a single chat_id via the cached index instead of rescanning the whole
+// year/month tree on every rename/delete/load/save. Builds the index on first use and
+// rebuilds it once on a miss (covers files added/moved outside this cache, e.g. by
+// another running instance) so correctness never depends on the cache being warm.
+fn chat_index_lookup(app: &AppHandle, state: &AppState, chat_id: &str) -> Option<PathBuf> {
+    let mut just_built = false;
+    {
+        let mut guard = state.chat_index.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(build_chat_index(app));
+            just_built = true;
+        }
+        if let Some(path) = guard.as_ref().and_then(|idx| idx.get(chat_id)) {
+            if path.exists() {
+                return Some(path.clone());
+            }
+        }
+    }
+    // A fresh build we just did above already reflects current disk state, so a miss
+    // there is a real miss — rebuilding again immediately would just repeat the same
+    // full directory walk for the same answer.
+    if just_built {
+        return None;
+    }
+    let fresh = build_chat_index(app);
+    let found = fresh.get(chat_id).cloned();
+    *state.chat_index.lock().unwrap() = Some(fresh);
+    found
+}
+
+fn find_chat_file(app: &AppHandle, state: &AppState, chat_id: &str) -> Option<PathBuf> {
+    chat_index_lookup(app, state, chat_id)
+}
+
+fn find_chat_file_public(app: &AppHandle, state: &AppState, chat_id: &str) -> Option<PathBuf> {
+    chat_index_lookup(app, state, chat_id).filter(|p| !p.starts_with(private_dir(app)))
+}
+
+fn find_chat_file_private(app: &AppHandle, state: &AppState, chat_id: &str) -> Option<PathBuf> {
+    chat_index_lookup(app, state, chat_id).filter(|p| p.starts_with(private_dir(app)))
+}
+
+fn chat_index_insert(state: &AppState, chat_id: &str, path: PathBuf) {
+    if let Ok(mut guard) = state.chat_index.lock() {
+        guard.get_or_insert_with(HashMap::new).insert(chat_id.to_string(), path);
+    }
+}
+
+fn chat_index_remove(state: &AppState, chat_id: &str) {
+    if let Ok(mut guard) = state.chat_index.lock() {
+        if let Some(idx) = guard.as_mut() {
+            idx.remove(chat_id);
+        }
+    }
 }
 
 fn get_text_content(msg: &Value) -> String {
@@ -537,10 +621,14 @@ fn load_chat_from_file(text_path: &Path) -> Result<Value, String> {
         .unwrap_or_default();
     let json_path = chat_json_path(text_path);
     if json_path.exists() {
-        let json_text = fs::read_to_string(&json_path).map_err(|e| e.to_string())?;
-        let mut chat: Value = serde_json::from_str(&json_text).map_err(|e| e.to_string())?;
-        hydrate_chat_attachments(&mut chat, text_path);
-        return Ok(chat);
+        // A crash mid-write can leave this missing/truncated/corrupt even though the
+        // .txt sibling written just before it is intact — fall back instead of erroring.
+        if let Ok(json_text) = fs::read_to_string(&json_path) {
+            if let Ok(mut chat) = serde_json::from_str::<Value>(&json_text) {
+                hydrate_chat_attachments(&mut chat, text_path);
+                return Ok(chat);
+            }
+        }
     }
 
     let text = fs::read_to_string(text_path).map_err(|e| e.to_string())?;
@@ -553,9 +641,26 @@ fn write_chat_bundle(text_path: &Path, chat: &Value) -> Result<(), String> {
     }
     let mut structured = chat.clone();
     persist_chat_attachments(&mut structured, text_path)?;
-    fs::write(text_path, chat_to_text(&structured)).map_err(|e| e.to_string())?;
+
+    // Write full contents to temp files first, then atomically rename into place, so a
+    // crash/power-loss mid-write can never leave a truncated .txt or .json on disk.
+    let text_tmp = text_path.with_extension("txt.tmp");
+    fs::write(&text_tmp, chat_to_text(&structured)).map_err(|e| e.to_string())?;
+    let json_path = chat_json_path(text_path);
+    let json_tmp = json_path.with_extension("json.tmp");
     let json_text = serde_json::to_string_pretty(&structured).map_err(|e| e.to_string())?;
-    fs::write(chat_json_path(text_path), json_text).map_err(|e| e.to_string())?;
+    fs::write(&json_tmp, json_text).map_err(|e| e.to_string())?;
+
+    // Rename .txt into place FIRST: chat discovery (list_chat_files/build_chat_index)
+    // is keyed on .txt existing, not .json. Renaming .json first would mean a crash
+    // between the two renames leaves a brand-new chat's .json on disk with no .txt at
+    // all — permanently invisible to every listing, even though its data survives.
+    // Renaming .txt first instead means the worst case for an existing chat is that
+    // load_chat_from_file falls back to briefly-stale .json content (still a complete,
+    // valid prior save) until the next successful write — much cheaper than losing a
+    // brand-new chat's discoverability entirely.
+    fs::rename(&text_tmp, text_path).map_err(|e| e.to_string())?;
+    fs::rename(&json_tmp, &json_path).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -634,8 +739,9 @@ fn summarize_messages(messages: &Value) -> Value {
                 let role = m.get("role").cloned().unwrap_or(Value::String(String::new()));
                 let content = match m.get("content") {
                     Some(Value::String(s)) => {
-                        if s.len() > 120 {
-                            format!("{}…", &s[..120])
+                        if s.chars().count() > 120 {
+                            let truncated: String = s.chars().take(120).collect();
+                            format!("{truncated}…")
                         } else {
                             s.clone()
                         }
@@ -1218,6 +1324,29 @@ fn unique_chunk_count(path: &Path) -> usize {
         .unwrap_or(0)
 }
 
+// Bounds only the wait for response headers — NOT a streamed body, which post_stream
+// reads separately under STALL_TIMEOUT_SECS — so a server that never even replies
+// (accepts the TCP connection then goes silent) can't hang a request forever. Shared by
+// post_stream's initial request and its reasoning-fallback retry.
+enum HeaderWaitOutcome {
+    Ready(reqwest::Result<reqwest::Response>),
+    Cancelled,
+    TimedOut,
+}
+
+async fn await_response_headers(
+    request: impl std::future::Future<Output = reqwest::Result<reqwest::Response>>,
+    cancel_rx: &mut oneshot::Receiver<()>,
+) -> HeaderWaitOutcome {
+    tokio::select! {
+        _ = &mut *cancel_rx => HeaderWaitOutcome::Cancelled,
+        r = tokio::time::timeout(Duration::from_secs(RESPONSE_HEADERS_TIMEOUT_SECS), request) => match r {
+            Ok(inner) => HeaderWaitOutcome::Ready(inner),
+            Err(_) => HeaderWaitOutcome::TimedOut,
+        },
+    }
+}
+
 async fn post_stream(
     window: WebviewWindow,
     state: tauri::State<'_, AppState>,
@@ -1236,9 +1365,12 @@ async fn post_stream(
     let start = now_ms();
 
     let (cancel_tx, mut cancel_rx) = oneshot::channel();
-    if let Ok(mut current) = state.current_cancel.lock() {
-        *current = Some(cancel_tx);
-    }
+    let generation = next_generation_id(&state);
+    state.current_cancel.lock().unwrap().insert(generation, cancel_tx);
+    let _cancel_guard = CancelGuard {
+        state: state.inner(),
+        generation,
+    };
 
     // Prepend system prompt if provided
     let mut effective = messages.clone();
@@ -1319,12 +1451,17 @@ async fn post_stream(
 
     let request = client.post(&endpoint).json(&body).send();
 
-    let response = tokio::select! {
-        _ = &mut cancel_rx => {
+    let response = match await_response_headers(request, &mut cancel_rx).await {
+        HeaderWaitOutcome::Cancelled => {
             dev_log(&window, "response", json!({ "endpoint": endpoint, "model": model, "durationMs": now_ms().saturating_sub(start), "status": "cancelled" }));
             return json!({ "cancelled": true });
         }
-        r = request => r
+        HeaderWaitOutcome::TimedOut => {
+            let msg = format!("Server accepted the connection but sent no response within {RESPONSE_HEADERS_TIMEOUT_SECS}s");
+            dev_log(&window, "response", json!({ "endpoint": endpoint, "model": model, "durationMs": now_ms().saturating_sub(start), "status": "error", "error": msg }));
+            return json!({ "error": msg });
+        }
+        HeaderWaitOutcome::Ready(r) => r,
     };
 
     let mut response = match response {
@@ -1360,15 +1497,18 @@ async fn post_stream(
                 }),
             );
             let retry = client.post(&endpoint).json(&fallback_body).send();
-            response = match tokio::select! {
-                _ = &mut cancel_rx => {
+            response = match await_response_headers(retry, &mut cancel_rx).await {
+                HeaderWaitOutcome::Cancelled => {
                     dev_log(&window, "response", json!({ "endpoint": endpoint, "model": model, "durationMs": now_ms().saturating_sub(start), "status": "cancelled" }));
                     return json!({ "cancelled": true });
                 }
-                r = retry => r
-            } {
-                Ok(r) => r,
-                Err(e) => {
+                HeaderWaitOutcome::TimedOut => {
+                    let msg = format!("Server accepted the connection but sent no response within {RESPONSE_HEADERS_TIMEOUT_SECS}s after reasoning fallback");
+                    dev_log(&window, "response", json!({ "endpoint": endpoint, "model": model, "durationMs": now_ms().saturating_sub(start), "status": "error", "error": msg }));
+                    return json!({ "error": msg, "reasoningFallback": true });
+                }
+                HeaderWaitOutcome::Ready(Ok(r)) => r,
+                HeaderWaitOutcome::Ready(Err(e)) => {
                     let msg = format!("Connection failed after reasoning fallback: {e}");
                     dev_log(&window, "response", json!({ "endpoint": endpoint, "model": model, "durationMs": now_ms().saturating_sub(start), "status": "error", "error": msg }));
                     return json!({ "error": msg, "reasoningFallback": true });
@@ -1392,7 +1532,10 @@ async fn post_stream(
 
     let mut stream = response.bytes_stream();
     let mut full_content = String::new();
-    let mut buffer = String::new();
+    // Raw bytes, not a String: network chunk boundaries aren't guaranteed to land on
+    // UTF-8 character boundaries, so decoding each chunk independently (as before) could
+    // split a multi-byte character and turn it into replacement-character garbage.
+    let mut buffer: Vec<u8> = Vec::new();
     let mut chunk_count = 0u64;
     let mut stream_error: Option<String> = None;
 
@@ -1419,11 +1562,19 @@ async fn post_stream(
             Err(e) => return json!({ "error": e.to_string() }),
         };
 
-        buffer.push_str(&String::from_utf8_lossy(&bytes));
-        let mut lines: Vec<String> = buffer.split('\n').map(str::to_string).collect();
-        buffer = lines.pop().unwrap_or_default();
+        buffer.extend_from_slice(&bytes);
 
-        for line in lines {
+        // Only decode up through the last newline; '\n' (0x0A) never appears inside a
+        // multi-byte UTF-8 sequence, so splitting on raw bytes here is always safe. Any
+        // trailing partial line — which may end mid-character if a chunk boundary split
+        // it — stays buffered as raw bytes until the rest of it arrives.
+        let Some(split_at) = buffer.iter().rposition(|&b| b == b'\n').map(|i| i + 1) else {
+            continue;
+        };
+        let complete: Vec<u8> = buffer.drain(..split_at).collect();
+        let text = String::from_utf8_lossy(&complete);
+
+        for line in text.split('\n') {
             let trimmed = line.trim();
             if trimmed.is_empty()
                 || trimmed.starts_with("event:")
@@ -1459,9 +1610,6 @@ async fn post_stream(
     }
 
     if let Some(error) = stream_error {
-        if let Ok(mut current) = state.current_cancel.lock() {
-            *current = None;
-        }
         return json!({ "error": error });
     }
 
@@ -1479,10 +1627,6 @@ async fn post_stream(
             "reasoningFallback": reasoning_fallback
         }),
     );
-
-    if let Ok(mut current) = state.current_cancel.lock() {
-        *current = None;
-    }
 
     json!({ "content": full_content, "reasoningRequested": reasoning_preference, "reasoningFallback": reasoning_fallback })
 }
@@ -1547,12 +1691,11 @@ async fn chat_analyze_image(
 
 #[tauri::command]
 fn chat_cancel(state: tauri::State<'_, AppState>) -> Result<Value, String> {
-    if let Some(cancel) = state
-        .current_cancel
-        .lock()
-        .map_err(|e| e.to_string())?
-        .take()
-    {
+    // Cancels every in-flight generation (there is normally exactly one from the UI's
+    // point of view), rather than a single shared slot that a second request starting
+    // could silently steal from an unrelated first one.
+    let mut map = state.current_cancel.lock().map_err(|e| e.to_string())?;
+    for (_, cancel) in map.drain() {
         let _ = cancel.send(());
     }
     Ok(json!({ "cancelled": true }))
@@ -2254,6 +2397,7 @@ fn value_has_vision_hint(value: &Value, depth: u8) -> bool {
 async fn get_models(server_url: String) -> Result<Value, String> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(8))
+        .timeout(Duration::from_secs(15))
         .build()
         .map_err(|e| e.to_string())?;
     let url = format!("{}/v1/models", server_url.trim_end_matches('/'));
@@ -2522,7 +2666,12 @@ fn set_server_url(
 }
 
 #[tauri::command]
-fn chat_save(app: AppHandle, mut chat: Value, base_count: Option<usize>) -> Result<Value, String> {
+fn chat_save(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    mut chat: Value,
+    base_count: Option<usize>,
+) -> Result<Value, String> {
     let month = month_from_chat(&chat);
     let dir = monthly_dir(&chats_dir(&app), &month);
     ensure_dir(&dir)?;
@@ -2531,13 +2680,15 @@ fn chat_save(app: AppHandle, mut chat: Value, base_count: Option<usize>) -> Resu
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let filepath = find_chat_file(&app, &old_id).unwrap_or_else(|| dir.join(chat_file_name(&old_id)));
+    let filepath = find_chat_file(&app, &state, &old_id)
+        .unwrap_or_else(|| dir.join(chat_file_name(&old_id)));
     let relocated = filepath.starts_with(private_dir(&app));
     if !filepath.exists() {
         let new_id = generate_chat_id();
         chat["id"] = Value::String(new_id.clone());
         let new_file = dir.join(chat_file_name(&new_id));
         write_chat_bundle(&new_file, &chat)?;
+        chat_index_insert(&state, &new_id, new_file);
         return Ok(json!({
             "ok": true,
             "newId": new_id,
@@ -2579,8 +2730,12 @@ fn chat_save(app: AppHandle, mut chat: Value, base_count: Option<usize>) -> Resu
 }
 
 #[tauri::command]
-fn chat_load(app: AppHandle, chat_id: String) -> Result<Value, String> {
-    let Some(filepath) = find_chat_file(&app, &chat_id) else {
+fn chat_load(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    chat_id: String,
+) -> Result<Value, String> {
+    let Some(filepath) = find_chat_file(&app, &state, &chat_id) else {
         return Err(format!("Chat not found: {chat_id}"));
     };
     load_chat_from_file(&filepath)
@@ -2608,17 +2763,27 @@ fn chat_list(app: AppHandle) -> Result<Value, String> {
 }
 
 #[tauri::command]
-fn chat_delete(app: AppHandle, chat_id: String) -> Result<Value, String> {
-    let Some(filepath) = find_chat_file(&app, &chat_id) else {
+fn chat_delete(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    chat_id: String,
+) -> Result<Value, String> {
+    let Some(filepath) = find_chat_file(&app, &state, &chat_id) else {
         return Ok(json!({ "ok": true, "notFound": true }));
     };
     remove_chat_bundle(&filepath)?;
+    chat_index_remove(&state, &chat_id);
     Ok(json!({ "ok": true }))
 }
 
 #[tauri::command]
-fn chat_rename(app: AppHandle, chat_id: String, new_title: String) -> Result<Value, String> {
-    let Some(filepath) = find_chat_file(&app, &chat_id) else {
+fn chat_rename(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    chat_id: String,
+    new_title: String,
+) -> Result<Value, String> {
+    let Some(filepath) = find_chat_file(&app, &state, &chat_id) else {
         return Err(format!("Chat not found: {chat_id}"));
     };
     let mut chat = load_chat_from_file(&filepath)?;
@@ -2628,14 +2793,19 @@ fn chat_rename(app: AppHandle, chat_id: String, new_title: String) -> Result<Val
 }
 
 #[tauri::command]
-fn chat_make_private(app: AppHandle, chat_id: String) -> Result<Value, String> {
-    let Some(src) = find_chat_file_in(&chats_dir(&app), &chat_id) else {
+fn chat_make_private(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    chat_id: String,
+) -> Result<Value, String> {
+    let Some(src) = find_chat_file_public(&app, &state, &chat_id) else {
         return Err(format!("Chat not found: {chat_id}"));
     };
     let private = private_dir(&app);
     ensure_dir(&private)?;
     let dst = private.join(chat_file_name(&chat_id));
     move_chat_bundle(&src, &dst)?;
+    chat_index_insert(&state, &chat_id, dst);
     Ok(json!({ "ok": true }))
 }
 
@@ -2661,8 +2831,12 @@ fn chat_list_private(app: AppHandle) -> Result<Value, String> {
 }
 
 #[tauri::command]
-fn chat_unhide(app: AppHandle, chat_id: String) -> Result<Value, String> {
-    let Some(src) = find_chat_file_in(&private_dir(&app), &chat_id) else {
+fn chat_unhide(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    chat_id: String,
+) -> Result<Value, String> {
+    let Some(src) = find_chat_file_private(&app, &state, &chat_id) else {
         return Err(format!("Private chat not found: {chat_id}"));
     };
     let chat = load_chat_from_file(&src)?;
@@ -2671,6 +2845,7 @@ fn chat_unhide(app: AppHandle, chat_id: String) -> Result<Value, String> {
     ensure_dir(&dst_dir)?;
     let dst = dst_dir.join(chat_file_name(&chat_id));
     move_chat_bundle(&src, &dst)?;
+    chat_index_insert(&state, &chat_id, dst);
     Ok(json!({ "ok": true }))
 }
 
@@ -2706,10 +2881,11 @@ fn chat_list_branch_siblings(app: AppHandle, group_id: String) -> Result<Value, 
 #[tauri::command]
 fn chat_set_branch_group(
     app: AppHandle,
+    state: tauri::State<'_, AppState>,
     chat_id: String,
     group_id: String,
 ) -> Result<Value, String> {
-    let Some(filepath) = find_chat_file(&app, &chat_id) else {
+    let Some(filepath) = find_chat_file(&app, &state, &chat_id) else {
         return Err(format!("Chat not found: {chat_id}"));
     };
     let mut chat = load_chat_from_file(&filepath)?;
@@ -2873,9 +3049,11 @@ pub fn run() {
         .setup(|app| {
             let url = load_server_url_from_file(app.handle());
             let state = AppState {
-                current_cancel: Mutex::new(None),
+                current_cancel: Mutex::new(HashMap::new()),
+                next_generation: Mutex::new(0),
                 current_model_load_cancel: Mutex::new(None),
                 server_url: Mutex::new(url),
+                chat_index: Mutex::new(None),
             };
             app.manage(state);
             if let Some(window) = app.get_webview_window("main") {

@@ -1,7 +1,51 @@
 marked.setOptions({ breaks: true, gfm: true });
 
+// Defense-in-depth only: the page CSP (script-src 'self', no unsafe-inline) already
+// blocks injected <script>/inline-handler execution, but there's no independent
+// sanitization layer for markdown/LLM output rendered via innerHTML. This strips the
+// well-known script-execution and navigation-hijack vectors before insertion, so a CSP
+// relaxation, an <iframe>-class vector, or HTML smuggled in via a prompt-injected
+// web-search result doesn't render live.
+const SANITIZE_BLOCKED_SELECTOR = 'script, iframe, object, embed, form, link, meta, base, style, svg, math';
+// Navigation attributes: any data: URI here can navigate the whole webview to an
+// attacker-controlled HTML/SVG document, so data: is blocked here (not just javascript:).
+const SANITIZE_NAV_ATTRS = new Set(['href', 'xlink:href', 'action', 'formaction']);
+const SANITIZE_DANGEROUS_NAV_SCHEME = /^\s*(javascript|vbscript|data):/i;
+// Resource attributes: data: is left alone here since the CSP already allows
+// `img-src 'self' data:` for legitimate inline images.
+const SANITIZE_SRC_ATTRS = new Set(['src']);
+const SANITIZE_DANGEROUS_SCHEME = /^\s*(javascript|vbscript):/i;
+
+function sanitizeHtml(html) {
+  const template = document.createElement('template');
+  template.innerHTML = html;
+  const root = template.content;
+
+  // querySelectorAll returns a static snapshot, so removing an element mid-loop is
+  // safe; its now-detached descendants are still visited but that's harmless (they
+  // won't appear in the serialized output regardless of what happens to them here).
+  for (const el of root.querySelectorAll('*')) {
+    if (el.matches(SANITIZE_BLOCKED_SELECTOR)) {
+      el.remove();
+      continue;
+    }
+    for (const attr of Array.from(el.attributes)) {
+      const name = attr.name.toLowerCase();
+      if (name.startsWith('on')) {
+        el.removeAttribute(attr.name);
+      } else if (SANITIZE_NAV_ATTRS.has(name) && SANITIZE_DANGEROUS_NAV_SCHEME.test(attr.value)) {
+        el.removeAttribute(attr.name);
+      } else if (SANITIZE_SRC_ATTRS.has(name) && SANITIZE_DANGEROUS_SCHEME.test(attr.value)) {
+        el.removeAttribute(attr.name);
+      }
+    }
+  }
+
+  return template.innerHTML;
+}
+
 function renderMarkdown(text) {
-  return marked.parse(text || '');
+  return sanitizeHtml(marked.parse(text || ''));
 }
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
@@ -351,14 +395,43 @@ function setAnalysisMode(enabled) {
   }
 }
 
+const ANALYSIS_LOG_MAX_ROWS = 1000;
+let analysisLogQueue = [];
+let analysisLogFlushPending = false;
+
+function flushAnalysisLogQueue() {
+  analysisLogFlushPending = false;
+  if (!analysisLog || analysisLogQueue.length === 0) return;
+  const fragment = document.createDocumentFragment();
+  for (const row of analysisLogQueue) fragment.appendChild(row);
+  analysisLogQueue = [];
+  analysisLog.appendChild(fragment);
+  while (analysisLog.childElementCount > ANALYSIS_LOG_MAX_ROWS) {
+    analysisLog.removeChild(analysisLog.firstChild);
+  }
+  analysisLog.scrollTop = analysisLog.scrollHeight;
+}
+
 function analysisLogLine(text, type = 'info') {
   const line = `[${new Date().toLocaleTimeString()}] ${text}`;
   if (analysisLog) {
+    // Batched via rAF and capped at ANALYSIS_LOG_MAX_ROWS: a long run can call this
+    // hundreds/thousands of times in quick succession, and appending+reflowing once
+    // per call (rather than once per frame) made that scale with total log volume.
     const row = document.createElement('div');
     row.className = `analysis-log-row ${type}`;
     row.textContent = line;
-    analysisLog.appendChild(row);
-    analysisLog.scrollTop = analysisLog.scrollHeight;
+    analysisLogQueue.push(row);
+    // Capped independently of the rendered/flushed rows: rAF is suspended while a
+    // WebView2 window is minimized/occluded, so without this the queue itself could
+    // grow unbounded during a long automated run even though on-screen rows stay capped.
+    if (analysisLogQueue.length > ANALYSIS_LOG_MAX_ROWS) {
+      analysisLogQueue.splice(0, analysisLogQueue.length - ANALYSIS_LOG_MAX_ROWS);
+    }
+    if (!analysisLogFlushPending) {
+      analysisLogFlushPending = true;
+      requestAnimationFrame(flushAnalysisLogQueue);
+    }
   }
   if (activeAnalysisDatasetId && activeAnalysisRunId && activeAnalysisLogKind) {
     window.api.analysisAppendLog(activeAnalysisDatasetId, activeAnalysisRunId, activeAnalysisLogKind, line)
@@ -378,6 +451,10 @@ async function refreshAnalysisPaths() {
 
 function clearAnalysisView(logKind = '') {
   if (analysisLog) analysisLog.innerHTML = '';
+  // Drop anything queued but not yet flushed, so a rAF callback already scheduled by a
+  // pre-clear analysisLogLine() call doesn't repopulate this freshly-cleared panel with
+  // stale lines from the run being cleared.
+  analysisLogQueue = [];
   if (analysisResults) analysisResults.innerHTML = '';
   if (analysisMetrics) analysisMetrics.innerHTML = '';
   if (analysisOutputPath) analysisOutputPath.textContent = '';
@@ -4692,8 +4769,17 @@ async function submitEditMessage(msgIndex, newText) {
     await window.api.setBranchGroup(currentChat.id, groupId).catch(() => {});
   }
 
-  // Save branch
-  const result = await window.api.saveChat(branchChat, 0);
+  // Save branch. Same silent-failure class as saveCurrentChat: this call bypasses that
+  // helper (it saves a brand-new forked chat, not the current one), so it needs its own
+  // guard rather than relying on saveCurrentChat's try/catch to cover it.
+  let result;
+  try {
+    result = await window.api.saveChat(branchChat, 0);
+  } catch (err) {
+    console.error('Failed to save branch chat:', err);
+    addMessage('error', `Failed to save edited message: ${err?.message || err}`);
+    return;
+  }
   if (result?.newId) branchChat.id = result.newId;
 
   await loadChatById(branchChat.id);
@@ -4715,9 +4801,17 @@ function resendMessage(msgDiv, msgIndex) {
 async function saveCurrentChat() {
   if (!currentChat) return;
   currentChat.model = currentModel || '';
-  const result = await window.api.saveChat(currentChat, lastSavedCount);
-  if (result?.newId) currentChat.id = result.newId;
-  lastSavedCount = result?.savedCount || conversationHistory.length;
+  // Every call site previously awaited this without a catch, so a save failure (disk
+  // error, IPC error) became an unhandled rejection: the message was already rendered
+  // and the input already cleared, but nothing told the user it wasn't persisted.
+  try {
+    const result = await window.api.saveChat(currentChat, lastSavedCount);
+    if (result?.newId) currentChat.id = result.newId;
+    lastSavedCount = result?.savedCount || conversationHistory.length;
+  } catch (err) {
+    console.error('Failed to save chat:', err);
+    addMessage('error', `Failed to save chat: ${err?.message || err}. Your latest message may not be saved to disk.`);
+  }
 }
 
 async function loadChats() {
@@ -5335,6 +5429,7 @@ async function streamAssistantResponse({ forceImageDescriptionsForLastUser = fal
   let assistantDiv = null;
   let rafPending = false;
   let finalized = false;
+  let lastRenderAt = 0;
 
   function finishStreaming() {
     if (finalized) return;
@@ -5353,9 +5448,30 @@ async function streamAssistantResponse({ forceImageDescriptionsForLastUser = fal
     markLatestUnanswered();
   };
 
+  // Each call re-parses the whole response so far (marked has no incremental/streaming
+  // API), so cost grows with response length for the life of the stream. rAF already
+  // caps this at one render per display frame no matter how fast chunks arrive; this
+  // adds a time floor on top so a long generation doesn't spend the full session
+  // re-parsing+re-rendering an ever-growing string up to 60 times a second.
+  const STREAM_RENDER_MIN_INTERVAL_MS = 80;
+
   function renderStreamedMarkdown() {
+    // finalized also gates this: a throttle-deferred rAF (below) can still be pending
+    // when the stream finishes and does its own final synchronous render, and without
+    // this check that stale callback would fire a frame later and redundantly replace
+    // assistantDiv's contents again (wasted work, and it would clear any in-progress
+    // text selection in that message).
+    if (!assistantDiv || generation.stopped || finalized) {
+      rafPending = false;
+      return;
+    }
+    const now = performance.now();
+    if (now - lastRenderAt < STREAM_RENDER_MIN_INTERVAL_MS) {
+      requestAnimationFrame(renderStreamedMarkdown);
+      return;
+    }
     rafPending = false;
-    if (!assistantDiv || generation.stopped) return;
+    lastRenderAt = now;
     assistantDiv.innerHTML = renderMarkdown(streamedText);
     if (autoScrollEnabled) {
       const msgRect = messagesEl.getBoundingClientRect();
@@ -5719,10 +5835,15 @@ searchClose?.addEventListener('click', closeSearch);
 const devConsoleEl = document.getElementById('dev-console');
 const devConsoleInfo = document.getElementById('dev-console-info');
 const devConsoleLogs = document.getElementById('dev-console-logs');
+const DEV_LOGS_MAX_ENTRIES = 500;
 let devLogs = [];
 
 window.api.onDevLog((entry) => {
+  // Capped: every dev:log event (which can carry full request payloads, including
+  // base64 image data for vision requests) was previously retained forever, whether or
+  // not the Developer Console was ever opened.
   devLogs.push(entry);
+  if (devLogs.length > DEV_LOGS_MAX_ENTRIES) devLogs.splice(0, devLogs.length - DEV_LOGS_MAX_ENTRIES);
   if (!devConsoleEl.classList.contains('hidden')) renderDevLog(entry);
 });
 
@@ -5813,14 +5934,16 @@ function renderDevLog(entry) {
     if (val == null) continue;
     const row = document.createElement('div');
     row.className = 'dev-log-detail-row';
-    row.innerHTML = `<span class="dev-log-detail-key">${key}</span><span class="dev-log-detail-val">${val}</span>`;
+    // entry.* values come from the LLM server's responses (e.g. error text), so they
+    // need the same escaping as any other server/model-controlled string before innerHTML.
+    row.innerHTML = `<span class="dev-log-detail-key">${escapeHtml(key)}</span><span class="dev-log-detail-val">${escapeHtml(val)}</span>`;
     details.appendChild(row);
   }
 
   if (entry.messages && Array.isArray(entry.messages)) {
     const row = document.createElement('div');
     row.className = 'dev-log-detail-row';
-    row.innerHTML = `<span class="dev-log-detail-key">request</span><span class="dev-log-detail-val">${JSON.stringify(entry.messages, null, 2).slice(0, 800)}</span>`;
+    row.innerHTML = `<span class="dev-log-detail-key">request</span><span class="dev-log-detail-val">${escapeHtml(JSON.stringify(entry.messages, null, 2).slice(0, 800))}</span>`;
     details.appendChild(row);
   }
 
@@ -5831,6 +5954,9 @@ function renderDevLog(entry) {
   logEl.appendChild(header);
   logEl.appendChild(details);
   devConsoleLogs.appendChild(logEl);
+  while (devConsoleLogs.children.length > DEV_LOGS_MAX_ENTRIES) {
+    devConsoleLogs.removeChild(devConsoleLogs.firstElementChild);
+  }
   devConsoleLogs.scrollTop = devConsoleLogs.scrollHeight;
 }
 

@@ -49,6 +49,8 @@
     exaSearch: (query, options) => invoke('exa_search', { query, options }),
     getServerUrl: () => invoke('get_server_url'),
     setServerUrl: (url) => invoke('set_server_url', { url }),
+    getApiToken: () => invoke('get_api_token'),
+    setApiToken: (token) => invoke('set_api_token', { token }),
 
     saveChat: (chat, baseCount) => invoke('chat_save', { chat, baseCount }),
     listChats: () => invoke('chat_list'),
@@ -77,6 +79,7 @@
     analysisListCanonBatches: (datasetId, runId) => invoke('analysis_list_canon_batches', { datasetId, runId }),
     analysisSaveGraph: (datasetId, runId, graph) => invoke('analysis_save_graph', { datasetId, runId, graph }),
     analysisReadGraph: (path) => invoke('analysis_read_graph', { path }),
+    analysisListGraphs: () => invoke('analysis_list_graphs'),
     analysisSaveReconciliation: (name, graph) => invoke('analysis_save_reconciliation', { name, graph }),
     analysisAppendLog: (datasetId, runId, logKind, line) => invoke('analysis_append_log', { datasetId, runId, logKind, line }),
     analysisPaths: (datasetId, runId) => invoke('analysis_paths', { datasetId, runId }),

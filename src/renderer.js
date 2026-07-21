@@ -127,6 +127,7 @@ const serverStatusEl    = document.getElementById('server-status');
 const contextBarFill    = document.getElementById('context-bar-fill');
 const contextBarLabel   = document.getElementById('context-bar-label');
 const settingsServerUrl = document.getElementById('settings-server-url');
+const settingsApiToken = document.getElementById('settings-api-token');
 const settingsServerConnect = document.getElementById('settings-server-connect');
 const settingsCtxWindow = document.getElementById('settings-ctx-window');
 const settingsSystemPrompt  = document.getElementById('settings-system-prompt');
@@ -152,8 +153,19 @@ const settingsUseCurrentImageAnalysis = document.getElementById('settings-use-cu
 const settingsIncludeImageAnalysisContext = document.getElementById('settings-include-image-analysis-context');
 const setupChecklist = document.getElementById('setup-checklist');
 const webSearchToggle   = document.getElementById('web-search-toggle');
+const webSearchModeGroup = document.getElementById('web-search-mode');
 const settingsExaKey    = document.getElementById('settings-exa-key');
 const settingsExaResults = document.getElementById('settings-exa-results');
+const settingsExaDeepPages = document.getElementById('settings-exa-deep-pages');
+const settingsExaDeepChars = document.getElementById('settings-exa-deep-chars');
+const conceptMapToggle  = document.getElementById('concept-map-toggle');
+const cmMapSelect       = document.getElementById('cm-map-select');
+const cmMapRefresh      = document.getElementById('cm-map-refresh');
+const cmMapStatus       = document.getElementById('cm-map-status');
+const cmModeSelect      = document.getElementById('cm-mode');
+const cmLevelsGroup     = document.getElementById('cm-levels');
+const cmIncludeEvents   = document.getElementById('cm-include-events');
+const cmMaxConcepts     = document.getElementById('cm-max-concepts');
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -183,9 +195,30 @@ let isProgrammaticScroll = false;
 let autoScrollDebounceTimer = null;
 let activeGeneration = null;
 let modelLoadRequestId = 0;
-let webSearchEnabled = localStorage.getItem('webSearchEnabled') === '1';
+// Web search depth: 'off' | 'quick' (1 smart query, summaries) | 'deep' (multi-query, full page text).
+// Migrate the old boolean flag: previously-on becomes 'quick'.
+let webSearchMode = localStorage.getItem('webSearchMode')
+  || (localStorage.getItem('webSearchEnabled') === '1' ? 'quick' : 'off');
+if (!['off', 'quick', 'deep'].includes(webSearchMode)) webSearchMode = 'off';
+let lastWebSearchOnMode = webSearchMode === 'off' ? 'quick' : webSearchMode; // restored when re-enabling
 let exaApiKey = localStorage.getItem('exaApiKey') || '';
 let exaNumResults = parseInt(localStorage.getItem('exaNumResults') || '5');
+// Deep-mode budget. Built for 256k-context local models with a 50–250k-token/chat ceiling in mind.
+let webDeepMaxPages = parseInt(localStorage.getItem('webDeepMaxPages') || '6');   // pages to inject full text for
+let webDeepCharsPerPage = parseInt(localStorage.getItem('webDeepCharsPerPage') || '6000');
+const WEB_DEEP_MAX_QUERIES = 4;  // decomposition ceiling for deep mode
+
+// ── Concept map memory (local analysis graphs as conceptual anchors) ──────────────
+// Experimental: inject a map of the user's own concepts (from Data Analysis output
+// graphs) so the model can calibrate what the user knows. See buildConceptMapContext.
+let conceptMapEnabled = localStorage.getItem('conceptMapEnabled') === '1';
+let conceptMapPath = localStorage.getItem('conceptMapPath') || '';
+let conceptMapMode = localStorage.getItem('conceptMapMode') || 'overview';  // 'overview' | 'relevant'
+let conceptMapLevels = (localStorage.getItem('conceptMapLevels') || 'macro,topic')
+  .split(',').map(s => s.trim()).filter(Boolean);
+let conceptMapIncludeEvents = localStorage.getItem('conceptMapIncludeEvents') === '1';
+let conceptMapMaxConcepts = parseInt(localStorage.getItem('conceptMapMaxConcepts') || '200');
+let conceptGraphCache = { path: null, graph: null };  // avoid re-reading the graph each turn
 let analysisDatasets = [];
 let analysisRuns = [];
 let activeAnalysisSource = ['anthropic', 'openai'].includes(localStorage.getItem('activeAnalysisSource'))
@@ -318,6 +351,8 @@ settingsCtxWindow.addEventListener('change', () => {
 
 if (settingsExaKey) settingsExaKey.value = exaApiKey;
 if (settingsExaResults) settingsExaResults.value = exaNumResults;
+if (settingsExaDeepPages) settingsExaDeepPages.value = webDeepMaxPages;
+if (settingsExaDeepChars) settingsExaDeepChars.value = webDeepCharsPerPage;
 
 settingsExaKey?.addEventListener('change', () => {
   exaApiKey = settingsExaKey.value.trim();
@@ -331,23 +366,192 @@ settingsExaResults?.addEventListener('change', () => {
   localStorage.setItem('exaNumResults', val);
 });
 
-function applyWebSearchToggle() {
-  if (!webSearchToggle) return;
-  webSearchToggle.classList.toggle('active', webSearchEnabled);
-  webSearchToggle.setAttribute('aria-pressed', webSearchEnabled ? 'true' : 'false');
-  webSearchToggle.title = `Web search (Exa) — ${webSearchEnabled ? 'on' : 'off'}`;
+settingsExaDeepPages?.addEventListener('change', () => {
+  const val = Math.min(20, Math.max(1, parseInt(settingsExaDeepPages.value) || 6));
+  webDeepMaxPages = val;
+  settingsExaDeepPages.value = val;
+  localStorage.setItem('webDeepMaxPages', val);
+});
+
+settingsExaDeepChars?.addEventListener('change', () => {
+  const val = Math.min(30000, Math.max(1000, parseInt(settingsExaDeepChars.value) || 6000));
+  webDeepCharsPerPage = val;
+  settingsExaDeepChars.value = val;
+  localStorage.setItem('webDeepCharsPerPage', val);
+});
+
+function setWebSearchMode(mode) {
+  if (!['off', 'quick', 'deep'].includes(mode)) mode = 'off';
+  webSearchMode = mode;
+  if (mode !== 'off') lastWebSearchOnMode = mode;
+  localStorage.setItem('webSearchMode', mode);
+  applyWebSearchUI();
+  if (mode !== 'off' && !exaApiKey) {
+    addMessage('error', 'Web search is on, but no Exa API key is set. Add one in Settings → General.');
+  }
 }
 
+function applyWebSearchUI() {
+  const on = webSearchMode !== 'off';
+  if (webSearchToggle) {
+    webSearchToggle.classList.toggle('active', on);
+    webSearchToggle.setAttribute('aria-pressed', on ? 'true' : 'false');
+    webSearchToggle.title = on
+      ? `Web search: ${webSearchMode} — click to turn off`
+      : 'Web search — off';
+  }
+  if (webSearchModeGroup) {
+    webSearchModeGroup.classList.toggle('hidden', !on);
+    for (const btn of webSearchModeGroup.querySelectorAll('button[data-mode]')) {
+      const active = on && btn.dataset.mode === webSearchMode;
+      btn.classList.toggle('active', active);
+      btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+    }
+  }
+}
+
+// Toggle button flips off ↔ last-used depth (defaults to quick).
 webSearchToggle?.addEventListener('click', () => {
-  webSearchEnabled = !webSearchEnabled;
-  localStorage.setItem('webSearchEnabled', webSearchEnabled ? '1' : '0');
-  applyWebSearchToggle();
-  if (webSearchEnabled && !exaApiKey) {
-    addMessage('error', 'Web search is on, but no Exa API key is set. Add one in Settings → General.');
+  setWebSearchMode(webSearchMode === 'off' ? lastWebSearchOnMode : 'off');
+});
+
+// Quick / Deep segment picks the depth (and turns search on).
+webSearchModeGroup?.addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-mode]');
+  if (!btn) return;
+  setWebSearchMode(btn.dataset.mode);
+});
+
+applyWebSearchUI();
+
+// ── Concept map memory: composer toggle + settings ────────────────────────────────
+
+function applyConceptMapToggle() {
+  if (!conceptMapToggle) return;
+  conceptMapToggle.classList.toggle('active', conceptMapEnabled);
+  conceptMapToggle.setAttribute('aria-pressed', conceptMapEnabled ? 'true' : 'false');
+  conceptMapToggle.title = `Concept map memory — ${conceptMapEnabled ? 'on' : 'off'}`;
+}
+
+conceptMapToggle?.addEventListener('click', () => {
+  conceptMapEnabled = !conceptMapEnabled;
+  localStorage.setItem('conceptMapEnabled', conceptMapEnabled ? '1' : '0');
+  applyConceptMapToggle();
+  if (conceptMapEnabled && !conceptMapPath) {
+    addMessage('error', 'Concept map memory is on, but no map is selected. Pick one in Settings → Concept map.');
   }
 });
 
-applyWebSearchToggle();
+applyConceptMapToggle();
+
+// Reflect saved config into the settings controls.
+if (cmModeSelect) cmModeSelect.value = conceptMapMode;
+if (cmIncludeEvents) cmIncludeEvents.checked = conceptMapIncludeEvents;
+if (cmMaxConcepts) cmMaxConcepts.value = conceptMapMaxConcepts;
+if (cmLevelsGroup) {
+  const set = new Set(conceptMapLevels);
+  for (const cb of cmLevelsGroup.querySelectorAll('input[data-level]')) {
+    cb.checked = set.has(cb.dataset.level);
+  }
+}
+
+cmModeSelect?.addEventListener('change', () => {
+  conceptMapMode = cmModeSelect.value === 'relevant' ? 'relevant' : 'overview';
+  localStorage.setItem('conceptMapMode', conceptMapMode);
+});
+
+cmIncludeEvents?.addEventListener('change', () => {
+  conceptMapIncludeEvents = cmIncludeEvents.checked;
+  localStorage.setItem('conceptMapIncludeEvents', conceptMapIncludeEvents ? '1' : '0');
+});
+
+cmMaxConcepts?.addEventListener('change', () => {
+  const val = Math.min(1000, Math.max(10, parseInt(cmMaxConcepts.value) || 200));
+  conceptMapMaxConcepts = val;
+  cmMaxConcepts.value = val;
+  localStorage.setItem('conceptMapMaxConcepts', val);
+});
+
+cmLevelsGroup?.addEventListener('change', () => {
+  const levels = [];
+  for (const cb of cmLevelsGroup.querySelectorAll('input[data-level]')) {
+    if (cb.checked) levels.push(cb.dataset.level);
+  }
+  conceptMapLevels = levels;
+  localStorage.setItem('conceptMapLevels', levels.join(','));
+});
+
+cmMapSelect?.addEventListener('change', () => {
+  conceptMapPath = cmMapSelect.value || '';
+  localStorage.setItem('conceptMapPath', conceptMapPath);
+  conceptGraphCache = { path: null, graph: null };  // invalidate on map switch
+  updateConceptMapStatus();
+});
+
+cmMapRefresh?.addEventListener('click', () => {
+  conceptGraphCache = { path: null, graph: null };
+  renderConceptMapSettings();
+});
+
+// Populate the picker from analysis output on disk.
+async function renderConceptMapSettings() {
+  if (!cmMapSelect) return;
+  if (cmMapStatus) cmMapStatus.textContent = 'Scanning analysis output…';
+  let graphs = [];
+  try {
+    const res = await window.api.analysisListGraphs();
+    graphs = Array.isArray(res?.graphs) ? res.graphs : [];
+  } catch (err) {
+    if (cmMapStatus) cmMapStatus.textContent = `Could not list concept maps: ${err?.message || err}`;
+    return;
+  }
+
+  cmMapSelect.innerHTML = '';
+  const placeholder = document.createElement('option');
+  placeholder.value = '';
+  placeholder.textContent = graphs.length ? '— select a concept map —' : '— no concept maps found (run Data Analysis first) —';
+  cmMapSelect.appendChild(placeholder);
+
+  for (const g of graphs) {
+    const opt = document.createElement('option');
+    opt.value = g.path;
+    const who = g.kind === 'reconciliation'
+      ? 'reconciled'
+      : [g.source, g.datasetId, g.runId].filter(Boolean).join('/');
+    const name = g.graphId || g.fileName || 'graph';
+    opt.textContent = `${name} · ${who} · ${g.conceptCount} concepts${g.eventCount ? ` · ${g.eventCount} ev` : ''}`;
+    cmMapSelect.appendChild(opt);
+  }
+
+  // Keep a saved-but-missing selection usable (e.g. graph on disk not re-scanned yet).
+  if (conceptMapPath && !graphs.some(g => g.path === conceptMapPath)) {
+    const opt = document.createElement('option');
+    opt.value = conceptMapPath;
+    opt.textContent = `(saved) ${conceptMapPath.split(/[\\/]/).pop()}`;
+    cmMapSelect.appendChild(opt);
+  }
+  cmMapSelect.value = conceptMapPath || '';
+  updateConceptMapStatus(graphs);
+}
+
+function updateConceptMapStatus(graphs) {
+  if (!cmMapStatus) return;
+  if (!conceptMapPath) {
+    cmMapStatus.textContent = conceptMapEnabled
+      ? 'No map selected — the toggle will do nothing until you pick one.'
+      : 'No map selected.';
+    return;
+  }
+  const g = Array.isArray(graphs) ? graphs.find(x => x.path === conceptMapPath) : null;
+  if (g) {
+    const macro = Array.isArray(g.macroLabels) && g.macroLabels.length
+      ? ` — ${g.macroLabels.slice(0, 5).join(', ')}${g.macroLabels.length > 5 ? '…' : ''}`
+      : '';
+    cmMapStatus.textContent = `Selected: ${g.conceptCount} concepts${g.eventCount ? `, ${g.eventCount} events` : ''}${macro}`;
+  } else {
+    cmMapStatus.textContent = `Selected: ${conceptMapPath.split(/[\\/]/).pop()}`;
+  }
+}
 
 // ── Data analysis mode ─────────────────────────────────────────────────────────
 
@@ -3468,7 +3672,16 @@ settingsServerConnect.addEventListener('click', () => {
   serverUrl = url;
   localStorage.setItem('serverUrl', serverUrl);
   window.api.setServerUrl(serverUrl).catch(() => {});
+  // Persist the token too so "enter token + Connect" applies both before reconnecting.
+  if (settingsApiToken) window.api.setApiToken(settingsApiToken.value.trim()).catch(() => {});
   loadModels(true);
+});
+
+// Saving the token alone (e.g. after LM Studio starts requiring one) reconnects.
+settingsApiToken?.addEventListener('change', () => {
+  window.api.setApiToken(settingsApiToken.value.trim())
+    .then(() => loadModels(true))
+    .catch(() => {});
 });
 
 // ── Read marker toggle ─────────────────────────────────────────────────────────
@@ -3970,6 +4183,7 @@ function openSettingsTab(name) {
   });
   if (name === 'models') renderModelSettings();
   if (name === 'setup') renderSetupChecklist();
+  if (name === 'conceptmap') renderConceptMapSettings();
 }
 
 function renderSetupChecklist() {
@@ -5267,30 +5481,154 @@ async function analyzeMissingImagesForTextProjection() {
 
 // ── Web search execution ─────────────────────────────────────────────────────────
 
-function formatSearchContext(query, results) {
+// Compact transcript of the turns BEFORE the latest user message, so the query
+// planner can resolve references ("it", "that library we discussed") from context.
+function recentTranscriptForPlanner(maxTurns = 6, maxCharsPerTurn = 400) {
+  const prior = conversationHistory.slice(0, -1).slice(-maxTurns);
+  const lines = [];
+  for (const m of prior) {
+    const who = m.role === 'assistant' ? 'Assistant' : m.role === 'user' ? 'User' : m.role;
+    let t = getDisplayText(m).replace(/\s+/g, ' ').trim();
+    if (!t) continue;
+    if (t.length > maxCharsPerTurn) t = t.slice(0, maxCharsPerTurn) + '…';
+    lines.push(`${who}: ${t}`);
+  }
+  return lines.join('\n');
+}
+
+// One-shot, non-streaming model call used for query planning. Kept separate from the
+// analysis model helpers so it doesn't touch the analysis log or reasoning toggles.
+async function runQueryPlanner(messages) {
+  let text = '';
+  const result = await window.api.sendMessage(
+    messages,
+    { model: currentModel, temperature: 0.2, maxTokens: 400, reasoningRequested: false },
+    (chunk) => { text += chunk; }
+  );
+  if (result?.error) throw new Error(result.error);
+  if (result?.cancelled) throw new Error('cancelled');
+  return (text || result?.content || '').trim();
+}
+
+// Turn the raw user message + recent context into focused search queries.
+// Quick → exactly one query; Deep → up to WEB_DEEP_MAX_QUERIES, one per facet.
+// Always resolves to at least one query; on any failure it falls back to the raw
+// message, so the feature can never do worse than the old "send the prompt verbatim".
+async function generateSearchQueries(userText, mode) {
+  const fallback = [userText.trim()].filter(Boolean);
+  if (!currentModel) return fallback;
+
+  const deep = mode === 'deep';
+  const countRule = deep
+    ? `- If the message has multiple distinct sub-questions or facets, produce one focused query PER facet (up to ${WEB_DEEP_MAX_QUERIES}). If it is simple, produce just one. Never produce near-duplicate queries.`
+    : `- Produce EXACTLY ONE query — the single best one to answer the message.`;
+
+  const system = `You are a web-search query planner for a chat assistant. The assistant will answer the user's latest message; your job is to decide what to search for. Do NOT answer the question.
+
+Rules:
+- Resolve references: replace pronouns and vague mentions ("it", "that library", "the framework we discussed") with the explicit names/terms from the conversation.
+- Strip conversational filler ("hey can you", "please", "I was wondering"). Keep only the searchable core.
+- Prefer concise, keyword-style queries a search engine handles well. Include specifics (product names, versions, dates, exact error text) when implied.
+${countRule}
+- Respond with ONLY this JSON, nothing else: {"queries": ["..."]}`;
+
+  const transcript = recentTranscriptForPlanner();
+  const user = `${transcript ? `Recent conversation:\n${transcript}\n\n` : ''}Latest user message:\n${userText.trim()}\n\nProduce the search ${deep ? 'queries' : 'query'} as JSON.`;
+
+  try {
+    const raw = await runQueryPlanner([
+      { role: 'system', content: system },
+      { role: 'user', content: user },
+    ]);
+    const parsed = extractJsonObject(raw);
+    let queries = Array.isArray(parsed?.queries) ? parsed.queries : [];
+    queries = queries
+      .map(q => (typeof q === 'string' ? q.trim() : ''))
+      .filter(Boolean);
+    // Dedupe case-insensitively, preserving order.
+    const seen = new Set();
+    queries = queries.filter(q => {
+      const k = q.toLowerCase();
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
+    if (!queries.length) return fallback;
+    return deep ? queries.slice(0, WEB_DEEP_MAX_QUERIES) : [queries[0]];
+  } catch (_) {
+    return fallback;  // planner failed → behave like the old raw-query path
+  }
+}
+
+function normalizeUrlKey(url) {
+  return String(url || '').trim().replace(/[#?].*$/, '').replace(/\/+$/, '').toLowerCase();
+}
+
+// Round-robin interleave results across queries so every sub-question is represented,
+// dedupe by URL, and cap at maxPages.
+function mergeDeepResults(perQuery, maxPages) {
+  const seen = new Set();
+  const merged = [];
+  const maxLen = perQuery.reduce((n, r) => Math.max(n, r.length), 0);
+  for (let i = 0; i < maxLen && merged.length < maxPages; i++) {
+    for (const results of perQuery) {
+      if (merged.length >= maxPages) break;
+      const r = results[i];
+      if (!r) continue;
+      const key = normalizeUrlKey(r.url);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      merged.push(r);
+    }
+  }
+  return merged;
+}
+
+function bodyForResult(r, mode) {
+  const highlights = Array.isArray(r.highlights) ? r.highlights.filter(Boolean).join(' … ') : '';
+  if (mode === 'deep') {
+    const body = (r.text || r.summary || highlights || '').trim();
+    return body.slice(0, webDeepCharsPerPage);
+  }
+  const body = (r.summary || highlights || '').trim();
+  return body.slice(0, 2000);
+}
+
+function formatSearchContext(queries, results, mode) {
   const lines = results.map((r, i) => {
     const parts = [`[${i + 1}] ${r.title || r.url || 'Untitled'}`];
     if (r.url) parts.push(`URL: ${r.url}`);
     if (r.publishedDate) parts.push(`Published: ${r.publishedDate}`);
-    const snippets = Array.isArray(r.highlights) ? r.highlights.filter(Boolean) : [];
-    const body = (r.summary || snippets.join(' … ') || '').trim();
+    const body = bodyForResult(r, mode);
     if (body) parts.push(body);
     return parts.join('\n');
   });
-  return `The user has web search enabled. Here are current web search results for the query "${query}". `
+  const queryLabel = queries.length === 1
+    ? `the query "${queries[0]}"`
+    : `the queries ${queries.map(q => `"${q}"`).join(', ')}`;
+  return `The user has web search enabled. Here are current web search results for ${queryLabel}. `
     + `Use them to inform your answer and cite sources as [n] with their URLs when relevant. `
     + `If they are not useful, rely on your own knowledge.\n\n`
     + lines.join('\n\n');
 }
 
-function renderSearchSources(query, results) {
+function renderSearchSources(queries, results) {
   const div = document.createElement('div');
   div.className = 'message search-sources';
 
   const title = document.createElement('div');
   title.className = 'search-sources-title';
-  title.textContent = `Web results for "${query}"`;
+  title.textContent = queries.length === 1
+    ? `Web results for "${queries[0]}"`
+    : `Web results for ${queries.length} queries`;
   div.appendChild(title);
+
+  if (queries.length > 1) {
+    const q = document.createElement('div');
+    q.className = 'search-sources-queries';
+    q.textContent = queries.map(x => `“${x}”`).join('  ·  ');
+    div.appendChild(q);
+  }
 
   const list = document.createElement('ol');
   for (const r of results) {
@@ -5312,17 +5650,17 @@ function renderSearchSources(query, results) {
 
 // Guard injected when a search was attempted but produced nothing usable, so the
 // model cannot pretend it searched the web.
-function noSearchResultsGuard(query, reason) {
-  return `Web search was enabled and attempted for the query "${query}", but it ${reason}. `
+function noSearchResultsGuard(queryLabel, reason) {
+  return `Web search was enabled and attempted for ${queryLabel}, but it ${reason}. `
     + `You did NOT receive any web search results. Do not claim that you searched the web, `
     + `and do not cite or invent web sources or URLs. Answer from your own knowledge and note `
     + `that your information may be out of date.`;
 }
 
 // Returns a context string to inject, or null if no search was attempted
-// (toggle off, empty query, or no API key).
-async function runWebSearch(query) {
-  if (!webSearchEnabled || !query) return null;
+// (mode off, empty query, or no API key).
+async function runWebSearch(userText, mode) {
+  if (mode === 'off' || !userText) return null;
   if (!exaApiKey) {
     addMessage('error', 'Web search is on, but no Exa API key is set. Add one in Settings → General.');
     return null;
@@ -5330,25 +5668,251 @@ async function runWebSearch(query) {
 
   const status = document.createElement('div');
   status.className = 'message search-sources searching';
-  status.textContent = `Searching the web for "${query}"…`;
+  status.textContent = 'Understanding your question…';
   messagesEl.appendChild(status);
   messagesEl.scrollTop = messagesEl.scrollHeight;
 
+  const queries = await generateSearchQueries(userText, mode);
+  const queryLabel = queries.length === 1
+    ? `the query "${queries[0]}"`
+    : `the queries ${queries.map(q => `"${q}"`).join(', ')}`;
+  status.textContent = queries.length === 1
+    ? `Searching the web for "${queries[0]}"…`
+    : `Searching the web (${queries.length} queries)…`;
+
   try {
-    const result = await window.api.exaSearch(query, {
-      apiKey: exaApiKey,
-      numResults: exaNumResults,
-    });
+    let results;
+    if (mode === 'deep') {
+      const perQuery = await Promise.all(queries.map(q =>
+        window.api.exaSearch(q, {
+          apiKey: exaApiKey,
+          numResults: exaNumResults,
+          includeText: true,
+          textMaxChars: webDeepCharsPerPage,
+        }).then(
+          res => (Array.isArray(res?.results) ? res.results : []),
+          () => []  // one failed query shouldn't sink the whole search
+        )
+      ));
+      results = mergeDeepResults(perQuery, webDeepMaxPages);
+    } else {
+      const res = await window.api.exaSearch(queries[0], {
+        apiKey: exaApiKey,
+        numResults: exaNumResults,
+        includeSummary: true,
+      });
+      results = Array.isArray(res?.results) ? res.results : [];
+    }
     status.remove();
-    const results = Array.isArray(result?.results) ? result.results : [];
-    if (results.length === 0) return noSearchResultsGuard(query, 'returned no results');
-    renderSearchSources(query, results);
-    return formatSearchContext(query, results);
+    if (results.length === 0) return noSearchResultsGuard(queryLabel, 'returned no results');
+    renderSearchSources(queries, results);
+    return formatSearchContext(queries, results, mode);
   } catch (err) {
     status.remove();
     addMessage('error', `Web search failed: ${err?.message || err}`);
-    return noSearchResultsGuard(query, `failed (${err?.message || err})`);
+    return noSearchResultsGuard(queryLabel, `failed (${err?.message || err})`);
   }
+}
+
+// ── Concept map memory execution ──────────────────────────────────────────────────
+
+const CM_LEVEL_RANK = { macro: 0, topic: 1, subtopic: 2, motif: 3 };
+const CM_SUMMARY_LEVELS = new Set(['macro', 'topic']);  // levels verbose enough to include summaries
+const CM_STOPWORDS = new Set(['the','and','for','are','but','not','you','your','with','this','that','have','has','had','was','were','what','how','why','when','where','which','who','can','could','would','should','about','into','from','they','them','his','her','its','our','their','been','also','than','then','there','here','some','more','most','such','only','just','like','over','under','does','did','doing']);
+
+function cmTokens(text) {
+  return (String(text || '').toLowerCase().match(/[a-z0-9]+/g) || [])
+    .filter(t => t.length >= 3 && !CM_STOPWORDS.has(t));
+}
+
+function cmConceptSearchText(c) {
+  return [c.canonical_label, ...(Array.isArray(c.aliases) ? c.aliases : []), c.summary]
+    .filter(Boolean).join(' ');
+}
+
+function cmSortConcepts(concepts) {
+  return concepts.slice().sort((a, b) => {
+    const ra = CM_LEVEL_RANK[String(a.level || '').toLowerCase()] ?? 9;
+    const rb = CM_LEVEL_RANK[String(b.level || '').toLowerCase()] ?? 9;
+    return ra - rb || String(a.canonical_label || '').localeCompare(String(b.canonical_label || ''));
+  });
+}
+
+async function loadConceptGraph(path) {
+  if (conceptGraphCache.path === path && conceptGraphCache.graph) return conceptGraphCache.graph;
+  const graph = await window.api.analysisReadGraph(path);
+  conceptGraphCache = { path, graph };
+  return graph;
+}
+
+// Overview: a hierarchical outline (macro → topic → …) built from parent_id links,
+// capped at maxLines. Concepts whose parent is filtered out become roots.
+function cmRenderTree(sortedConcepts, maxLines) {
+  const byId = new Map();
+  for (const c of sortedConcepts) if (c.concept_id) byId.set(c.concept_id, c);
+  const children = new Map();
+  const roots = [];
+  for (const c of sortedConcepts) {
+    const pid = c.parent_id;
+    if (pid && pid !== c.concept_id && byId.has(pid)) {
+      if (!children.has(pid)) children.set(pid, []);
+      children.get(pid).push(c);
+    } else {
+      roots.push(c);
+    }
+  }
+  const lines = [];
+  const visited = new Set();
+  function walk(c, depth) {
+    if (lines.length >= maxLines || (c.concept_id && visited.has(c.concept_id))) return;
+    if (c.concept_id) visited.add(c.concept_id);
+    const label = (c.canonical_label || c.concept_id || 'Untitled').trim();
+    let line = `${'  '.repeat(depth)}- ${label}`;
+    const summary = (c.summary || '').trim();
+    if (CM_SUMMARY_LEVELS.has(String(c.level || '').toLowerCase()) && summary && summary !== label) {
+      line += `: ${summary.slice(0, 200)}`;
+    }
+    lines.push(line);
+    for (const k of (children.get(c.concept_id) || [])) {
+      if (lines.length >= maxLines) break;
+      walk(k, depth + 1);
+    }
+  }
+  for (const r of roots) { if (lines.length >= maxLines) break; walk(r, 0); }
+  for (const c of sortedConcepts) {  // any left over (cycles / orphans)
+    if (lines.length >= maxLines) break;
+    if (!c.concept_id || !visited.has(c.concept_id)) walk(c, 0);
+  }
+  return { text: lines.join('\n'), shown: lines.length };
+}
+
+// Relevant: concepts whose label/aliases/summary overlap the message tokens, ranked.
+function cmRenderRelevant(concepts, byIdAll, userText, maxItems) {
+  const q = new Set(cmTokens(userText));
+  if (!q.size) return { text: '', shown: 0 };
+  const scored = [];
+  for (const c of concepts) {
+    let score = 0;
+    for (const t of new Set(cmTokens(cmConceptSearchText(c)))) if (q.has(t)) score++;
+    if (score > 0) scored.push({ c, score });
+  }
+  scored.sort((a, b) => b.score - a.score
+    || String(a.c.canonical_label || '').localeCompare(String(b.c.canonical_label || '')));
+  const top = scored.slice(0, maxItems);
+  const lines = top.map(({ c }) => {
+    const parent = c.parent_id ? byIdAll.get(c.parent_id) : null;
+    const anchor = parent ? ` (under “${parent.canonical_label || parent.concept_id}”)` : '';
+    const summary = (c.summary || '').trim();
+    const sum = summary ? `: ${summary.slice(0, 220)}` : '';
+    return `- ${c.canonical_label || c.concept_id}${anchor} [${c.level || 'concept'}]${sum}`;
+  });
+  return { text: lines.join('\n'), shown: lines.length };
+}
+
+function cmRenderTimeline(events, conceptIdFilter, maxItems) {
+  let evs = Array.isArray(events) ? events.slice() : [];
+  if (conceptIdFilter) {
+    evs = evs.filter(e => Array.isArray(e.concept_ids) && e.concept_ids.some(id => conceptIdFilter.has(id)));
+  }
+  evs.sort((a, b) => String(a.timestamp || '').localeCompare(String(b.timestamp || '')));
+  return evs.slice(0, maxItems)
+    .map(e => `- ${e.timestamp || '—'}: ${(e.summary || '').trim().slice(0, 200)}`)
+    .join('\n');
+}
+
+function cmDisplayName(path, graph) {
+  return (graph && graph.graph_id) || path.split(/[\\/]/).pop() || 'concept map';
+}
+
+function renderConceptMapNote(info) {
+  const div = document.createElement('div');
+  div.className = 'message search-sources concept-map-note';
+  const title = document.createElement('div');
+  title.className = 'search-sources-title';
+  title.textContent = `Concept map memory · ${info.name}`;
+  div.appendChild(title);
+  const sub = document.createElement('div');
+  sub.className = 'search-sources-queries';
+  sub.textContent = `${info.mode} · ${info.shown}/${info.total} concepts`
+    + `${info.timeline ? ' · timeline' : ''} · levels: ${info.levels.join(', ') || 'none'}`;
+  div.appendChild(sub);
+  messagesEl.appendChild(div);
+  return div;
+}
+
+// Returns a context string to inject as conceptual-anchor memory, or null.
+async function buildConceptMapContext(userText) {
+  if (!conceptMapEnabled) return null;
+  if (!conceptMapPath) {
+    addMessage('error', 'Concept map memory is on, but no map is selected. Pick one in Settings → Concept map.');
+    return null;
+  }
+  if (!conceptMapLevels.length) {
+    addMessage('error', 'Concept map memory is on, but no levels are selected. Enable at least one in Settings → Concept map.');
+    return null;
+  }
+
+  let graph;
+  try {
+    graph = await loadConceptGraph(conceptMapPath);
+  } catch (err) {
+    addMessage('error', `Concept map failed to load: ${err?.message || err}`);
+    return null;
+  }
+
+  const allConcepts = Array.isArray(graph?.concepts) ? graph.concepts : [];
+  if (!allConcepts.length) return null;
+
+  const byIdAll = new Map();
+  for (const c of allConcepts) if (c.concept_id) byIdAll.set(c.concept_id, c);
+
+  const levelSet = new Set(conceptMapLevels);
+  const filtered = allConcepts.filter(c => levelSet.has(String(c.level || '').toLowerCase()));
+  if (!filtered.length) return null;
+
+  let rendered;
+  const conceptIdFilter = new Set();
+  if (conceptMapMode === 'relevant') {
+    rendered = cmRenderRelevant(filtered, byIdAll, userText, conceptMapMaxConcepts);
+    if (!rendered.shown) {
+      // No keyword hit — fall back to a compact overview so the anchor still helps.
+      rendered = cmRenderTree(cmSortConcepts(filtered), Math.min(conceptMapMaxConcepts, 60));
+    } else {
+      // Collect ids of shown concepts for timeline filtering.
+      for (const c of filtered) if (c.concept_id) conceptIdFilter.add(c.concept_id);
+    }
+  } else {
+    rendered = cmRenderTree(cmSortConcepts(filtered), conceptMapMaxConcepts);
+    for (const c of filtered) if (c.concept_id) conceptIdFilter.add(c.concept_id);
+  }
+  if (!rendered.text) return null;
+
+  let timeline = '';
+  if (conceptMapIncludeEvents && Array.isArray(graph.events) && graph.events.length) {
+    // In relevant mode, scope events to the shown concepts; in overview, show all (capped).
+    const filter = conceptMapMode === 'relevant' ? conceptIdFilter : null;
+    timeline = cmRenderTimeline(graph.events, filter, 40);
+  }
+
+  const name = cmDisplayName(conceptMapPath, graph);
+  renderConceptMapNote({
+    name,
+    mode: conceptMapMode,
+    shown: rendered.shown,
+    total: allConcepts.length,
+    timeline: !!timeline,
+    levels: conceptMapLevels,
+  });
+
+  const framing = `The following is a map of the user's own conceptual space, distilled by this app's Data Analysis from their PAST conversations — the topics they think about and how those relate. Treat it as background on what the user is likely already familiar with and the directions of their thinking. It is NOT the user's current question and NOT facts to recite. Use it to calibrate depth, avoid over-explaining what they clearly know, and connect your answer to their existing concepts where relevant. If it isn't relevant to the message, ignore it.`;
+
+  const parts = [
+    framing,
+    `\n# Concept map: ${name} (${rendered.shown} of ${allConcepts.length} concepts shown; levels: ${conceptMapLevels.join(', ')})`,
+    rendered.text,
+  ];
+  if (timeline) parts.push(`\n## Timeline (events)\n${timeline}`);
+  return parts.join('\n');
 }
 
 async function sendMessage() {
@@ -5401,17 +5965,23 @@ async function sendMessage() {
   }
 
   let webSearchContext = null;
-  if (webSearchEnabled && text) {
-    webSearchContext = await runWebSearch(text);
+  if (webSearchMode !== 'off' && text) {
+    webSearchContext = await runWebSearch(text, webSearchMode);
+  }
+
+  let conceptMapContext = null;
+  if (conceptMapEnabled && text) {
+    conceptMapContext = await buildConceptMapContext(text);
   }
 
   await streamAssistantResponse({
     forceImageDescriptionsForLastUser: shouldAnalyzeOutgoingImages,
     webSearchContext,
+    conceptMapContext,
   });
 }
 
-async function streamAssistantResponse({ forceImageDescriptionsForLastUser = false, webSearchContext = null } = {}) {
+async function streamAssistantResponse({ forceImageDescriptionsForLastUser = false, webSearchContext = null, conceptMapContext = null } = {}) {
   const distToBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight;
   if (distToBottom < 350) autoScrollEnabled = true;
   document.body.classList.add('streaming');
@@ -5505,14 +6075,17 @@ async function streamAssistantResponse({ forceImageDescriptionsForLastUser = fal
   };
   const requestHadImages = conversationHistory.some(messageHasImages);
   const apiMessages = buildApiMessagesForModel(conversationHistory, currentModel, { forceImageDescriptionsForLastUser });
-  if (webSearchContext) {
-    // Inject search results as a system message just before the last user turn.
+  // Inject extra context as system messages just before the last user turn. Order:
+  // concept-map memory (long-term background) first, then web results (current), then
+  // the user turn.
+  const injectedContexts = [conceptMapContext, webSearchContext].filter(Boolean);
+  if (injectedContexts.length) {
     let lastUserIdx = -1;
     for (let i = apiMessages.length - 1; i >= 0; i--) {
       if (apiMessages[i].role === 'user') { lastUserIdx = i; break; }
     }
     const insertAt = lastUserIdx >= 0 ? lastUserIdx : apiMessages.length;
-    apiMessages.splice(insertAt, 0, { role: 'system', content: webSearchContext });
+    apiMessages.splice(insertAt, 0, ...injectedContexts.map(content => ({ role: 'system', content })));
   }
   const requestSentActualImages = apiMessages.some(messageHasImages);
 
@@ -5994,6 +6567,12 @@ async function init() {
       localStorage.setItem('serverUrl', serverUrl);
       settingsServerUrl.value = serverUrl;
     }
+  } catch {}
+  // The token is persisted by the backend and applied to every server request there;
+  // load it into the settings field for display/editing.
+  try {
+    const savedToken = await window.api.getApiToken();
+    if (settingsApiToken) settingsApiToken.value = savedToken || '';
   } catch {}
 
   await loadModels();

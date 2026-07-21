@@ -1767,16 +1767,45 @@ body.streaming .msg-edit-btn, body.streaming .msg-resend-btn { display: none !im
 
 #composer-main-row { display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 8px; }
 
-#web-search-toggle {
+#web-search-toggle,
+#concept-map-toggle {
   flex-shrink: 0; width: 46px; height: 46px; padding: 0;
   border: 1px solid var(--border); border-radius: 8px;
   background: var(--bg-primary); color: var(--text-secondary);
   display: flex; align-items: center; justify-content: center; cursor: pointer;
   transition: color 0.15s, border-color 0.15s, background 0.15s;
 }
-#web-search-toggle:hover { color: var(--text-primary); border-color: var(--accent); }
-#web-search-toggle.active {
+#web-search-toggle:hover,
+#concept-map-toggle:hover { color: var(--text-primary); border-color: var(--accent); }
+#web-search-toggle.active,
+#concept-map-toggle.active {
   background: var(--accent); color: var(--accent-text); border-color: var(--accent);
+}
+
+.cm-check {
+  display: inline-flex; align-items: center; gap: 5px;
+  color: var(--text-secondary); font-size: 13px; cursor: pointer;
+}
+.cm-check input { accent-color: var(--accent); }
+.message.search-sources.concept-map-note .search-sources-title::before {
+  content: "◈"; margin-right: 2px; color: var(--accent);
+}
+
+#web-search-mode {
+  flex-shrink: 0; display: flex; height: 46px; box-sizing: border-box;
+  border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+  background: var(--bg-primary);
+}
+#web-search-mode.hidden { display: none; }
+#web-search-mode button {
+  border: 0; background: transparent; color: var(--text-secondary);
+  padding: 0 12px; font-size: 12px; font-weight: 600; cursor: pointer;
+  transition: color 0.15s, background 0.15s;
+}
+#web-search-mode button + button { border-left: 1px solid var(--border); }
+#web-search-mode button:hover { color: var(--text-primary); }
+#web-search-mode button.active {
+  background: var(--accent); color: var(--accent-text);
 }
 
 .message.search-sources {
@@ -1789,6 +1818,10 @@ body.streaming .msg-edit-btn, body.streaming .msg-resend-btn { display: none !im
 .message.search-sources .search-sources-title {
   font-weight: 600; color: var(--text-primary); margin-bottom: 4px;
   display: flex; align-items: center; gap: 6px;
+}
+.message.search-sources .search-sources-queries {
+  color: var(--text-secondary); margin-bottom: 6px; font-size: 11px;
+  overflow-wrap: anywhere;
 }
 .message.search-sources ol { margin: 0; padding-left: 18px; }
 .message.search-sources li { margin: 2px 0; }

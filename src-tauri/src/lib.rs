@@ -27,6 +27,9 @@ struct AppState {
     next_generation: Mutex<u64>,
     current_model_load_cancel: Mutex<Option<oneshot::Sender<()>>>,
     server_url: Mutex<String>,
+    // Optional bearer token for servers that require auth (LM Studio's "require API key").
+    // Empty string = send no Authorization header (the common local, no-auth case).
+    api_token: Mutex<String>,
     // Cache of chat_id -> file path so single-chat ops don't rescan the whole chats tree.
     // Rebuilt wholesale on a lookup miss (e.g. externally-added files) to stay correct.
     chat_index: Mutex<Option<HashMap<String, PathBuf>>>,
@@ -126,6 +129,28 @@ fn load_server_url_from_file(app: &AppHandle) -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| DEFAULT_SERVER_URL.to_string())
+}
+
+fn api_token_file(app: &AppHandle) -> PathBuf {
+    app_root(app).join("api-token.txt")
+}
+
+fn load_api_token_from_file(app: &AppHandle) -> String {
+    fs::read_to_string(api_token_file(app))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+// Attach `Authorization: Bearer <token>` when a token is set; otherwise leave the
+// request unauthenticated (local servers with auth disabled).
+fn with_bearer(builder: reqwest::RequestBuilder, token: &str) -> reqwest::RequestBuilder {
+    let token = token.trim();
+    if token.is_empty() {
+        builder
+    } else {
+        builder.bearer_auth(token)
+    }
 }
 
 fn ensure_dir(path: &Path) -> Result<(), String> {
@@ -1355,6 +1380,7 @@ async fn post_stream(
     stream_channel: Channel<String>,
 ) -> Value {
     let server_url = state.server_url.lock().unwrap().clone();
+    let api_token = state.api_token.lock().unwrap().clone();
     let model = options
         .as_ref()
         .and_then(|o| o.get("model"))
@@ -1449,7 +1475,7 @@ async fn post_stream(
         Err(e) => return json!({ "error": e.to_string() }),
     };
 
-    let request = client.post(&endpoint).json(&body).send();
+    let request = with_bearer(client.post(&endpoint).json(&body), &api_token).send();
 
     let response = match await_response_headers(request, &mut cancel_rx).await {
         HeaderWaitOutcome::Cancelled => {
@@ -1496,7 +1522,7 @@ async fn post_stream(
                     "retryingWithoutReasoning": true
                 }),
             );
-            let retry = client.post(&endpoint).json(&fallback_body).send();
+            let retry = with_bearer(client.post(&endpoint).json(&fallback_body), &api_token).send();
             response = match await_response_headers(retry, &mut cancel_rx).await {
                 HeaderWaitOutcome::Cancelled => {
                     dev_log(&window, "response", json!({ "endpoint": endpoint, "model": model, "durationMs": now_ms().saturating_sub(start), "status": "cancelled" }));
@@ -2212,6 +2238,154 @@ fn analysis_read_graph(path: String) -> Result<Value, String> {
     Ok(value)
 }
 
+// Lightweight metadata for one concept-map graph on disk, for the concept-map picker.
+// Parses the file to count concepts/events and preview macro labels, but returns only
+// the summary (not the whole graph) so listing many graphs stays cheap.
+fn graph_summary_entry(
+    path: &Path,
+    kind: &str,
+    source: Option<&str>,
+    dataset_id: Option<&str>,
+    run_id: Option<&str>,
+) -> Value {
+    let modified_ms = fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let mut concept_count = 0u64;
+    let mut event_count = 0u64;
+    let mut graph_id = String::new();
+    let mut macro_labels: Vec<String> = Vec::new();
+    let mut parse_ok = false;
+
+    if let Ok(text) = fs::read_to_string(path) {
+        if let Ok(v) = serde_json::from_str::<Value>(&text) {
+            parse_ok = true;
+            if let Some(arr) = v.get("concepts").and_then(Value::as_array) {
+                concept_count = arr.len() as u64;
+                for c in arr {
+                    let level = c.get("level").and_then(Value::as_str).unwrap_or("");
+                    if level.eq_ignore_ascii_case("macro") && macro_labels.len() < 8 {
+                        if let Some(l) = c.get("canonical_label").and_then(Value::as_str) {
+                            if !l.is_empty() {
+                                macro_labels.push(l.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            event_count = v
+                .get("events")
+                .and_then(Value::as_array)
+                .map(|a| a.len() as u64)
+                .unwrap_or(0);
+            graph_id = v
+                .get("graph_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+        }
+    }
+
+    json!({
+        "path": path.display().to_string(),
+        "kind": kind,
+        "source": source,
+        "datasetId": dataset_id,
+        "runId": run_id,
+        "fileName": path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+        "graphId": graph_id,
+        "conceptCount": concept_count,
+        "eventCount": event_count,
+        "macroLabels": macro_labels,
+        "modifiedMs": modified_ms,
+        "parseOk": parse_ok
+    })
+}
+
+fn collect_run_graphs(
+    dataset_dir: &Path,
+    source: Option<&str>,
+    dataset_id: &str,
+    out: &mut Vec<Value>,
+) {
+    let runs = dataset_dir.join("runs");
+    if let Ok(entries) = fs::read_dir(&runs) {
+        for run in entries.flatten() {
+            let rpath = run.path();
+            if !rpath.is_dir() {
+                continue;
+            }
+            let run_id = run.file_name().to_string_lossy().to_string();
+            let gpath = rpath.join("output_graph.json");
+            if gpath.is_file() {
+                out.push(graph_summary_entry(&gpath, "run", source, Some(dataset_id), Some(&run_id)));
+            }
+        }
+    }
+}
+
+// Discover every finished concept-map graph under analysis-projects: each run's
+// output_graph.json (flat <dataset>/runs/... or nested <source>/<dataset>/runs/...) plus
+// every reconciliations/*.json. Newest first. Used by the concept-map memory picker.
+#[tauri::command]
+fn analysis_list_graphs(app: AppHandle) -> Result<Value, String> {
+    let root = analysis_dir(&app);
+    let mut out: Vec<Value> = Vec::new();
+
+    if let Ok(entries) = fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == "reconciliations" {
+                continue;
+            }
+            // A dir directly containing `runs/` is a flat dataset; otherwise it's a source
+            // dir (anthropic/openai/…) holding dataset dirs.
+            if path.join("runs").is_dir() {
+                collect_run_graphs(&path, None, &name, &mut out);
+            } else if let Ok(datasets) = fs::read_dir(&path) {
+                for ds in datasets.flatten() {
+                    let dpath = ds.path();
+                    if dpath.join("runs").is_dir() {
+                        let dataset_id = ds.file_name().to_string_lossy().to_string();
+                        collect_run_graphs(&dpath, Some(&name), &dataset_id, &mut out);
+                    }
+                }
+            }
+        }
+    }
+
+    let recon = root.join("reconciliations");
+    if let Ok(files) = fs::read_dir(&recon) {
+        for f in files.flatten() {
+            let p = f.path();
+            if p.is_file()
+                && p.extension()
+                    .and_then(|s| s.to_str())
+                    .map(|e| e.eq_ignore_ascii_case("json"))
+                    == Some(true)
+            {
+                out.push(graph_summary_entry(&p, "reconciliation", None, None, None));
+            }
+        }
+    }
+
+    out.sort_by(|a, b| {
+        let ma = a.get("modifiedMs").and_then(Value::as_u64).unwrap_or(0);
+        let mb = b.get("modifiedMs").and_then(Value::as_u64).unwrap_or(0);
+        mb.cmp(&ma)
+    });
+
+    Ok(json!({ "graphs": out }))
+}
+
 #[tauri::command]
 fn analysis_save_reconciliation(
     app: AppHandle,
@@ -2394,15 +2568,15 @@ fn value_has_vision_hint(value: &Value, depth: u8) -> bool {
 }
 
 #[tauri::command]
-async fn get_models(server_url: String) -> Result<Value, String> {
+async fn get_models(state: tauri::State<'_, AppState>, server_url: String) -> Result<Value, String> {
+    let api_token = state.api_token.lock().unwrap().clone();
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(8))
         .timeout(Duration::from_secs(15))
         .build()
         .map_err(|e| e.to_string())?;
     let url = format!("{}/v1/models", server_url.trim_end_matches('/'));
-    let resp = client
-        .get(&url)
+    let resp = with_bearer(client.get(&url), &api_token)
         .send()
         .await
         .map_err(|e| format!("Cannot reach server: {e}"))?;
@@ -2448,6 +2622,7 @@ async fn get_models(server_url: String) -> Result<Value, String> {
 #[tauri::command]
 async fn load_model(window: WebviewWindow, state: tauri::State<'_, AppState>, model: String) -> Result<Value, String> {
     let server_url = state.server_url.lock().unwrap().clone();
+    let api_token = state.api_token.lock().unwrap().clone();
     let endpoint = format!("{}/api/v1/models/load", server_url.trim_end_matches('/'));
     let start = now_ms();
     let (cancel_tx, mut cancel_rx) = oneshot::channel();
@@ -2474,9 +2649,7 @@ async fn load_model(window: WebviewWindow, state: tauri::State<'_, AppState>, mo
         .timeout(Duration::from_secs(300))
         .build()
         .map_err(|e| e.to_string())?;
-    let request = client
-        .post(&endpoint)
-        .json(&json!({ "model": model }))
+    let request = with_bearer(client.post(&endpoint).json(&json!({ "model": model })), &api_token)
         .send();
     let resp = tokio::select! {
         _ = &mut cancel_rx => {
@@ -2559,6 +2732,25 @@ async fn exa_search(
         .filter(|&n| (1..=10).contains(&n))
         .unwrap_or(5);
 
+    // Content controls: quick mode asks for query-focused summaries; deep mode asks for
+    // bounded full page text. Highlights are always requested as a cheap fallback snippet.
+    let include_summary = options
+        .as_ref()
+        .and_then(|o| o.get("includeSummary"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let include_text = options
+        .as_ref()
+        .and_then(|o| o.get("includeText"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let text_max_chars = options
+        .as_ref()
+        .and_then(|o| o.get("textMaxChars"))
+        .and_then(Value::as_u64)
+        .map(|n| n.clamp(1000, 30000))
+        .unwrap_or(6000);
+
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return Err("Empty search query.".to_string());
@@ -2583,11 +2775,19 @@ async fn exa_search(
         .build()
         .map_err(|e| e.to_string())?;
 
+    let mut contents = json!({ "highlights": true });
+    if include_summary {
+        contents["summary"] = json!({ "query": trimmed });
+    }
+    if include_text {
+        contents["text"] = json!({ "maxCharacters": text_max_chars });
+    }
+
     let body = json!({
         "query": trimmed,
         "type": "auto",
         "numResults": num_results,
-        "contents": { "highlights": true }
+        "contents": contents
     });
 
     let resp = client
@@ -2629,7 +2829,8 @@ async fn exa_search(
                 "publishedDate": r.get("publishedDate").cloned().unwrap_or(Value::Null),
                 "author": r.get("author").cloned().unwrap_or(Value::Null),
                 "highlights": r.get("highlights").cloned().unwrap_or_else(|| json!([])),
-                "summary": r.get("summary").cloned().unwrap_or(Value::Null)
+                "summary": r.get("summary").cloned().unwrap_or(Value::Null),
+                "text": r.get("text").cloned().unwrap_or(Value::Null)
             })
         })
         .collect::<Vec<_>>();
@@ -2662,6 +2863,23 @@ fn set_server_url(
     let url = url.trim().to_string();
     *state.server_url.lock().unwrap() = url.clone();
     fs::write(server_url_file(&app), &url).map_err(|e| format!("Failed to save URL: {e}"))?;
+    Ok(json!({ "ok": true }))
+}
+
+#[tauri::command]
+fn get_api_token(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    Ok(state.api_token.lock().unwrap().clone())
+}
+
+#[tauri::command]
+fn set_api_token(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    token: String,
+) -> Result<Value, String> {
+    let token = token.trim().to_string();
+    *state.api_token.lock().unwrap() = token.clone();
+    fs::write(api_token_file(&app), &token).map_err(|e| format!("Failed to save token: {e}"))?;
     Ok(json!({ "ok": true }))
 }
 
@@ -3048,11 +3266,13 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let url = load_server_url_from_file(app.handle());
+            let api_token = load_api_token_from_file(app.handle());
             let state = AppState {
                 current_cancel: Mutex::new(HashMap::new()),
                 next_generation: Mutex::new(0),
                 current_model_load_cancel: Mutex::new(None),
                 server_url: Mutex::new(url),
+                api_token: Mutex::new(api_token),
                 chat_index: Mutex::new(None),
             };
             app.manage(state);
@@ -3090,6 +3310,7 @@ pub fn run() {
             analysis_list_canon_batches,
             analysis_save_graph,
             analysis_read_graph,
+            analysis_list_graphs,
             analysis_save_reconciliation,
             analysis_append_log,
             analysis_paths,
@@ -3101,6 +3322,8 @@ pub fn run() {
             exa_search,
             get_server_url,
             set_server_url,
+            get_api_token,
+            set_api_token,
             shell_open_external,
             window_minimize,
             window_toggle_maximize,

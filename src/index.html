@@ -15,6 +15,10 @@
         <span data-tauri-drag-region>Local LLM Chat</span>
         <span id="server-status" class="server-status" title="Server status"></span>
       </div>
+      <div id="app-mode-tabs" role="tablist" aria-label="Workspace">
+        <button id="chat-mode-tab" class="app-mode-tab active" type="button" data-mode="chat" role="tab" aria-selected="true">Chat</button>
+        <button id="analysis-mode-tab" class="app-mode-tab" type="button" data-mode="analysis" role="tab" aria-selected="false">Analysis</button>
+      </div>
       <div id="titlebar-window-controls">
         <button class="titlebar-window-btn" id="titlebar-minimize" title="Minimize" aria-label="Minimize">
           <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
@@ -37,10 +41,6 @@
     <div id="main-area">
       <div id="sidebar-area">
         <aside id="sidebar">
-          <div id="app-mode-tabs" role="tablist" aria-label="Workspace">
-            <button id="chat-mode-tab" class="app-mode-tab active" type="button" data-mode="chat" role="tab" aria-selected="true">Chat</button>
-            <button id="analysis-mode-tab" class="app-mode-tab" type="button" data-mode="analysis" role="tab" aria-selected="false">Analysis</button>
-          </div>
           <button id="new-chat-btn">+ New Chat</button>
           <div id="chat-list"></div>
           <div id="sidebar-footer">
@@ -238,6 +238,15 @@
               </select>
             </div>
 
+            <label class="settings-label">Arrangement <span class="settings-hint">(overview ordering, like the 3D map's layouts)</span></label>
+            <div class="settings-row">
+              <select id="cm-arrangement">
+                <option value="hierarchy">Hierarchy — parent → child outline</option>
+                <option value="salience">Salience — most-referenced concepts first</option>
+                <option value="alpha">Alphabetical</option>
+              </select>
+            </div>
+
             <label class="settings-label">Include levels <span class="settings-hint">(category granularity)</span></label>
             <div id="cm-levels" class="settings-row" style="flex-wrap: wrap; gap: 12px;">
               <label class="cm-check"><input type="checkbox" data-level="macro" checked> macro</label>
@@ -254,8 +263,21 @@
 
             <label class="settings-label">Max concepts <span class="settings-hint">(size budget)</span></label>
             <div class="settings-row">
-              <input type="number" id="cm-max-concepts" min="10" max="1000" step="10" value="200">
+              <input type="number" id="cm-max-concepts" min="10" max="9999" step="10" value="200">
             </div>
+
+            <label class="settings-label">Memory injection framing <span class="settings-hint">(how the map is described to the model)</span></label>
+            <textarea id="cm-framing" class="settings-textarea" rows="6" spellcheck="false"
+              placeholder="Instructions that precede the concept map when it is injected as memory..."></textarea>
+            <button id="cm-framing-reset" class="settings-action-btn">Reset framing to default</button>
+
+            <label class="settings-label">Extraction guidelines <span class="settings-hint">(added to Data Analysis topic-extraction prompts)</span></label>
+            <textarea id="cm-extraction-guidelines" class="settings-textarea" rows="4" spellcheck="false"
+              placeholder="Extra rules appended when extracting topics from chunks. One per line. Leave empty for defaults."></textarea>
+
+            <label class="settings-label">Canonization guidelines <span class="settings-hint">(added to Data Analysis canonize/merge prompts)</span></label>
+            <textarea id="cm-canonization-guidelines" class="settings-textarea" rows="4" spellcheck="false"
+              placeholder="Extra rules appended when merging topics into the canonical graph. One per line. Leave empty for defaults."></textarea>
           </section>
         </div>
       </div>
@@ -292,6 +314,7 @@
         <div class="analysis-source-tabs" role="tablist" aria-label="Data source">
           <button id="analysis-tab-anthropic" class="analysis-source-tab active" type="button" data-source="anthropic" role="tab" aria-selected="true">Anthropic</button>
           <button id="analysis-tab-openai" class="analysis-source-tab" type="button" data-source="openai" role="tab" aria-selected="false">OpenAI</button>
+          <button id="analysis-tab-grok" class="analysis-source-tab" type="button" data-source="grok" role="tab" aria-selected="false">Grok</button>
         </div>
 
         <div class="analysis-grid">

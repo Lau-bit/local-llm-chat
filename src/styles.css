@@ -273,7 +273,7 @@ body {
   flex-shrink: 0;
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-start;
   background: #080807;
   border-bottom: 1px solid rgba(232, 160, 32, 0.12);
   color: var(--text-primary);
@@ -328,6 +328,7 @@ body {
   display: flex;
   align-items: stretch;
   flex-shrink: 0;
+  margin-left: auto;
 }
 
 .titlebar-window-btn {
@@ -383,22 +384,28 @@ body {
 
 #sidebar.hidden { opacity: 0; pointer-events: none; }
 
+/* Workspace tabs live in the custom title bar, just right of the brand/status light. */
 #app-mode-tabs {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  display: flex;
+  align-items: center;
   gap: 6px;
-  padding: 12px 12px 0;
+  height: 100%;
+  padding: 0 8px;
 }
 
 .app-mode-tab {
-  height: 32px;
+  height: 24px;
+  padding: 0 14px;
   border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--bg-primary);
+  border-radius: 6px;
+  background: var(--bg-elevated);
   color: var(--text-secondary);
   font-family: inherit;
   font-size: 12px;
+  line-height: 1;
   cursor: pointer;
+  display: flex;
+  align-items: center;
 }
 
 .app-mode-tab:hover { color: var(--text-primary); border-color: var(--accent); background: var(--bg-hover); }
@@ -427,6 +434,20 @@ body {
   flex: 1;
   overflow-y: auto;
   padding: 8px 8px 0;
+}
+
+/* The sidebar toggle is an absolutely-positioned full-width bar (see #sidebar-toggle,
+   z-index 260); the chat list is in normal flow and would otherwise start underneath it,
+   hiding the first item and swallowing its clicks. Reserve room so the list clears the
+   bar. The bar sits below "+ New Chat" in chat mode but rides to the very top in analysis
+   mode (where New Chat is hidden), so the clearance differs per mode. The collapsed state
+   hides the sidebar content, so no reservation is needed there. */
+body:not(.analysis-mode) #sidebar-area:not(.collapsed) #chat-list {
+  margin-top: 34px;
+}
+
+body.analysis-mode #sidebar-area:not(.collapsed) #chat-list {
+  margin-top: 50px;
 }
 
 .chat-item {
@@ -567,7 +588,7 @@ body {
 /* ── Sidebar toggle ───────────────────────────────────────────────────────── */
 
 #sidebar-toggle {
-  position: absolute; top: 104px; left: 12px;
+  position: absolute; top: 58px; left: 12px;
   width: 236px; height: 34px;
   border: 1px solid var(--border); border-radius: 8px;
   background: var(--bg-elevated); color: var(--text-muted);
@@ -579,16 +600,13 @@ body {
 
 #sidebar-toggle:hover { color: var(--text-primary); background: var(--bg-hover); border-color: var(--accent); }
 
-body.analysis-mode #sidebar-area:not(.collapsed) #app-mode-tabs {
-  grid-template-columns: 1fr;
-  width: calc(100% - 58px);
-}
-
+/* In analysis mode "+ New Chat" is hidden, so the toggle bar rides up to the top of
+   the sidebar (the workspace tabs now live in the title bar, not here). */
 body.analysis-mode #sidebar-area:not(.collapsed) #sidebar-toggle {
   top: 12px;
-  left: 210px;
-  width: 38px;
-  height: 70px;
+  left: 12px;
+  width: 236px;
+  height: 34px;
   border-radius: 8px;
 }
 
@@ -851,6 +869,15 @@ body.analysis-mode #sidebar-area:not(.collapsed) #sidebar-toggle {
 }
 
 .settings-action-btn:hover { background: var(--bg-tertiary); color: var(--text-primary); }
+
+.settings-textarea {
+  width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg-primary); color: var(--text-primary);
+  font-family: inherit; font-size: 12px; line-height: 1.5; resize: vertical; outline: none;
+  min-height: 64px; max-height: 40vh; box-sizing: border-box;
+}
+
+.settings-textarea:focus { border-color: var(--accent); }
 
 .model-settings-header { display: flex; gap: 8px; margin-bottom: 12px; }
 
@@ -1191,7 +1218,7 @@ body.analysis-mode #analysis-container:not(.hidden) {
 
 .analysis-source-tabs {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
   margin-bottom: 10px;
 }

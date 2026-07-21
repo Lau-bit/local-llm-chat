@@ -868,7 +868,7 @@ fn dataset_dir(app: &AppHandle, dataset_id: &str) -> PathBuf {
     if flat.exists() {
         return flat;
     }
-    for source in ["anthropic", "openai"] {
+    for source in ["anthropic", "openai", "grok"] {
         let path = root.join(source).join(dataset_id);
         if path.exists() {
             return path;
@@ -1189,6 +1189,170 @@ fn extract_openai_records_from_value(
             extract_openai_conversation_records(obj, source_path, records);
         }
         _ => {}
+    }
+    records.len() - before
+}
+
+// ── grok.com export adapter ────────────────────────────────────────────────
+// grok exports (prod-grok-backend.json) are shaped
+//   {"conversations":[{"conversation":{id,title,create_time,...},
+//                      "responses":[{"response":{_id,message,sender,create_time,
+//                                                parent_response_id,model,...}}]}], ...}
+// Message text lives in `message` (not `text`/`content`), senders are "human"/"ASSISTANT",
+// response timestamps are MongoDB extended JSON, and assistant messages carry
+// <grok:render>…</grok:render> citation markup — so grok needs its own extractor.
+
+// Convert epoch milliseconds (UTC) to an ISO-8601 string, matching the ISO timestamps
+// the rest of the pipeline expects (month_from_iso etc.). No chrono dependency: uses
+// Howard Hinnant's civil-from-days algorithm.
+fn millis_to_iso(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let millis = ms.rem_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let (hour, min, sec) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+    // civil_from_days: days since 1970-01-01 -> (year, month, day)
+    let z = days + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}.{millis:03}Z")
+}
+
+// Grok create_time is either an ISO string or MongoDB extended JSON
+// ({"$date":{"$numberLong":"<ms>"}} or {"$date":"<iso>"} or {"$date":<ms>}).
+fn grok_timestamp_to_iso(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(s)) => s.trim().to_string(),
+        Some(Value::Number(n)) => n.as_i64().map(millis_to_iso).unwrap_or_default(),
+        Some(Value::Object(map)) => match map.get("$date") {
+            Some(Value::String(s)) => s.trim().to_string(),
+            Some(Value::Number(n)) => n.as_i64().map(millis_to_iso).unwrap_or_default(),
+            Some(Value::Object(inner)) => match inner.get("$numberLong") {
+                Some(Value::String(s)) => {
+                    s.trim().parse::<i64>().ok().map(millis_to_iso).unwrap_or_default()
+                }
+                Some(Value::Number(n)) => n.as_i64().map(millis_to_iso).unwrap_or_default(),
+                _ => String::new(),
+            },
+            _ => String::new(),
+        },
+        _ => String::new(),
+    }
+}
+
+// Remove <grok:render …>…</grok:render> inline-citation markup that clutters assistant
+// messages. An unterminated open tag drops the remainder (there is no real content after
+// a malformed tag in practice).
+fn strip_grok_render(text: &str) -> String {
+    const OPEN: &str = "<grok:render";
+    const CLOSE: &str = "</grok:render>";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        match rest.find(OPEN) {
+            Some(open) => {
+                out.push_str(&rest[..open]);
+                match rest[open..].find(CLOSE) {
+                    Some(rel) => rest = &rest[open + rel + CLOSE.len()..],
+                    None => break,
+                }
+            }
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn push_grok_record(
+    records: &mut Vec<Value>,
+    source_path: &str,
+    conversation: &serde_json::Map<String, Value>,
+    response: &serde_json::Map<String, Value>,
+) {
+    let raw = response.get("message").and_then(Value::as_str).unwrap_or("");
+    let clean = strip_grok_render(raw);
+    let clean = clean.trim();
+    if clean.is_empty() {
+        return;
+    }
+
+    let message_id = response.get("_id").and_then(Value::as_str).unwrap_or("");
+    // Normalize "human"/"ASSISTANT" (and any future variants) to lowercase.
+    let sender = response
+        .get("sender")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_ascii_lowercase();
+    let created_at = grok_timestamp_to_iso(response.get("create_time"));
+    let conversation_id = response
+        .get("conversation_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .or_else(|| conversation.get("id").and_then(Value::as_str))
+        .unwrap_or("");
+    let title = conversation.get("title").and_then(Value::as_str).unwrap_or("");
+    let parent = response
+        .get("parent_response_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let model = response.get("model").and_then(Value::as_str).unwrap_or("");
+    let record_key = format!("{conversation_id}:{message_id}:{created_at}:{clean}");
+    let (analysis_text, omitted_blocks, omitted_chars) = omit_code_blocks_for_analysis(clean);
+
+    records.push(json!({
+        "record_id": format!("rec_{}", stable_hash(&record_key)),
+        "source_message_uuid": message_id,
+        "sender": sender,
+        "created_at": created_at.clone(),
+        "updated_at": grok_timestamp_to_iso(conversation.get("modify_time")),
+        "start_timestamp": created_at,
+        "stop_timestamp": "",
+        "parent_message_uuid": parent,
+        "source_path": source_path,
+        "conversation_id": conversation_id,
+        "conversation_title": title,
+        "model": model,
+        "content_index": 0,
+        "text": clean,
+        "analysis_text": analysis_text,
+        "omitted_code_blocks": omitted_blocks,
+        "omitted_code_chars": omitted_chars
+    }));
+}
+
+fn extract_grok_records_from_value(
+    value: &Value,
+    source_path: &str,
+    records: &mut Vec<Value>,
+) -> usize {
+    let before = records.len();
+    let empty = serde_json::Map::new();
+    if let Some(conversations) = value.get("conversations").and_then(Value::as_array) {
+        for item in conversations {
+            let Some(item_obj) = item.as_object() else {
+                continue;
+            };
+            let conversation = item_obj
+                .get("conversation")
+                .and_then(Value::as_object)
+                .unwrap_or(&empty);
+            if let Some(responses) = item_obj.get("responses").and_then(Value::as_array) {
+                for entry in responses {
+                    if let Some(response) = entry.get("response").and_then(Value::as_object) {
+                        push_grok_record(records, source_path, conversation, response);
+                    }
+                }
+            }
+        }
     }
     records.len() - before
 }
@@ -1734,9 +1898,9 @@ fn analysis_import(
     source_format: String,
 ) -> Result<Value, String> {
     let source_format = source_format.trim().to_ascii_lowercase();
-    if source_format != "anthropic" && source_format != "openai" {
+    if source_format != "anthropic" && source_format != "openai" && source_format != "grok" {
         return Err(
-            "Choose Anthropic / Claude export or OpenAI / ChatGPT export before importing."
+            "Choose Anthropic / Claude, OpenAI / ChatGPT, or Grok export before importing."
                 .to_string(),
         );
     }
@@ -1774,23 +1938,33 @@ fn analysis_import(
     .map_err(|e| e.to_string())?;
 
     let mut records = Vec::new();
-    let conversation_count = match &parsed {
-        Value::Array(items) => items.len(),
-        Value::Object(_) => 1,
-        _ => 0,
+    let conversation_count = if source_format == "grok" {
+        parsed
+            .get("conversations")
+            .and_then(Value::as_array)
+            .map(|a| a.len())
+            .unwrap_or(0)
+    } else {
+        match &parsed {
+            Value::Array(items) => items.len(),
+            Value::Object(_) => 1,
+            _ => 0,
+        }
     };
     if source_format == "openai" {
         extract_openai_records_from_value(&parsed, &source.display().to_string(), &mut records);
+    } else if source_format == "grok" {
+        extract_grok_records_from_value(&parsed, &source.display().to_string(), &mut records);
     } else {
         extract_records_from_value(&parsed, &source.display().to_string(), &mut records);
     }
     if records.is_empty() {
         return Err(format!(
             "No analyzable records found for {} export.",
-            if source_format == "openai" {
-                "OpenAI / ChatGPT"
-            } else {
-                "Anthropic / Claude"
+            match source_format.as_str() {
+                "openai" => "OpenAI / ChatGPT",
+                "grok" => "Grok",
+                _ => "Anthropic / Claude",
             }
         ));
     }
@@ -1831,7 +2005,7 @@ fn analysis_import(
         .to_string();
     let manifest = json!({
         "dataset_id": dataset_id,
-        "adapter": if source_format == "openai" { "openai_chatgpt_export_v1" } else { "conversation_export_v1" },
+        "adapter": match source_format.as_str() { "openai" => "openai_chatgpt_export_v1", "grok" => "grok_export_v1", _ => "conversation_export_v1" },
         "source_format": source_format,
         "schema_version": "0.1.0",
         "source_file": source.display().to_string(),
@@ -1880,7 +2054,7 @@ fn analysis_list(app: AppHandle, source_format: Option<String>) -> Result<Value,
         .unwrap_or_else(|| "anthropic".to_string())
         .trim()
         .to_ascii_lowercase();
-    if source_format != "anthropic" && source_format != "openai" {
+    if source_format != "anthropic" && source_format != "openai" && source_format != "grok" {
         return Err("Unknown analysis source format.".to_string());
     }
     let mut items = Vec::new();

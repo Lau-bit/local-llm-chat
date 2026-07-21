@@ -163,9 +163,14 @@ const cmMapSelect       = document.getElementById('cm-map-select');
 const cmMapRefresh      = document.getElementById('cm-map-refresh');
 const cmMapStatus       = document.getElementById('cm-map-status');
 const cmModeSelect      = document.getElementById('cm-mode');
+const cmArrangement     = document.getElementById('cm-arrangement');
 const cmLevelsGroup     = document.getElementById('cm-levels');
 const cmIncludeEvents   = document.getElementById('cm-include-events');
 const cmMaxConcepts     = document.getElementById('cm-max-concepts');
+const cmFraming         = document.getElementById('cm-framing');
+const cmFramingReset    = document.getElementById('cm-framing-reset');
+const cmExtractionGuidelines  = document.getElementById('cm-extraction-guidelines');
+const cmCanonizationGuidelines = document.getElementById('cm-canonization-guidelines');
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -195,6 +200,11 @@ let isProgrammaticScroll = false;
 let autoScrollDebounceTimer = null;
 let activeGeneration = null;
 let modelLoadRequestId = 0;
+// The model LM Studio currently has loaded, as far as we know. Used to avoid firing
+// redundant load requests (returning to a chat, or clicking between chats, must not
+// keep reloading — or pile up several models in LM Studio). Best-effort belief: if it's
+// wrong, a send simply JIT-loads the model server-side and we recover.
+let loadedModel = null;
 // Web search depth: 'off' | 'quick' (1 smart query, summaries) | 'deep' (multi-query, full page text).
 // Migrate the old boolean flag: previously-on becomes 'quick'.
 let webSearchMode = localStorage.getItem('webSearchMode')
@@ -214,14 +224,25 @@ const WEB_DEEP_MAX_QUERIES = 4;  // decomposition ceiling for deep mode
 let conceptMapEnabled = localStorage.getItem('conceptMapEnabled') === '1';
 let conceptMapPath = localStorage.getItem('conceptMapPath') || '';
 let conceptMapMode = localStorage.getItem('conceptMapMode') || 'overview';  // 'overview' | 'relevant'
+// Overview arrangement, mirroring the 3D vector-map viewer's layouts: 'hierarchy' (tree),
+// 'salience' (most-referenced first, like its "size" layout), 'alpha'.
+let conceptMapArrangement = ['hierarchy', 'salience', 'alpha'].includes(localStorage.getItem('conceptMapArrangement'))
+  ? localStorage.getItem('conceptMapArrangement') : 'hierarchy';
 let conceptMapLevels = (localStorage.getItem('conceptMapLevels') || 'macro,topic')
   .split(',').map(s => s.trim()).filter(Boolean);
 let conceptMapIncludeEvents = localStorage.getItem('conceptMapIncludeEvents') === '1';
 let conceptMapMaxConcepts = parseInt(localStorage.getItem('conceptMapMaxConcepts') || '200');
 let conceptGraphCache = { path: null, graph: null };  // avoid re-reading the graph each turn
+
+// Default text describing the concept map when it is injected as memory. User-tunable in Settings → Concept map.
+const CM_DEFAULT_FRAMING = `The following is a map of the user's own conceptual space, distilled by this app's Data Analysis from their PAST conversations — the topics they think about and how those relate. Treat it as background on what the user is likely already familiar with and the directions of their thinking. It is NOT the user's current question and NOT facts to recite. Use it to calibrate depth, avoid over-explaining what they clearly know, and connect your answer to their existing concepts where relevant. If it isn't relevant to the message, ignore it.`;
+let conceptMapFraming = localStorage.getItem('conceptMapFraming') || CM_DEFAULT_FRAMING;
+// Extra guidelines appended to the Data Analysis concept-map generation prompts (empty = built-in defaults only).
+let conceptMapExtractionGuidelines = localStorage.getItem('conceptMapExtractionGuidelines') || '';
+let conceptMapCanonizationGuidelines = localStorage.getItem('conceptMapCanonizationGuidelines') || '';
 let analysisDatasets = [];
 let analysisRuns = [];
-let activeAnalysisSource = ['anthropic', 'openai'].includes(localStorage.getItem('activeAnalysisSource'))
+let activeAnalysisSource = ['anthropic', 'openai', 'grok'].includes(localStorage.getItem('activeAnalysisSource'))
   ? localStorage.getItem('activeAnalysisSource')
   : 'anthropic';
 let activeAnalysisDatasetId = localStorage.getItem(`activeAnalysisDatasetId:${activeAnalysisSource}`) || localStorage.getItem('activeAnalysisDatasetId') || '';
@@ -446,8 +467,12 @@ applyConceptMapToggle();
 
 // Reflect saved config into the settings controls.
 if (cmModeSelect) cmModeSelect.value = conceptMapMode;
+if (cmArrangement) cmArrangement.value = conceptMapArrangement;
 if (cmIncludeEvents) cmIncludeEvents.checked = conceptMapIncludeEvents;
 if (cmMaxConcepts) cmMaxConcepts.value = conceptMapMaxConcepts;
+if (cmFraming) cmFraming.value = conceptMapFraming;
+if (cmExtractionGuidelines) cmExtractionGuidelines.value = conceptMapExtractionGuidelines;
+if (cmCanonizationGuidelines) cmCanonizationGuidelines.value = conceptMapCanonizationGuidelines;
 if (cmLevelsGroup) {
   const set = new Set(conceptMapLevels);
   for (const cb of cmLevelsGroup.querySelectorAll('input[data-level]')) {
@@ -460,16 +485,47 @@ cmModeSelect?.addEventListener('change', () => {
   localStorage.setItem('conceptMapMode', conceptMapMode);
 });
 
+cmArrangement?.addEventListener('change', () => {
+  conceptMapArrangement = ['hierarchy', 'salience', 'alpha'].includes(cmArrangement.value)
+    ? cmArrangement.value : 'hierarchy';
+  cmArrangement.value = conceptMapArrangement;
+  localStorage.setItem('conceptMapArrangement', conceptMapArrangement);
+});
+
 cmIncludeEvents?.addEventListener('change', () => {
   conceptMapIncludeEvents = cmIncludeEvents.checked;
   localStorage.setItem('conceptMapIncludeEvents', conceptMapIncludeEvents ? '1' : '0');
 });
 
 cmMaxConcepts?.addEventListener('change', () => {
-  const val = Math.min(1000, Math.max(10, parseInt(cmMaxConcepts.value) || 200));
+  const val = Math.min(9999, Math.max(10, parseInt(cmMaxConcepts.value) || 200));
   conceptMapMaxConcepts = val;
   cmMaxConcepts.value = val;
   localStorage.setItem('conceptMapMaxConcepts', val);
+});
+
+cmFraming?.addEventListener('change', () => {
+  conceptMapFraming = cmFraming.value.trim() || CM_DEFAULT_FRAMING;
+  cmFraming.value = conceptMapFraming;
+  localStorage.setItem('conceptMapFraming', conceptMapFraming);
+});
+
+cmFramingReset?.addEventListener('click', () => {
+  conceptMapFraming = CM_DEFAULT_FRAMING;
+  if (cmFraming) cmFraming.value = CM_DEFAULT_FRAMING;
+  localStorage.setItem('conceptMapFraming', CM_DEFAULT_FRAMING);
+});
+
+cmExtractionGuidelines?.addEventListener('change', () => {
+  conceptMapExtractionGuidelines = cmExtractionGuidelines.value.trim();
+  cmExtractionGuidelines.value = conceptMapExtractionGuidelines;
+  localStorage.setItem('conceptMapExtractionGuidelines', conceptMapExtractionGuidelines);
+});
+
+cmCanonizationGuidelines?.addEventListener('change', () => {
+  conceptMapCanonizationGuidelines = cmCanonizationGuidelines.value.trim();
+  cmCanonizationGuidelines.value = conceptMapCanonizationGuidelines;
+  localStorage.setItem('conceptMapCanonizationGuidelines', conceptMapCanonizationGuidelines);
 });
 
 cmLevelsGroup?.addEventListener('change', () => {
@@ -896,7 +952,9 @@ function analysisStorageKey(name, source = activeAnalysisSource) {
 }
 
 function analysisSourceLabel(source = activeAnalysisSource) {
-  return source === 'openai' ? 'OpenAI' : 'Anthropic';
+  if (source === 'openai') return 'OpenAI';
+  if (source === 'grok') return 'Grok';
+  return 'Anthropic';
 }
 
 function saveCurrentAnalysisSourceState() {
@@ -916,6 +974,8 @@ function restoreAnalysisSourceState(source) {
     analysisSourcePath.value = localStorage.getItem(analysisStorageKey('analysisSourcePath', source)) || '';
     analysisSourcePath.placeholder = source === 'openai'
       ? 'Paste ChatGPT conversations.json or HTML export path...'
+      : source === 'grok'
+      ? 'Paste Grok export prod-grok-backend.json path...'
       : 'Paste Anthropic / Claude JSON export path...';
   }
   localStorage.setItem('activeAnalysisSource', source);
@@ -1237,6 +1297,17 @@ ${raw}`
   }
 }
 
+// Formats user-tunable extra guidelines (from Settings → Concept map) as an appended
+// rules block. Returns '' when the user has not added any, so prompts keep their defaults.
+function conceptGuidelineBlock(text) {
+  const lines = String(text || '')
+    .split('\n')
+    .map(l => l.trim())
+    .filter(Boolean)
+    .map(l => (l.startsWith('-') ? l : `- ${l}`));
+  return lines.length ? `\nAdditional user guidelines (follow these too):\n${lines.join('\n')}\n` : '';
+}
+
 function topicExtractionPrompt(chunk, settings) {
   const densityGuide = {
     sparse: 'Extract only the strongest recurring themes.',
@@ -1280,7 +1351,7 @@ Rules:
 - Include project/app ideas, recurring technical problems, philosophical themes, emotional arcs, political/social concepts, and self-model changes when present.
 - Prefer distinct useful topics over generic grand themes.
 - Max topics: ${settings.maxTopicsPerChunk}.
-
+${conceptGuidelineBlock(conceptMapExtractionGuidelines)}
 Chunk text:
 ${chunk.text}`;
 }
@@ -1318,7 +1389,7 @@ Rules:
 - Prefer broad useful coverage over detail. Every chunk should get at least 1 TOPIC line unless it is empty.
 - User prompts around code are valuable; generated code bodies are not.
 ${includeEvents ? '- EVENT lines are optional; include only major timeline-relevant events.' : '- Do not output EVENT lines.'}
-
+${conceptGuidelineBlock(conceptMapExtractionGuidelines)}
 Chunks:
 ${chunkBlocks}`;
 }
@@ -1741,7 +1812,7 @@ Canonization rules:
 - Per concept: max 5 aliases, max 7 subtopics, max 3 evidence objects.
 - For small/test batches, preserving 50-100 distinct useful concepts is acceptable when the input supports it.
 - Use short strings. Summaries should usually be one sentence.
-
+${conceptGuidelineBlock(conceptMapCanonizationGuidelines)}
 Chunk topic results:
 ${JSON.stringify(compact)}`;
 }
@@ -1766,7 +1837,7 @@ Merge rules:
 - Output caps: max 300 concepts, max 320 events, max 360 edges.
 - Per concept: max 6 aliases, max 10 subtopics, max 5 evidence objects.
 - Use short strings. Do not include long excerpts.
-
+${conceptGuidelineBlock(conceptMapCanonizationGuidelines)}
 Graph fragments:
 ${JSON.stringify(compact)}`;
 }
@@ -4284,6 +4355,11 @@ function setModelSelectTitles(text) {
 
 async function preloadSelectedModel(modelId) {
   if (!modelId || !serverOnline) return;
+  // Already loaded — don't send another load request for it.
+  if (modelId === loadedModel) {
+    setModelSelectTitles(`Loaded ${modelId}`);
+    return;
+  }
   const requestId = ++modelLoadRequestId;
   setModelSelectTitles(`Loading ${modelId} in LM Studio...`);
   try {
@@ -4292,6 +4368,7 @@ async function preloadSelectedModel(modelId) {
     if (result?.cancelled) {
       return;
     } else if (result?.ok) {
+      loadedModel = modelId;
       setModelSelectTitles(`Loaded ${modelId}`);
       setServerStatus('online');
     } else {
@@ -5168,8 +5245,12 @@ async function loadChatById(chatId) {
 
   currentChatMeta = await window.api.loadChatMeta(chatId).catch(() => []);
 
+  // Reflect the chat's saved model in the UI, but do NOT preload it on chat switch:
+  // merely opening chats (or returning to one) must not fire load requests or pile up
+  // multiple models in LM Studio. The model loads when the user actually sends (LM Studio
+  // JIT-loads it) or explicitly reselects it.
   if (chat.model && MODELS[chat.model]) {
-    applySelectedModel(chat.model, false, { preload: true });
+    applySelectedModel(chat.model, false, { preload: false });
   } else if (currentModel) {
     applySelectedModel(currentModel, false, { preload: false });
   }
@@ -5730,6 +5811,75 @@ function cmConceptSearchText(c) {
     .filter(Boolean).join(' ');
 }
 
+// ── Concept weighting (mirrors the human-facing 3D vector-map viewer) ──────────
+// The viewer sizes each node by evidence weight = (# record refs) + (# evidence chunks),
+// normalized to the graph max. We reuse the exact same signal so the model's sense of
+// "what's central to the user" matches what the user sees in the 3D map.
+function cmEvidenceWeight(c) {
+  let records = 0;
+  let chunks = 0;
+  for (const e of (Array.isArray(c.evidence) ? c.evidence : [])) {
+    chunks += 1;
+    records += Array.isArray(e.record_ids) ? e.record_ids.length : 0;
+  }
+  return records + chunks;
+}
+
+// Per-concept salience index over the WHOLE graph: reference weight (as above), child
+// fan-out (hub bonus), and weight normalized to the graph max (0..1, like the viewer's
+// node score). Keyed by concept_id.
+function cmComputeSalience(allConcepts) {
+  const childCount = new Map();
+  for (const c of allConcepts) {
+    const pid = c.parent_id;
+    if (pid && pid !== c.concept_id) childCount.set(pid, (childCount.get(pid) || 0) + 1);
+  }
+  let maxWeight = 1;
+  const info = new Map();
+  for (const c of allConcepts) {
+    const weight = cmEvidenceWeight(c);
+    if (weight > maxWeight) maxWeight = weight;
+    info.set(c.concept_id, { weight, children: childCount.get(c.concept_id) || 0, norm: 0 });
+  }
+  for (const v of info.values()) v.norm = v.weight / maxWeight;
+  return info;
+}
+
+function cmSalienceOf(c, weights) {
+  return (weights && weights.get(c && c.concept_id)) || { weight: 0, children: 0, norm: 0 };
+}
+
+// Rank order: reference weight, then hub fan-out, then level, then label.
+function cmSalienceCompare(a, b, weights) {
+  const ia = cmSalienceOf(a, weights);
+  const ib = cmSalienceOf(b, weights);
+  return (ib.weight - ia.weight)
+    || (ib.children - ia.children)
+    || ((CM_LEVEL_RANK[String(a.level || '').toLowerCase()] ?? 9) - (CM_LEVEL_RANK[String(b.level || '').toLowerCase()] ?? 9))
+    || String(a.canonical_label || '').localeCompare(String(b.canonical_label || ''));
+}
+
+// Inline salience markers appended to a rendered concept line. `·N` = reference weight,
+// `★` = a most-central concept (top of the normalized range). [level] shown on flat lists.
+function cmMarkers(c, weights, showLevel) {
+  const info = cmSalienceOf(c, weights);
+  const lvl = showLevel ? ` [${c.level || 'concept'}]` : '';
+  const w = info.weight > 0 ? ` ·${info.weight}` : '';
+  const star = info.norm >= 0.5 ? ' ★' : '';
+  return `${lvl}${w}${star}`;
+}
+
+// Smoothed inverse document frequency over the concept corpus, so distinctive tokens
+// count more than ubiquitous ones when scoring relevance.
+function cmBuildIdf(concepts) {
+  const df = new Map();
+  const total = Math.max(1, concepts.length);
+  for (const c of concepts) {
+    for (const t of new Set(cmTokens(cmConceptSearchText(c)))) df.set(t, (df.get(t) || 0) + 1);
+  }
+  return (t) => Math.log((total + 1) / ((df.get(t) || 0) + 1)) + 1;
+}
+
 function cmSortConcepts(concepts) {
   return concepts.slice().sort((a, b) => {
     const ra = CM_LEVEL_RANK[String(a.level || '').toLowerCase()] ?? 9;
@@ -5745,9 +5895,11 @@ async function loadConceptGraph(path) {
   return graph;
 }
 
-// Overview: a hierarchical outline (macro → topic → …) built from parent_id links,
-// capped at maxLines. Concepts whose parent is filtered out become roots.
-function cmRenderTree(sortedConcepts, maxLines) {
+// Overview (hierarchy arrangement): a parent → child outline, capped at maxLines.
+// Siblings/roots are ordered by salience so the most central concepts lead — and if the
+// budget truncates, the heaviest branches survive. Concepts whose parent is filtered out
+// become roots. Each line is annotated with its reference weight (·N / ★).
+function cmRenderTree(sortedConcepts, maxLines, weights) {
   const byId = new Map();
   for (const c of sortedConcepts) if (c.concept_id) byId.set(c.concept_id, c);
   const children = new Map();
@@ -5761,13 +5913,15 @@ function cmRenderTree(sortedConcepts, maxLines) {
       roots.push(c);
     }
   }
+  roots.sort((a, b) => cmSalienceCompare(a, b, weights));
+  for (const arr of children.values()) arr.sort((a, b) => cmSalienceCompare(a, b, weights));
   const lines = [];
   const visited = new Set();
   function walk(c, depth) {
     if (lines.length >= maxLines || (c.concept_id && visited.has(c.concept_id))) return;
     if (c.concept_id) visited.add(c.concept_id);
     const label = (c.canonical_label || c.concept_id || 'Untitled').trim();
-    let line = `${'  '.repeat(depth)}- ${label}`;
+    let line = `${'  '.repeat(depth)}- ${label}${cmMarkers(c, weights, false)}`;
     const summary = (c.summary || '').trim();
     if (CM_SUMMARY_LEVELS.has(String(c.level || '').toLowerCase()) && summary && summary !== label) {
       line += `: ${summary.slice(0, 200)}`;
@@ -5786,15 +5940,39 @@ function cmRenderTree(sortedConcepts, maxLines) {
   return { text: lines.join('\n'), shown: lines.length };
 }
 
-// Relevant: concepts whose label/aliases/summary overlap the message tokens, ranked.
-function cmRenderRelevant(concepts, byIdAll, userText, maxItems) {
+// Overview (salience / alpha arrangements): a flat ranked list, mirroring the viewer's
+// "size" and "alpha" layouts. Salience = most-referenced first; alpha = by label.
+function cmRenderRanked(concepts, maxItems, weights, byIdAll, by) {
+  const arr = concepts.slice();
+  if (by === 'alpha') {
+    arr.sort((a, b) => String(a.canonical_label || '').localeCompare(String(b.canonical_label || '')));
+  } else {
+    arr.sort((a, b) => cmSalienceCompare(a, b, weights));
+  }
+  const lines = arr.slice(0, maxItems).map(c => {
+    const parent = c.parent_id ? byIdAll.get(c.parent_id) : null;
+    const anchor = parent ? ` (under “${parent.canonical_label || parent.concept_id}”)` : '';
+    const summary = (c.summary || '').trim();
+    const sum = CM_SUMMARY_LEVELS.has(String(c.level || '').toLowerCase()) && summary
+      ? `: ${summary.slice(0, 200)}` : '';
+    return `- ${c.canonical_label || c.concept_id}${anchor}${cmMarkers(c, weights, true)}${sum}`;
+  });
+  return { text: lines.join('\n'), shown: lines.length };
+}
+
+// Relevant: concepts whose label/aliases/summary overlap the message, ranked by
+// IDF-weighted lexical overlap (distinctive tokens count more) and lightly boosted by
+// salience so, among similarly-relevant concepts, the more central to the user lead.
+function cmRenderRelevant(concepts, byIdAll, userText, maxItems, weights, idf) {
   const q = new Set(cmTokens(userText));
   if (!q.size) return { text: '', shown: 0 };
   const scored = [];
   for (const c of concepts) {
-    let score = 0;
-    for (const t of new Set(cmTokens(cmConceptSearchText(c)))) if (q.has(t)) score++;
-    if (score > 0) scored.push({ c, score });
+    let lex = 0;
+    for (const t of new Set(cmTokens(cmConceptSearchText(c)))) if (q.has(t)) lex += idf(t);
+    if (lex <= 0) continue;
+    const norm = cmSalienceOf(c, weights).norm;
+    scored.push({ c, score: lex * (1 + 0.35 * norm) });
   }
   scored.sort((a, b) => b.score - a.score
     || String(a.c.canonical_label || '').localeCompare(String(b.c.canonical_label || '')));
@@ -5804,7 +5982,7 @@ function cmRenderRelevant(concepts, byIdAll, userText, maxItems) {
     const anchor = parent ? ` (under “${parent.canonical_label || parent.concept_id}”)` : '';
     const summary = (c.summary || '').trim();
     const sum = summary ? `: ${summary.slice(0, 220)}` : '';
-    return `- ${c.canonical_label || c.concept_id}${anchor} [${c.level || 'concept'}]${sum}`;
+    return `- ${c.canonical_label || c.concept_id}${anchor}${cmMarkers(c, weights, true)}${sum}`;
   });
   return { text: lines.join('\n'), shown: lines.length };
 }
@@ -5833,7 +6011,8 @@ function renderConceptMapNote(info) {
   div.appendChild(title);
   const sub = document.createElement('div');
   sub.className = 'search-sources-queries';
-  sub.textContent = `${info.mode} · ${info.shown}/${info.total} concepts`
+  const arrangeTag = info.mode === 'relevant' ? '' : ` · ${info.arrangement}`;
+  sub.textContent = `${info.mode}${arrangeTag} · ${info.shown}/${info.total} concepts`
     + `${info.timeline ? ' · timeline' : ''} · levels: ${info.levels.join(', ') || 'none'}`;
   div.appendChild(sub);
   messagesEl.appendChild(div);
@@ -5870,19 +6049,32 @@ async function buildConceptMapContext(userText) {
   const filtered = allConcepts.filter(c => levelSet.has(String(c.level || '').toLowerCase()));
   if (!filtered.length) return null;
 
+  // Salience (evidence weight) + IDF depend only on the graph, not the level filter, so
+  // memoize them on the cached graph object to avoid recomputing every message.
+  if (!graph.__cmWeights) graph.__cmWeights = cmComputeSalience(allConcepts);
+  if (!graph.__cmIdf) graph.__cmIdf = cmBuildIdf(allConcepts);
+  const weights = graph.__cmWeights;
+  const idf = graph.__cmIdf;
+
+  const renderOverview = (maxLines) => {
+    if (conceptMapArrangement === 'salience') return cmRenderRanked(filtered, maxLines, weights, byIdAll, 'salience');
+    if (conceptMapArrangement === 'alpha') return cmRenderRanked(filtered, maxLines, weights, byIdAll, 'alpha');
+    return cmRenderTree(cmSortConcepts(filtered), maxLines, weights);
+  };
+
   let rendered;
   const conceptIdFilter = new Set();
   if (conceptMapMode === 'relevant') {
-    rendered = cmRenderRelevant(filtered, byIdAll, userText, conceptMapMaxConcepts);
+    rendered = cmRenderRelevant(filtered, byIdAll, userText, conceptMapMaxConcepts, weights, idf);
     if (!rendered.shown) {
-      // No keyword hit — fall back to a compact overview so the anchor still helps.
-      rendered = cmRenderTree(cmSortConcepts(filtered), Math.min(conceptMapMaxConcepts, 60));
+      // No lexical hit — fall back to a compact overview so the anchor still helps.
+      rendered = renderOverview(Math.min(conceptMapMaxConcepts, 60));
     } else {
       // Collect ids of shown concepts for timeline filtering.
       for (const c of filtered) if (c.concept_id) conceptIdFilter.add(c.concept_id);
     }
   } else {
-    rendered = cmRenderTree(cmSortConcepts(filtered), conceptMapMaxConcepts);
+    rendered = renderOverview(conceptMapMaxConcepts);
     for (const c of filtered) if (c.concept_id) conceptIdFilter.add(c.concept_id);
   }
   if (!rendered.text) return null;
@@ -5898,17 +6090,20 @@ async function buildConceptMapContext(userText) {
   renderConceptMapNote({
     name,
     mode: conceptMapMode,
+    arrangement: conceptMapArrangement,
     shown: rendered.shown,
     total: allConcepts.length,
     timeline: !!timeline,
     levels: conceptMapLevels,
   });
 
-  const framing = `The following is a map of the user's own conceptual space, distilled by this app's Data Analysis from their PAST conversations — the topics they think about and how those relate. Treat it as background on what the user is likely already familiar with and the directions of their thinking. It is NOT the user's current question and NOT facts to recite. Use it to calibrate depth, avoid over-explaining what they clearly know, and connect your answer to their existing concepts where relevant. If it isn't relevant to the message, ignore it.`;
+  const framing = conceptMapFraming || CM_DEFAULT_FRAMING;
+  const modeTag = conceptMapMode === 'relevant' ? 'relevant to this message' : `overview / ${conceptMapArrangement}`;
 
   const parts = [
     framing,
-    `\n# Concept map: ${name} (${rendered.shown} of ${allConcepts.length} concepts shown; levels: ${conceptMapLevels.join(', ')})`,
+    `\n# Concept map: ${name} (${rendered.shown} of ${allConcepts.length} concepts shown · ${modeTag} · levels: ${conceptMapLevels.join(', ')})`,
+    `Legend: \`·N\` = how often a concept recurs across the user's history (higher = more central to them); \`★\` marks their most central concepts; \`[level]\` (where shown) is macro→motif granularity.`,
     rendered.text,
   ];
   if (timeline) parts.push(`\n## Timeline (events)\n${timeline}`);
@@ -6125,6 +6320,9 @@ async function streamAssistantResponse({ forceImageDescriptionsForLastUser = fal
   } else if (result?.cancelled) {
     if (!streamedText && assistantDiv) assistantDiv.remove();
   } else {
+    // A completed response means LM Studio has this model loaded — record it so we
+    // don't redundantly reload it later.
+    loadedModel = options.model || currentModel || loadedModel;
     const finalText = streamedText || result?.content || '';
     if (assistantDiv) {
       assistantDiv.innerHTML = renderMarkdown(finalText);

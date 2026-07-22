@@ -87,6 +87,8 @@
     analysisResetTopics: (datasetId, runId) => invoke('analysis_reset_topics', { datasetId, runId }),
     analysisResetCanonization: (datasetId, runId) => invoke('analysis_reset_canonization', { datasetId, runId }),
 
+    libraryCollect: (sources, opts) => invoke('library_collect', { sources, opts }),
+
     openExternal: (url) => invoke('shell_open_external', { url }),
     onDevLog: (callback) => onEvent('dev:log', callback),
 

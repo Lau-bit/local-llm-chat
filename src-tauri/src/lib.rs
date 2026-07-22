@@ -3436,6 +3436,212 @@ fn apply_window_icon(window: &WebviewWindow) {
     let _ = window.set_icon(icon);
 }
 
+// ── Local library: read user-picked notes / text folders & files as chat context ──
+// A third context layer (beside web search and concept-map memory): the user points at
+// folders/files (e.g. their notes app's vault), the model gets their text directly.
+fn default_library_exts() -> std::collections::HashSet<String> {
+    [
+        "md", "markdown", "mdx", "txt", "text", "org", "rst", "adoc", "asciidoc", "tex",
+        "log", "csv", "tsv", "json", "yaml", "yml", "html", "htm",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+struct LibraryBudget {
+    files: usize,
+    max_files: usize,
+    chars: usize,
+    max_chars: usize,
+    per_file: usize,
+}
+
+impl LibraryBudget {
+    fn exhausted(&self) -> bool {
+        self.files >= self.max_files || self.chars >= self.max_chars
+    }
+}
+
+fn library_push_file(
+    path: &Path,
+    zone: &str,
+    root: &Path,
+    exts: &std::collections::HashSet<String>,
+    out: &mut Vec<Value>,
+    budget: &mut LibraryBudget,
+) {
+    if budget.exhausted() {
+        return;
+    }
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !exts.contains(&ext) {
+        return;
+    }
+    let Ok(raw) = fs::read_to_string(path) else {
+        return; // non-UTF8 / binary / unreadable — skip quietly
+    };
+    let total = raw.chars().count();
+    let mut truncated = false;
+    let text: String = if total > budget.per_file {
+        truncated = true;
+        raw.chars().take(budget.per_file).collect()
+    } else {
+        raw
+    };
+    let rel = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string();
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file")
+        .to_string();
+    let mtime = fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    budget.files += 1;
+    budget.chars += text.chars().count();
+    out.push(json!({
+        "path": path.to_string_lossy(),
+        "zone": zone,
+        "name": name,
+        "rel": rel,
+        "text": text,
+        "truncated": truncated,
+        "chars": total,
+        "mtime": mtime
+    }));
+}
+
+fn library_collect_dir(
+    dir: &Path,
+    zone: &str,
+    root: &Path,
+    exts: &std::collections::HashSet<String>,
+    out: &mut Vec<Value>,
+    budget: &mut LibraryBudget,
+    depth: usize,
+) {
+    if depth > 8 || budget.exhausted() {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut paths: Vec<PathBuf> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+    paths.sort();
+    for path in paths {
+        if budget.exhausted() {
+            return;
+        }
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        if name.starts_with('.') {
+            continue; // hidden files/dirs
+        }
+        if path.is_dir() {
+            if matches!(
+                name.as_str(),
+                "node_modules" | ".git" | "target" | "dist" | "build" | "__pycache__"
+            ) {
+                continue;
+            }
+            library_collect_dir(&path, zone, root, exts, out, budget, depth + 1);
+        } else {
+            library_push_file(&path, zone, root, exts, out, budget);
+        }
+    }
+}
+
+#[tauri::command]
+fn library_collect(sources: Vec<Value>, opts: Option<Value>) -> Result<Value, String> {
+    let opts = opts.unwrap_or_else(|| json!({}));
+    let max_files = opts.get("maxFiles").and_then(Value::as_u64).unwrap_or(400) as usize;
+    let max_chars = opts.get("maxTotalChars").and_then(Value::as_u64).unwrap_or(2_000_000) as usize;
+    let per_file = opts.get("maxFileChars").and_then(Value::as_u64).unwrap_or(200_000) as usize;
+    let exts: std::collections::HashSet<String> = opts
+        .get("exts")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.trim().trim_start_matches('.').to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_else(default_library_exts);
+
+    let mut out: Vec<Value> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+    let mut budget = LibraryBudget { files: 0, max_files, chars: 0, max_chars, per_file };
+
+    for src in &sources {
+        if budget.exhausted() {
+            break;
+        }
+        let raw = src
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .trim_matches('"')
+            .to_string();
+        if raw.is_empty() {
+            continue;
+        }
+        let p = PathBuf::from(&raw);
+        let zone_in = src.get("zone").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        let zone = if zone_in.is_empty() {
+            p.file_name().and_then(|s| s.to_str()).unwrap_or("Library").to_string()
+        } else {
+            zone_in
+        };
+        if !p.exists() {
+            missing.push(raw);
+            continue;
+        }
+        if p.is_dir() {
+            library_collect_dir(&p, &zone, &p, &exts, &mut out, &mut budget, 0);
+        } else {
+            let root = p.parent().map(Path::to_path_buf).unwrap_or_else(|| p.clone());
+            library_push_file(&p, &zone, &root, &exts, &mut out, &mut budget);
+        }
+    }
+
+    // Recent files first (useful for "all" mode; relevance mode re-ranks anyway).
+    out.sort_by(|a, b| {
+        b.get("mtime").and_then(Value::as_u64).unwrap_or(0)
+            .cmp(&a.get("mtime").and_then(Value::as_u64).unwrap_or(0))
+    });
+
+    let total_chars: usize = out
+        .iter()
+        .map(|f| f.get("text").and_then(Value::as_str).map(|s| s.chars().count()).unwrap_or(0))
+        .sum();
+    Ok(json!({
+        "files": out,
+        "stats": {
+            "files": out.len(),
+            "chars": total_chars,
+            "missing": missing,
+            "capped": budget.exhausted()
+        }
+    }))
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
@@ -3491,6 +3697,7 @@ pub fn run() {
             analysis_open_path,
             analysis_reset_topics,
             analysis_reset_canonization,
+            library_collect,
             get_models,
             load_model,
             exa_search,

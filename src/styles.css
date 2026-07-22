@@ -1795,7 +1795,8 @@ body.streaming .msg-edit-btn, body.streaming .msg-resend-btn { display: none !im
 #composer-main-row { display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 8px; }
 
 #web-search-toggle,
-#concept-map-toggle {
+#concept-map-toggle,
+#library-toggle {
   flex-shrink: 0; width: 46px; height: 46px; padding: 0;
   border: 1px solid var(--border); border-radius: 8px;
   background: var(--bg-primary); color: var(--text-secondary);
@@ -1803,9 +1804,11 @@ body.streaming .msg-edit-btn, body.streaming .msg-resend-btn { display: none !im
   transition: color 0.15s, border-color 0.15s, background 0.15s;
 }
 #web-search-toggle:hover,
-#concept-map-toggle:hover { color: var(--text-primary); border-color: var(--accent); }
+#concept-map-toggle:hover,
+#library-toggle:hover { color: var(--text-primary); border-color: var(--accent); }
 #web-search-toggle.active,
-#concept-map-toggle.active {
+#concept-map-toggle.active,
+#library-toggle.active {
   background: var(--accent); color: var(--accent-text); border-color: var(--accent);
 }
 

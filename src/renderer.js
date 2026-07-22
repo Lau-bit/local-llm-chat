@@ -171,6 +171,12 @@ const cmFraming         = document.getElementById('cm-framing');
 const cmFramingReset    = document.getElementById('cm-framing-reset');
 const cmExtractionGuidelines  = document.getElementById('cm-extraction-guidelines');
 const cmCanonizationGuidelines = document.getElementById('cm-canonization-guidelines');
+const libraryToggle     = document.getElementById('library-toggle');
+const libSources        = document.getElementById('lib-sources');
+const libMode           = document.getElementById('lib-mode');
+const libMaxChars       = document.getElementById('lib-max-chars');
+const libPreview        = document.getElementById('lib-preview');
+const libStatus         = document.getElementById('lib-status');
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -240,6 +246,17 @@ let conceptMapFraming = localStorage.getItem('conceptMapFraming') || CM_DEFAULT_
 // Extra guidelines appended to the Data Analysis concept-map generation prompts (empty = built-in defaults only).
 let conceptMapExtractionGuidelines = localStorage.getItem('conceptMapExtractionGuidelines') || '';
 let conceptMapCanonizationGuidelines = localStorage.getItem('conceptMapCanonizationGuidelines') || '';
+
+// ── Local library memory (notes/text folders & files as a third context layer) ────
+// The user points at folders/files (their notes vault, exported texts); the model reads
+// them directly as source material. See buildLibraryContext.
+let libraryEnabled = localStorage.getItem('libraryEnabled') === '1';
+let libraryMode = localStorage.getItem('libraryMode') || 'relevant';  // 'relevant' | 'all'
+let librarySourcesText = localStorage.getItem('librarySources') || '';
+let libraryMaxChars = parseInt(localStorage.getItem('libraryMaxChars') || '12000');
+const LIBRARY_FRAMING = `The following is content from the user's own local library — notes and source texts they have placed in specific folders/files for you to use directly. Treat it as authoritative, user-provided material and draw on it when it is relevant to the message; refer to the file name when you use something from it. If a piece isn't relevant to the message, ignore it.`;
+// Read caps handed to the Rust library_collect command (per-message; JS then trims to budget).
+const LIBRARY_COLLECT_OPTS = { maxFiles: 400, maxTotalChars: 2000000, maxFileChars: 200000 };
 let analysisDatasets = [];
 let analysisRuns = [];
 let activeAnalysisSource = ['anthropic', 'openai', 'grok'].includes(localStorage.getItem('activeAnalysisSource'))
@@ -535,6 +552,66 @@ cmLevelsGroup?.addEventListener('change', () => {
   }
   conceptMapLevels = levels;
   localStorage.setItem('conceptMapLevels', levels.join(','));
+});
+
+// ── Local library: composer toggle + settings ─────────────────────────────────────
+function applyLibraryToggle() {
+  if (!libraryToggle) return;
+  libraryToggle.classList.toggle('active', libraryEnabled);
+  libraryToggle.setAttribute('aria-pressed', libraryEnabled ? 'true' : 'false');
+  libraryToggle.title = `Local library — ${libraryEnabled ? 'on' : 'off'}`;
+}
+
+libraryToggle?.addEventListener('click', () => {
+  libraryEnabled = !libraryEnabled;
+  localStorage.setItem('libraryEnabled', libraryEnabled ? '1' : '0');
+  applyLibraryToggle();
+  if (libraryEnabled && !libParseSources(librarySourcesText).length) {
+    addMessage('error', 'Local library is on, but no sources are set. Add folders/files in Settings → Library.');
+  }
+});
+
+applyLibraryToggle();
+
+if (libSources) libSources.value = librarySourcesText;
+if (libMode) libMode.value = libraryMode;
+if (libMaxChars) libMaxChars.value = libraryMaxChars;
+
+libSources?.addEventListener('change', () => {
+  librarySourcesText = libSources.value;
+  localStorage.setItem('librarySources', librarySourcesText);
+});
+
+libMode?.addEventListener('change', () => {
+  libraryMode = libMode.value === 'all' ? 'all' : 'relevant';
+  localStorage.setItem('libraryMode', libraryMode);
+});
+
+libMaxChars?.addEventListener('change', () => {
+  const val = Math.min(200000, Math.max(1000, parseInt(libMaxChars.value) || 12000));
+  libraryMaxChars = val;
+  libMaxChars.value = val;
+  localStorage.setItem('libraryMaxChars', val);
+});
+
+libPreview?.addEventListener('click', async () => {
+  const sources = libParseSources(libSources ? libSources.value : librarySourcesText);
+  if (!sources.length) { if (libStatus) libStatus.textContent = 'Add at least one folder or file path first.'; return; }
+  if (libStatus) libStatus.textContent = 'Reading sources…';
+  try {
+    const res = await window.api.libraryCollect(sources, LIBRARY_COLLECT_OPTS);
+    const files = Array.isArray(res?.files) ? res.files : [];
+    const zones = [...new Set(files.map(f => f.zone))];
+    const kb = Math.round((res?.stats?.chars || 0) / 1000);
+    const miss = (res?.stats?.missing || []);
+    if (libStatus) libStatus.textContent = files.length
+      ? `${files.length} files · ${zones.length} zone(s): ${zones.join(', ')} · ~${kb}k chars`
+        + (miss.length ? ` · ${miss.length} missing path(s)` : '')
+        + (res?.stats?.capped ? ' · capped' : '')
+      : `No readable text files found${miss.length ? ` · missing: ${miss.join(', ')}` : ''}.`;
+  } catch (err) {
+    if (libStatus) libStatus.textContent = `Read failed: ${err?.message || err}`;
+  }
 });
 
 cmMapSelect?.addEventListener('change', () => {
@@ -6110,6 +6187,159 @@ async function buildConceptMapContext(userText) {
   return parts.join('\n');
 }
 
+// ── Local library context layer ───────────────────────────────────────────────────
+// Each source line is "Zone label | path" or just "path" (zone defaults to the basename).
+function libParseSources(text) {
+  return String(text || '').split('\n').map(l => l.trim()).filter(Boolean).map(line => {
+    const bar = line.indexOf('|');
+    if (bar >= 0) return { zone: line.slice(0, bar).trim(), path: line.slice(bar + 1).trim() };
+    return { zone: '', path: line };
+  }).filter(s => s.path);
+}
+
+// "All" packing: whole files, recent first (Rust already sorted by mtime desc), to budget.
+function libPackAll(files, budget) {
+  const out = [];
+  let used = 0;
+  for (const f of files) {
+    if (used >= budget) break;
+    let text = String(f.text || '').trim();
+    if (!text) continue;
+    if (text.length > budget - used) text = text.slice(0, Math.max(0, budget - used)).trim() + '\n…[truncated]';
+    out.push({ file: f, snippet: text });
+    used += text.length;
+  }
+  return out;
+}
+
+// Pick the highest-scoring paragraphs of a file for the query, kept in original order.
+function libBestBlocks(text, q, idf, cap) {
+  const blocks = String(text || '').split(/\n\s*\n/).map(b => b.trim()).filter(Boolean);
+  if (!blocks.length) return '';
+  const scored = blocks.map((b, i) => {
+    const toks = new Set(cmTokens(b));
+    let s = 0;
+    for (const t of q) if (toks.has(t)) s += idf(t);
+    return { b, i, s };
+  }).filter(x => x.s > 0).sort((a, b) => b.s - a.s);
+  if (!scored.length) return blocks[0].slice(0, cap);  // filename-only match → give the head
+  const chosen = [];
+  let used = 0;
+  for (const { b, i } of scored) {
+    if (used >= cap) break;
+    let bb = b;
+    if (bb.length > cap - used) bb = bb.slice(0, Math.max(0, cap - used)) + '…';
+    chosen.push({ i, b: bb });
+    used += bb.length + 4;
+  }
+  chosen.sort((a, b) => a.i - b.i);
+  return chosen.map(c => c.b).join('\n…\n');
+}
+
+// "Relevant" packing: IDF-rank files against the message, take the best blocks of each.
+function libPackRelevant(files, userText, budget) {
+  const q = new Set(cmTokens(userText));
+  if (!q.size) return [];
+  const df = new Map();
+  const fileToks = files.map(f => {
+    const toks = new Set(cmTokens(`${f.name || ''} ${f.text || ''}`));
+    for (const t of toks) df.set(t, (df.get(t) || 0) + 1);
+    return toks;
+  });
+  const total = files.length || 1;
+  const idf = (t) => Math.log((total + 1) / ((df.get(t) || 0) + 1)) + 1;
+  const scored = files.map((f, i) => {
+    let s = 0;
+    for (const t of q) if (fileToks[i].has(t)) s += idf(t);
+    return { f, s };
+  }).filter(x => x.s > 0).sort((a, b) => b.s - a.s);
+  if (!scored.length) return [];
+  const out = [];
+  let used = 0;
+  const perFile = Math.max(500, Math.floor(budget / Math.min(6, scored.length)));
+  for (const { f } of scored) {
+    if (used >= budget) break;
+    const snippet = libBestBlocks(f.text || '', q, idf, Math.min(perFile, budget - used));
+    if (!snippet) continue;
+    out.push({ file: f, snippet });
+    used += snippet.length;
+  }
+  return out;
+}
+
+function renderLibraryNote(info) {
+  const div = document.createElement('div');
+  div.className = 'message search-sources library-note';
+  const title = document.createElement('div');
+  title.className = 'search-sources-title';
+  title.textContent = `Local library · ${info.files} file${info.files === 1 ? '' : 's'}`;
+  div.appendChild(title);
+  const sub = document.createElement('div');
+  sub.className = 'search-sources-queries';
+  sub.textContent = `${info.mode} · zones: ${info.zones.join(', ') || 'none'}`
+    + (info.missing ? ` · ${info.missing} missing path(s)` : '');
+  div.appendChild(sub);
+  messagesEl.appendChild(div);
+  return div;
+}
+
+// Returns a context string built from the user's local library, or null.
+async function buildLibraryContext(userText) {
+  if (!libraryEnabled) return null;
+  const sources = libParseSources(librarySourcesText);
+  if (!sources.length) {
+    addMessage('error', 'Local library is on, but no sources are set. Add folders/files in Settings → Library.');
+    return null;
+  }
+
+  let res;
+  try {
+    res = await window.api.libraryCollect(sources, LIBRARY_COLLECT_OPTS);
+  } catch (err) {
+    addMessage('error', `Local library failed to read sources: ${err?.message || err}`);
+    return null;
+  }
+
+  const files = Array.isArray(res?.files) ? res.files : [];
+  const missing = Array.isArray(res?.stats?.missing) ? res.stats.missing : [];
+  if (!files.length) {
+    addMessage('error', `Local library is on, but no readable text files were found.${missing.length ? ` Missing: ${missing.join(', ')}` : ''}`);
+    return null;
+  }
+
+  const budget = Math.max(1000, libraryMaxChars);
+  let picked;
+  if (libraryMode === 'all' || !userText) {
+    picked = libPackAll(files, budget);
+  } else {
+    picked = libPackRelevant(files, userText, budget);
+    if (!picked.length) picked = libPackAll(files, Math.min(budget, 4000));  // no lexical hit → compact recent
+  }
+  if (!picked.length) return null;
+
+  const byZone = new Map();
+  for (const p of picked) {
+    const z = p.file.zone || 'Library';
+    if (!byZone.has(z)) byZone.set(z, []);
+    byZone.get(z).push(p);
+  }
+  const zoneNames = [...byZone.keys()];
+
+  renderLibraryNote({ files: picked.length, zones: zoneNames, mode: libraryMode, missing: missing.length });
+
+  const parts = [
+    LIBRARY_FRAMING,
+    `\n# Local library — ${picked.length} file${picked.length === 1 ? '' : 's'} (zones: ${zoneNames.join(', ')})${libraryMode === 'all' ? '' : ' · selected as relevant to this message'}`,
+  ];
+  for (const [zone, items] of byZone) {
+    parts.push(`\n## ${zone}`);
+    for (const { file, snippet } of items) {
+      parts.push(`### ${file.rel || file.name}\n${snippet}`);
+    }
+  }
+  return parts.join('\n');
+}
+
 async function sendMessage() {
   const text = inputEl.value.trim();
   if ((!text && pendingImages.length === 0) || document.body.classList.contains('streaming')) return;
@@ -6169,14 +6399,20 @@ async function sendMessage() {
     conceptMapContext = await buildConceptMapContext(text);
   }
 
+  let libraryContext = null;
+  if (libraryEnabled) {
+    libraryContext = await buildLibraryContext(text);
+  }
+
   await streamAssistantResponse({
     forceImageDescriptionsForLastUser: shouldAnalyzeOutgoingImages,
     webSearchContext,
     conceptMapContext,
+    libraryContext,
   });
 }
 
-async function streamAssistantResponse({ forceImageDescriptionsForLastUser = false, webSearchContext = null, conceptMapContext = null } = {}) {
+async function streamAssistantResponse({ forceImageDescriptionsForLastUser = false, webSearchContext = null, conceptMapContext = null, libraryContext = null } = {}) {
   const distToBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight;
   if (distToBottom < 350) autoScrollEnabled = true;
   document.body.classList.add('streaming');
@@ -6271,9 +6507,9 @@ async function streamAssistantResponse({ forceImageDescriptionsForLastUser = fal
   const requestHadImages = conversationHistory.some(messageHasImages);
   const apiMessages = buildApiMessagesForModel(conversationHistory, currentModel, { forceImageDescriptionsForLastUser });
   // Inject extra context as system messages just before the last user turn. Order:
-  // concept-map memory (long-term background) first, then web results (current), then
-  // the user turn.
-  const injectedContexts = [conceptMapContext, webSearchContext].filter(Boolean);
+  // concept-map memory (long-term background), then the user's local library (curated
+  // source material), then web results (external/current), then the user turn.
+  const injectedContexts = [conceptMapContext, libraryContext, webSearchContext].filter(Boolean);
   if (injectedContexts.length) {
     let lastUserIdx = -1;
     for (let i = apiMessages.length - 1; i >= 0; i--) {

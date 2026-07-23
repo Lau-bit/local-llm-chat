@@ -3642,6 +3642,256 @@ fn library_collect(sources: Vec<Value>, opts: Option<Value>) -> Result<Value, St
     }))
 }
 
+// ── Browser history search (Chromium: Vivaldi / Chrome) ────────────────────────────
+// Reads the user's local Chromium "History" SQLite DB (like the chromium-history-timeline
+// app), so the "Browser history" composer toggle can feed the local LLM what the user has
+// recently been looking at. Chromium timestamps are microseconds since 1601-01-01 UTC.
+const CHROME_EPOCH_TO_UNIX_MS: i64 = 11_644_473_600_000;
+
+fn chrome_us_to_unix_ms(chrome_us: i64) -> i64 {
+    chrome_us / 1000 - CHROME_EPOCH_TO_UNIX_MS
+}
+
+// Resolve which Chromium "History" DB files to read. Explicit profile paths win; otherwise
+// auto-detect Vivaldi (always) and Chrome (only when requested) under %LOCALAPPDATA%.
+fn history_db_candidates(profile_paths: &[String], include_chrome: bool) -> Vec<(String, PathBuf)> {
+    let mut out: Vec<(String, PathBuf)> = Vec::new();
+
+    if !profile_paths.is_empty() {
+        for raw in profile_paths {
+            let raw = raw.trim().trim_matches('"');
+            if raw.is_empty() {
+                continue;
+            }
+            let p = PathBuf::from(raw);
+            let (label, file) = if p.is_dir() {
+                let lower = p.to_string_lossy().to_lowercase();
+                let label = if lower.contains("vivaldi") {
+                    "Vivaldi"
+                } else if lower.contains("chrome") {
+                    "Chrome"
+                } else {
+                    "Chromium"
+                };
+                (label.to_string(), p.join("History"))
+            } else {
+                ("Custom".to_string(), p.clone())
+            };
+            if file.is_file() {
+                out.push((label, file));
+            }
+        }
+        return out;
+    }
+
+    let mut roots: Vec<(String, PathBuf)> = Vec::new();
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        roots.push(("Vivaldi".to_string(), PathBuf::from(&local).join("Vivaldi").join("User Data")));
+        if include_chrome {
+            roots.push((
+                "Chrome".to_string(),
+                PathBuf::from(&local).join("Google").join("Chrome").join("User Data"),
+            ));
+        }
+    }
+    for (label, root) in roots {
+        let Ok(entries) = fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if name.eq_ignore_ascii_case("System Profile") {
+                continue;
+            }
+            let history = path.join("History");
+            if history.is_file() {
+                out.push((label.clone(), history));
+            }
+        }
+    }
+    out
+}
+
+// Query one copied History DB. `tokens` (already lowercased) do a broad OR-any-token LIKE;
+// the frontend re-ranks precisely. Empty `tokens` → recency-only (recent visits).
+fn read_history_db(
+    copy_path: &Path,
+    browser: &str,
+    min_chrome_us: i64,
+    tokens: &[String],
+    scan_limit: i64,
+) -> Result<Vec<Value>, String> {
+    let conn = rusqlite::Connection::open_with_flags(
+        copy_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|e| format!("open failed: {e}"))?;
+
+    let likes: Vec<String> = tokens.iter().map(|t| format!("%{t}%")).collect();
+    let min = min_chrome_us;
+    let lim = scan_limit;
+
+    let mut sql = String::from(
+        "SELECT url, COALESCE(title, ''), visit_count, last_visit_time \
+         FROM urls WHERE last_visit_time >= ? AND url <> ''",
+    );
+    let mut param_refs: Vec<&dyn rusqlite::ToSql> = vec![&min];
+    if !likes.is_empty() {
+        let clause = likes
+            .iter()
+            .map(|_| "(lower(url) LIKE ? OR lower(title) LIKE ?)")
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        sql.push_str(" AND (");
+        sql.push_str(&clause);
+        sql.push(')');
+        for like in &likes {
+            param_refs.push(like);
+            param_refs.push(like);
+        }
+    }
+    sql.push_str(" ORDER BY visit_count DESC, last_visit_time DESC LIMIT ?");
+    param_refs.push(&lim);
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| format!("prepare failed: {e}"))?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(param_refs), |row| {
+            let url: String = row.get(0)?;
+            let title: String = row.get(1)?;
+            let visit_count: i64 = row.get(2)?;
+            let last_visit_time: i64 = row.get(3)?;
+            Ok(json!({
+                "url": url,
+                "title": title,
+                "visitCount": visit_count,
+                "lastVisitMs": chrome_us_to_unix_ms(last_visit_time),
+                "browser": browser,
+            }))
+        })
+        .map_err(|e| format!("query failed: {e}"))?;
+
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(|e| format!("row failed: {e}"))?);
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+fn browser_history_search(opts: Option<Value>) -> Result<Value, String> {
+    let opts = opts.unwrap_or_else(|| json!({}));
+    let query = opts
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+    let days = opts.get("days").and_then(Value::as_i64).unwrap_or(30).clamp(1, 3650);
+    let scan_limit = opts.get("scanLimit").and_then(Value::as_i64).unwrap_or(4000).clamp(50, 20000);
+    let include_chrome = opts.get("includeChrome").and_then(Value::as_bool).unwrap_or(false);
+    let profile_paths: Vec<String> = opts
+        .get("profilePaths")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect())
+        .unwrap_or_default();
+
+    // Broad token filter (JS ranks precisely). Keep it to a handful of tokens.
+    let tokens: Vec<String> = query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.chars().count() >= 2)
+        .take(8)
+        .map(|t| t.to_string())
+        .collect();
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let min_chrome_us = (now_ms - days * 86_400_000 + CHROME_EPOCH_TO_UNIX_MS) * 1000;
+
+    let candidates = history_db_candidates(&profile_paths, include_chrome);
+    if candidates.is_empty() {
+        return Ok(json!({
+            "items": [],
+            "stats": { "profiles": [], "missing": ["No Vivaldi/Chrome history profiles found."], "scanned": 0 }
+        }));
+    }
+
+    // Vivaldi/Chrome lock their live History DB, so copy each to a temp file first (this is
+    // exactly what the chromium-history-timeline app does) and open the copy read-only.
+    let temp_root = std::env::temp_dir();
+    let suffix = now_ms as u128;
+    let mut merged: HashMap<String, Value> = HashMap::new();
+    let mut profiles_used: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    let mut scanned = 0usize;
+
+    for (idx, (browser, history_path)) in candidates.iter().enumerate() {
+        let copy_path = temp_root.join(format!("llmchat-history-{suffix}-{idx}.sqlite"));
+        if let Err(e) = fs::copy(history_path, &copy_path) {
+            errors.push(format!("{}: copy failed ({e})", history_path.to_string_lossy()));
+            continue;
+        }
+        let result = read_history_db(&copy_path, browser, min_chrome_us, &tokens, scan_limit);
+        let _ = fs::remove_file(&copy_path);
+        match result {
+            Ok(rows) => {
+                profiles_used.push(history_path.to_string_lossy().to_string());
+                scanned += rows.len();
+                for row in rows {
+                    let url = row.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+                    if url.is_empty() {
+                        continue;
+                    }
+                    merged
+                        .entry(url)
+                        .and_modify(|existing| {
+                            let ev = existing.get("visitCount").and_then(Value::as_i64).unwrap_or(0);
+                            let nv = row.get("visitCount").and_then(Value::as_i64).unwrap_or(0);
+                            if nv > ev {
+                                existing["visitCount"] = json!(nv);
+                            }
+                            let el = existing.get("lastVisitMs").and_then(Value::as_i64).unwrap_or(0);
+                            let nl = row.get("lastVisitMs").and_then(Value::as_i64).unwrap_or(0);
+                            if nl > el {
+                                existing["lastVisitMs"] = json!(nl);
+                            }
+                            let et = existing.get("title").and_then(Value::as_str).unwrap_or("");
+                            let nt = row.get("title").and_then(Value::as_str).unwrap_or("");
+                            if et.is_empty() && !nt.is_empty() {
+                                existing["title"] = json!(nt);
+                            }
+                        })
+                        .or_insert(row);
+                }
+            }
+            Err(e) => errors.push(format!("{}: {e}", history_path.to_string_lossy())),
+        }
+    }
+
+    let mut items: Vec<Value> = merged.into_values().collect();
+    // Recent-first default; the frontend re-ranks for "relevant" mode.
+    items.sort_by(|a, b| {
+        b.get("lastVisitMs")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            .cmp(&a.get("lastVisitMs").and_then(Value::as_i64).unwrap_or(0))
+    });
+
+    Ok(json!({
+        "items": items,
+        "stats": {
+            "profiles": profiles_used,
+            "missing": errors,
+            "scanned": scanned
+        }
+    }))
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
@@ -3698,6 +3948,7 @@ pub fn run() {
             analysis_reset_topics,
             analysis_reset_canonization,
             library_collect,
+            browser_history_search,
             get_models,
             load_model,
             exa_search,

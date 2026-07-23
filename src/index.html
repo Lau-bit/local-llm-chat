@@ -88,6 +88,7 @@
           <button class="settings-tab" data-settings-tab="models" role="tab" aria-selected="false">Models</button>
           <button class="settings-tab" data-settings-tab="conceptmap" role="tab" aria-selected="false">Concept map</button>
           <button class="settings-tab" data-settings-tab="library" role="tab" aria-selected="false">Library</button>
+          <button class="settings-tab" data-settings-tab="history" role="tab" aria-selected="false">History</button>
         </div>
         <div id="settings-body">
           <section class="settings-pane" data-settings-pane="setup" role="tabpanel">
@@ -309,6 +310,51 @@
               <input type="number" id="lib-max-chars" min="1000" max="200000" step="1000" value="12000">
             </div>
           </section>
+
+          <section class="settings-pane" data-settings-pane="history" role="tabpanel">
+            <p class="settings-hint" style="margin: 0 0 10px;">
+              A browsing-history context layer. It reads your local Vivaldi (Chromium)
+              history — the same way the Chromium History Timeline app does — and feeds
+              the model what you've recently been looking at. Toggle it on with the
+              history button by the composer. History is read fresh, read-only, each
+              message; nothing is stored.
+            </p>
+
+            <label class="settings-label">Mode</label>
+            <div class="settings-row">
+              <select id="hist-mode">
+                <option value="relevant">Relevant — search history for what fits my message</option>
+                <option value="recent">Recent — include my most recent visits</option>
+              </select>
+            </div>
+
+            <label class="settings-label">Time window <span class="settings-hint">(only visits within the last N days)</span></label>
+            <div class="settings-row">
+              <input type="number" id="hist-days" min="1" max="3650" step="1" value="30">
+            </div>
+
+            <label class="settings-label">Max entries <span class="settings-hint">(pages injected per message)</span></label>
+            <div class="settings-row">
+              <input type="number" id="hist-max-entries" min="1" max="500" step="1" value="40">
+            </div>
+
+            <label class="settings-label">Budget <span class="settings-hint">(max characters injected per message)</span></label>
+            <div class="settings-row">
+              <input type="number" id="hist-max-chars" min="1000" max="200000" step="500" value="8000">
+            </div>
+
+            <label class="cm-check" style="margin: 10px 0 4px;">
+              <input type="checkbox" id="hist-include-chrome"> Also read Google Chrome history
+            </label>
+
+            <label class="settings-label">Custom profile paths <span class="settings-hint">(optional — one per line; a profile folder or a History file. Empty = auto-detect Vivaldi)</span></label>
+            <textarea id="hist-profiles" class="settings-textarea" rows="3" spellcheck="false"
+              placeholder="C:\Users\me\AppData\Local\Vivaldi\User Data\Default"></textarea>
+            <div class="settings-row" style="margin-top: 6px;">
+              <button id="hist-preview" class="settings-action-btn" style="width:auto; margin:0; padding:6px 12px;">Test read history</button>
+            </div>
+            <div id="hist-status" class="settings-hint" style="margin: 6px 0 4px;"></div>
+          </section>
         </div>
       </div>
 
@@ -519,6 +565,13 @@
             <path d="M4 5.5A1.5 1.5 0 0 1 5.5 4H10v16H5.5A1.5 1.5 0 0 0 4 21.5z"/>
             <path d="M20 5.5A1.5 1.5 0 0 0 18.5 4H14v16h4.5a1.5 1.5 0 0 1 1.5 1.5z"/>
             <line x1="10" y1="8" x2="4" y2="8"/><line x1="20" y1="8" x2="14" y2="8"/>
+          </svg>
+        </button>
+        <button id="history-toggle" title="Browser history — off" aria-pressed="false">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M3 3v5h5"/>
+            <path d="M3.05 13a9 9 0 1 0 2.6-6.36L3 8"/>
+            <path d="M12 7v5l3 2"/>
           </svg>
         </button>
         <textarea id="message-input" placeholder="Type a message..." rows="1" spellcheck="false"></textarea>

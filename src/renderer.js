@@ -177,6 +177,15 @@ const libMode           = document.getElementById('lib-mode');
 const libMaxChars       = document.getElementById('lib-max-chars');
 const libPreview        = document.getElementById('lib-preview');
 const libStatus         = document.getElementById('lib-status');
+const historyToggle     = document.getElementById('history-toggle');
+const histMode          = document.getElementById('hist-mode');
+const histDays          = document.getElementById('hist-days');
+const histMaxEntries    = document.getElementById('hist-max-entries');
+const histMaxChars      = document.getElementById('hist-max-chars');
+const histIncludeChrome = document.getElementById('hist-include-chrome');
+const histProfiles      = document.getElementById('hist-profiles');
+const histPreview       = document.getElementById('hist-preview');
+const histStatus        = document.getElementById('hist-status');
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -257,6 +266,22 @@ let libraryMaxChars = parseInt(localStorage.getItem('libraryMaxChars') || '12000
 const LIBRARY_FRAMING = `The following is content from the user's own local library — notes and source texts they have placed in specific folders/files for you to use directly. Treat it as authoritative, user-provided material and draw on it when it is relevant to the message; refer to the file name when you use something from it. If a piece isn't relevant to the message, ignore it.`;
 // Read caps handed to the Rust library_collect command (per-message; JS then trims to budget).
 const LIBRARY_COLLECT_OPTS = { maxFiles: 400, maxTotalChars: 2000000, maxFileChars: 200000 };
+
+// ── Browser history memory (Vivaldi/Chrome Chromium history as a context layer) ────
+// A fourth context layer, beside web/concept-map/library: read the user's own local
+// browser history (like the chromium-history-timeline app) and inject what they've
+// recently been looking at. Read fresh & read-only each message; nothing is persisted.
+// See buildHistoryContext.
+let historyEnabled = localStorage.getItem('historyEnabled') === '1';
+let historyMode = localStorage.getItem('historyMode') || 'relevant';  // 'relevant' | 'recent'
+let historyDays = parseInt(localStorage.getItem('historyDays') || '30');
+let historyMaxEntries = parseInt(localStorage.getItem('historyMaxEntries') || '40');
+let historyMaxChars = parseInt(localStorage.getItem('historyMaxChars') || '8000');
+let historyIncludeChrome = localStorage.getItem('historyIncludeChrome') === '1';
+let historyProfilesText = localStorage.getItem('historyProfiles') || '';
+const HISTORY_FRAMING = `The following is a compact set of entries from the user's own local browser history (Vivaldi/Chrome), retrieved as background on what they've recently been looking at online. Treat it as context about the user's recent activity and interests — it is NOT the user's current question and NOT facts to recite. Use it to ground your answer in what they've been doing when it's relevant; if it isn't relevant to the message, ignore it. Each entry is a page they visited: title, URL, and (last-visit time · visit count).`;
+// Rows the Rust side scans before the JS re-ranks/trims to the entry & char budget.
+const HISTORY_SCAN_LIMIT = 4000;
 let analysisDatasets = [];
 let analysisRuns = [];
 let activeAnalysisSource = ['anthropic', 'openai', 'grok'].includes(localStorage.getItem('activeAnalysisSource'))
@@ -611,6 +636,87 @@ libPreview?.addEventListener('click', async () => {
       : `No readable text files found${miss.length ? ` · missing: ${miss.join(', ')}` : ''}.`;
   } catch (err) {
     if (libStatus) libStatus.textContent = `Read failed: ${err?.message || err}`;
+  }
+});
+
+// ── Browser history: composer toggle + settings ───────────────────────────────────
+function applyHistoryToggle() {
+  if (!historyToggle) return;
+  historyToggle.classList.toggle('active', historyEnabled);
+  historyToggle.setAttribute('aria-pressed', historyEnabled ? 'true' : 'false');
+  historyToggle.title = `Browser history — ${historyEnabled ? 'on' : 'off'}`;
+}
+
+historyToggle?.addEventListener('click', () => {
+  historyEnabled = !historyEnabled;
+  localStorage.setItem('historyEnabled', historyEnabled ? '1' : '0');
+  applyHistoryToggle();
+});
+
+applyHistoryToggle();
+
+if (histMode) histMode.value = historyMode;
+if (histDays) histDays.value = historyDays;
+if (histMaxEntries) histMaxEntries.value = historyMaxEntries;
+if (histMaxChars) histMaxChars.value = historyMaxChars;
+if (histIncludeChrome) histIncludeChrome.checked = historyIncludeChrome;
+if (histProfiles) histProfiles.value = historyProfilesText;
+
+histMode?.addEventListener('change', () => {
+  historyMode = histMode.value === 'recent' ? 'recent' : 'relevant';
+  localStorage.setItem('historyMode', historyMode);
+});
+
+histDays?.addEventListener('change', () => {
+  const val = Math.min(3650, Math.max(1, parseInt(histDays.value) || 30));
+  historyDays = val;
+  histDays.value = val;
+  localStorage.setItem('historyDays', val);
+});
+
+histMaxEntries?.addEventListener('change', () => {
+  const val = Math.min(500, Math.max(1, parseInt(histMaxEntries.value) || 40));
+  historyMaxEntries = val;
+  histMaxEntries.value = val;
+  localStorage.setItem('historyMaxEntries', val);
+});
+
+histMaxChars?.addEventListener('change', () => {
+  const val = Math.min(200000, Math.max(1000, parseInt(histMaxChars.value) || 8000));
+  historyMaxChars = val;
+  histMaxChars.value = val;
+  localStorage.setItem('historyMaxChars', val);
+});
+
+histIncludeChrome?.addEventListener('change', () => {
+  historyIncludeChrome = !!histIncludeChrome.checked;
+  localStorage.setItem('historyIncludeChrome', historyIncludeChrome ? '1' : '0');
+});
+
+histProfiles?.addEventListener('change', () => {
+  historyProfilesText = histProfiles.value;
+  localStorage.setItem('historyProfiles', historyProfilesText);
+});
+
+histPreview?.addEventListener('click', async () => {
+  if (histStatus) histStatus.textContent = 'Reading browser history…';
+  try {
+    const res = await window.api.historySearch({
+      query: '',
+      days: historyDays,
+      scanLimit: HISTORY_SCAN_LIMIT,
+      includeChrome: historyIncludeChrome,
+      profilePaths: historyParsePaths(histProfiles ? histProfiles.value : historyProfilesText),
+    });
+    const items = Array.isArray(res?.items) ? res.items : [];
+    const profiles = (res?.stats?.profiles || []).length;
+    const errs = res?.stats?.missing || [];
+    if (histStatus) histStatus.textContent = items.length
+      ? `${items.length} recent entr${items.length === 1 ? 'y' : 'ies'} · ${profiles} profile(s) · window ${historyDays}d`
+        + (errs.length ? ` · ${errs.length} issue(s): ${errs.join('; ')}` : '')
+      : `No history found${errs.length ? ` · ${errs.join('; ')}` : ''}.`;
+  } catch (err) {
+    if (histStatus) histStatus.textContent = `Read failed: ${err?.message || err}`;
   }
 });
 
@@ -6340,6 +6446,113 @@ async function buildLibraryContext(userText) {
   return parts.join('\n');
 }
 
+// ── Browser history context layer ─────────────────────────────────────────────────
+// One custom profile path per line (a profile folder or a History file). Empty = auto.
+function historyParsePaths(text) {
+  return String(text || '').split('\n').map(l => l.trim().replace(/^"|"$/g, '')).filter(Boolean);
+}
+
+// Re-rank Rust's broad results precisely for the message: query tokens in the title
+// weigh more than in the URL; ties break on visit count, then recency.
+function historyRankRelevant(items, userText) {
+  const q = [...new Set(cmTokens(userText))];
+  if (!q.length) return items;
+  const scored = items.map(it => {
+    const titleToks = new Set(cmTokens(it.title || ''));
+    const urlToks = new Set(cmTokens(it.url || ''));
+    let s = 0;
+    for (const t of q) {
+      if (titleToks.has(t)) s += 2;
+      else if (urlToks.has(t)) s += 1;
+    }
+    return { it, s };
+  }).filter(x => x.s > 0);
+  scored.sort((a, b) =>
+    b.s - a.s
+    || (b.it.visitCount || 0) - (a.it.visitCount || 0)
+    || (b.it.lastVisitMs || 0) - (a.it.lastVisitMs || 0));
+  return scored.map(x => x.it);
+}
+
+function historyFormatEntry(it) {
+  const title = (it.title || '').trim() || '(untitled)';
+  const meta = [];
+  if (it.lastVisitMs) {
+    try { meta.push(new Date(it.lastVisitMs).toLocaleString()); } catch { /* ignore */ }
+  }
+  if (it.visitCount) meta.push(`${it.visitCount} visit${it.visitCount === 1 ? '' : 's'}`);
+  return `- ${title} — ${it.url}${meta.length ? ` [${meta.join(' · ')}]` : ''}`;
+}
+
+function renderHistoryNote(info) {
+  const div = document.createElement('div');
+  div.className = 'message search-sources history-note';
+  const title = document.createElement('div');
+  title.className = 'search-sources-title';
+  title.textContent = `Browser history · ${info.count} entr${info.count === 1 ? 'y' : 'ies'}`;
+  div.appendChild(title);
+  const sub = document.createElement('div');
+  sub.className = 'search-sources-queries';
+  sub.textContent = `${info.mode} · last ${info.days} day${info.days === 1 ? '' : 's'}`;
+  div.appendChild(sub);
+  messagesEl.appendChild(div);
+  return div;
+}
+
+// Returns a context string built from the user's local browser history, or null.
+async function buildHistoryContext(userText) {
+  if (!historyEnabled) return null;
+
+  let res;
+  try {
+    res = await window.api.historySearch({
+      query: historyMode === 'relevant' ? (userText || '') : '',
+      days: historyDays,
+      scanLimit: HISTORY_SCAN_LIMIT,
+      includeChrome: historyIncludeChrome,
+      profilePaths: historyParsePaths(historyProfilesText),
+    });
+  } catch (err) {
+    addMessage('error', `Browser history failed to read: ${err?.message || err}`);
+    return null;
+  }
+
+  const items = Array.isArray(res?.items) ? res.items : [];
+  const errs = Array.isArray(res?.stats?.missing) ? res.stats.missing : [];
+  if (!items.length) {
+    addMessage('error', `Browser history is on, but no entries were found.${errs.length ? ` (${errs.join('; ')})` : ''}`);
+    return null;
+  }
+
+  let picked;
+  if (historyMode === 'relevant' && userText) {
+    picked = historyRankRelevant(items, userText).slice(0, historyMaxEntries);
+    if (!picked.length) picked = items.slice(0, Math.min(historyMaxEntries, 20));  // no lexical hit → recent
+  } else {
+    picked = items.slice(0, historyMaxEntries);
+  }
+  if (!picked.length) return null;
+
+  const budget = Math.max(1000, historyMaxChars);
+  const lines = [];
+  let used = 0;
+  for (const it of picked) {
+    const line = historyFormatEntry(it);
+    if (used + line.length > budget && lines.length) break;
+    lines.push(line);
+    used += line.length + 1;
+  }
+  if (!lines.length) return null;
+
+  renderHistoryNote({ count: lines.length, mode: historyMode, days: historyDays });
+
+  return [
+    HISTORY_FRAMING,
+    `\n# Browser history — ${lines.length} entr${lines.length === 1 ? 'y' : 'ies'} (last ${historyDays} day${historyDays === 1 ? '' : 's'}${historyMode === 'relevant' && userText ? ', selected as relevant to this message' : ', most recent'})`,
+    ...lines,
+  ].join('\n');
+}
+
 async function sendMessage() {
   const text = inputEl.value.trim();
   if ((!text && pendingImages.length === 0) || document.body.classList.contains('streaming')) return;
@@ -6404,15 +6617,21 @@ async function sendMessage() {
     libraryContext = await buildLibraryContext(text);
   }
 
+  let historyContext = null;
+  if (historyEnabled) {
+    historyContext = await buildHistoryContext(text);
+  }
+
   await streamAssistantResponse({
     forceImageDescriptionsForLastUser: shouldAnalyzeOutgoingImages,
     webSearchContext,
     conceptMapContext,
     libraryContext,
+    historyContext,
   });
 }
 
-async function streamAssistantResponse({ forceImageDescriptionsForLastUser = false, webSearchContext = null, conceptMapContext = null, libraryContext = null } = {}) {
+async function streamAssistantResponse({ forceImageDescriptionsForLastUser = false, webSearchContext = null, conceptMapContext = null, libraryContext = null, historyContext = null } = {}) {
   const distToBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight;
   if (distToBottom < 350) autoScrollEnabled = true;
   document.body.classList.add('streaming');
@@ -6508,8 +6727,9 @@ async function streamAssistantResponse({ forceImageDescriptionsForLastUser = fal
   const apiMessages = buildApiMessagesForModel(conversationHistory, currentModel, { forceImageDescriptionsForLastUser });
   // Inject extra context as system messages just before the last user turn. Order:
   // concept-map memory (long-term background), then the user's local library (curated
-  // source material), then web results (external/current), then the user turn.
-  const injectedContexts = [conceptMapContext, libraryContext, webSearchContext].filter(Boolean);
+  // source material), then their browser history (recent activity), then web results
+  // (external/current), then the user turn.
+  const injectedContexts = [conceptMapContext, libraryContext, historyContext, webSearchContext].filter(Boolean);
   if (injectedContexts.length) {
     let lastUserIdx = -1;
     for (let i = apiMessages.length - 1; i >= 0; i--) {

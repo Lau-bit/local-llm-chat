@@ -532,6 +532,10 @@ body.analysis-mode #sidebar-area:not(.collapsed) #chat-list {
   position: relative;
 }
 
+/* Chat reasoning lives in the composer row now, so this group only has a job in Analysis
+   mode — where the composer is hidden and there is nowhere else to put it. */
+body:not(.analysis-mode) #reasoning-controls { display: none; }
+
 .reasoning-toggle {
   min-width: 0;
   height: 28px;
@@ -1794,10 +1798,14 @@ body.streaming .msg-edit-btn, body.streaming .msg-resend-btn { display: none !im
 
 #composer-main-row { display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 8px; }
 
+/* Semantic grouping only — the buttons stay direct flex items of the composer row. */
+#context-sources { display: contents; }
+
 #web-search-toggle,
 #concept-map-toggle,
 #library-toggle,
-#history-toggle {
+#history-toggle,
+#reasoning-toggle {
   flex-shrink: 0; width: 46px; height: 46px; padding: 0;
   border: 1px solid var(--border); border-radius: 8px;
   background: var(--bg-primary); color: var(--text-secondary);
@@ -1807,13 +1815,19 @@ body.streaming .msg-edit-btn, body.streaming .msg-resend-btn { display: none !im
 #web-search-toggle:hover,
 #concept-map-toggle:hover,
 #library-toggle:hover,
-#history-toggle:hover { color: var(--text-primary); border-color: var(--accent); }
+#history-toggle:hover,
+#reasoning-toggle:hover { color: var(--text-primary); border-color: var(--accent); }
 #web-search-toggle.active,
 #concept-map-toggle.active,
 #library-toggle.active,
-#history-toggle.active {
+#history-toggle.active,
+#reasoning-toggle.active {
   background: var(--accent); color: var(--accent-text); border-color: var(--accent);
 }
+
+/* Reasoning is not a context source: separate it from the group of four so the row reads
+   as "sources … | thinking" rather than as five interchangeable toggles. */
+#reasoning-toggle { margin-left: 4px; }
 
 .cm-check {
   display: inline-flex; align-items: center; gap: 5px;

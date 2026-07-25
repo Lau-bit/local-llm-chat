@@ -44,8 +44,143 @@ function sanitizeHtml(html) {
   return template.innerHTML;
 }
 
+// ── LaTeX in model output ─────────────────────────────────────────────────────
+// Nothing here renders math. marked passes `$\rightarrow$` through verbatim, and
+// CommonMark silently EATS the backslash in `\(…\)` / `\[…\]`, so that form loses its
+// delimiters and reads as ordinary parentheses. Local models — Gemma especially — reach
+// for LaTeX arrows in prose whatever the system prompt says, and the concept-map layer
+// makes it worse by pulling the model into an academic register. Rather than pull in a
+// whole math engine for what is nearly always an arrow, map the macros that actually
+// turn up in prose onto real Unicode and drop the delimiters. Runs before marked.parse;
+// code fences and inline code are skipped, so `$VAR`, `C:\Users\x` and a `\[` inside a
+// regex survive untouched.
+
+const LATEX_SYMBOLS = {
+  // Arrows — the overwhelming majority of what a chat answer actually emits.
+  rightarrow: '→', to: '→', longrightarrow: '⟶', Rightarrow: '⇒', implies: '⇒',
+  leftarrow: '←', gets: '←', longleftarrow: '⟵', Leftarrow: '⇐', impliedby: '⇐',
+  leftrightarrow: '↔', Leftrightarrow: '⇔', iff: '⇔', mapsto: '↦',
+  uparrow: '↑', downarrow: '↓', nearrow: '↗', searrow: '↘',
+  // Operators
+  times: '×', cdot: '·', div: '÷', pm: '±', mp: '∓', ast: '∗', star: '⋆', circ: '∘',
+  oplus: '⊕', otimes: '⊗',
+  // Relations
+  leq: '≤', le: '≤', geq: '≥', ge: '≥', neq: '≠', ne: '≠', approx: '≈', sim: '∼',
+  simeq: '≃', cong: '≅', equiv: '≡', propto: '∝', ll: '≪', gg: '≫',
+  // Sets and logic
+  in: '∈', notin: '∉', ni: '∋', subset: '⊂', subseteq: '⊆', supset: '⊃', supseteq: '⊇',
+  cup: '∪', cap: '∩', setminus: '∖', emptyset: '∅', varnothing: '∅',
+  forall: '∀', exists: '∃', nexists: '∄', neg: '¬', lnot: '¬',
+  land: '∧', wedge: '∧', lor: '∨', vee: '∨', therefore: '∴', because: '∵',
+  // Misc
+  infty: '∞', partial: '∂', nabla: '∇', sum: '∑', prod: '∏', int: '∫', sqrt: '√',
+  degree: '°', dots: '…', ldots: '…', cdots: '⋯', vdots: '⋮', prime: '′', bullet: '•',
+  // Greek — lowercase
+  alpha: 'α', beta: 'β', gamma: 'γ', delta: 'δ', epsilon: 'ε', varepsilon: 'ε',
+  zeta: 'ζ', eta: 'η', theta: 'θ', iota: 'ι', kappa: 'κ', lambda: 'λ', mu: 'μ',
+  nu: 'ν', xi: 'ξ', rho: 'ρ', sigma: 'σ', tau: 'τ', upsilon: 'υ', phi: 'φ',
+  varphi: 'φ', chi: 'χ', psi: 'ψ', omega: 'ω', pi: 'π',
+  // Greek — uppercase
+  Gamma: 'Γ', Delta: 'Δ', Theta: 'Θ', Lambda: 'Λ', Xi: 'Ξ', Pi: 'Π', Sigma: 'Σ',
+  Upsilon: 'Υ', Phi: 'Φ', Psi: 'Ψ', Omega: 'Ω',
+};
+
+const LATEX_SUPERSCRIPTS = {
+  0: '⁰', 1: '¹', 2: '²', 3: '³', 4: '⁴', 5: '⁵', 6: '⁶', 7: '⁷', 8: '⁸', 9: '⁹',
+  '+': '⁺', '-': '⁻', n: 'ⁿ', i: 'ⁱ',
+};
+const LATEX_SUBSCRIPTS = {
+  0: '₀', 1: '₁', 2: '₂', 3: '₃', 4: '₄', 5: '₅', 6: '₆', 7: '₇', 8: '₈', 9: '₉',
+  '+': '₊', '-': '₋',
+};
+
+// Fenced blocks, inline code, and an unterminated fence — during streaming the closing
+// fence has not arrived yet, but the contents are still code and must not be rewritten.
+const MD_CODE_RE = /(```[\s\S]*?```|~~~[\s\S]*?~~~|```[\s\S]*$|~~~[\s\S]*$|`[^`\n]*`)/g;
+
+// $$…$$ / $…$ / \(…\) / \[…\]. The single-$ form takes one of three shapes, none of which a
+// price can have: a lone symbol name ("$N$", "$k$" — models write these constantly in
+// "returned $N$ results"); an identifier applied to arguments ("$O(N)$", "$f(x)$", "$P(A|B)$"
+// — big-O survived an earlier version of this and showed up in testing); or a body carrying
+// a macro, superscript or subscript. So "$5 to $10" is still never read as math. The residue
+// is bare algebra with none of those markers ("$a + b$"), left as written.
+const MATH_SPAN_RE = /\$\$([\s\S]*?)\$\$|\$((?:[A-Za-z][A-Za-z0-9]{0,8}\([^()$\n]{1,24}\))|(?:[A-Za-z])|(?:[^$\n]*[\\^_][^$\n]*))\$|\\\(([\s\S]*?)\\\)|\\\[([\s\S]*?)\\\]/g;
+
+// Wrappers whose whole job is styling literal words — unwrap to the words themselves.
+const LATEX_TEXT_WRAPPER_RE =
+  /\\(?:text|textbf|textit|textrm|textsf|mathrm|mathbf|mathit|mathsf|mathcal|mathbb|operatorname)\s*\{([^{}]*)\}/g;
+
+function latexScriptChars(body, table) {
+  const out = Array.from(body, ch => table[ch]);
+  return out.every(Boolean) ? out.join('') : null;  // all-or-nothing: no half-converted runs
+}
+
+// Bare `\macro` → Unicode. Also the fallback for macros a model wrote with no delimiters
+// at all ("A \rightarrow B"). `[A-Za-z]+` is greedy, so `C:\input` yields "input" (not a
+// match) rather than mangling into `C:∈put`; only a path segment named exactly like a
+// macro could collide, which is rare enough to accept.
+function latexMacrosToUnicode(s) {
+  return s.replace(/\\([A-Za-z]+)/g, (m, name) => LATEX_SYMBOLS[name] ?? m);
+}
+
+// The inside of one math span, flattened to plain text.
+function demathBody(src) {
+  // Escaped braces are literal content; park them so the grouping-brace sweep below
+  // can't eat them.
+  let s = src.replace(/\\\{/g, '\u0001').replace(/\\\}/g, '\u0002');
+
+  for (let i = 0; i < 4 && LATEX_TEXT_WRAPPER_RE.test(s); i++) {  // innermost-out
+    LATEX_TEXT_WRAPPER_RE.lastIndex = 0;
+    s = s.replace(LATEX_TEXT_WRAPPER_RE, '$1');
+  }
+  LATEX_TEXT_WRAPPER_RE.lastIndex = 0;
+
+  const fracPart = (part) => {
+    const t = part.trim();
+    return /^[\w.]*$/.test(t) ? t : `(${t})`;  // parenthesise anything compound
+  };
+  s = s.replace(/\\[dt]?frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}/g, (m, a, b) => `${fracPart(a)}/${fracPart(b)}`);
+
+  s = s.replace(/\\(?:left|right|big|Big|bigg|Bigg)\b\s*/g, '');
+  s = s.replace(/\\(?:quad|qquad)\b/g, ' ').replace(/\\[,;:]/g, ' ').replace(/\\!/g, '').replace(/\\ /g, ' ');
+  s = s.replace(/\\\\/g, '\n');  // LaTeX line break — safe here, since this is math only
+
+  s = latexMacrosToUnicode(s);
+
+  s = s.replace(/\^\{([^{}]+)\}|\^([^\s{}])/g, (m, braced, single) =>
+    latexScriptChars(braced ?? single, LATEX_SUPERSCRIPTS) ?? m);
+  s = s.replace(/_\{([^{}]+)\}|_([^\s{}])/g, (m, braced, single) =>
+    latexScriptChars(braced ?? single, LATEX_SUBSCRIPTS) ?? m);
+
+  s = s.replace(/\\[A-Za-z]+\s*\{([^{}]*)\}/g, '$1');  // any wrapper macro left over
+  s = s.replace(/[{}]/g, '');                          // grouping braces
+  s = s.replace(/\u0001/g, '{').replace(/\u0002/g, '}');
+  return s.replace(/[ \t]{2,}/g, ' ').trim();
+}
+
+// A `$` with no partner is an opener whose closer is still streaming in — leave that tail
+// alone so the span pass takes charge of it once the rest arrives, instead of converting
+// the macro early and stranding the delimiters.
+function splitPendingMath(seg) {
+  if (((seg.match(/\$/g) || []).length % 2) === 0) return [seg, ''];
+  const idx = seg.lastIndexOf('$');
+  return [seg.slice(0, idx), seg.slice(idx)];
+}
+
+function demathText(text) {
+  if (!text || (!text.includes('$') && !text.includes('\\'))) return text;
+  // One capture group in MD_CODE_RE, so split() puts code segments at the odd indices.
+  return text.split(MD_CODE_RE).map((seg, i) => {
+    if (i % 2 === 1) return seg;
+    const [head, pending] = splitPendingMath(seg);
+    const converted = head.replace(MATH_SPAN_RE, (m, dd, d, paren, bracket) =>
+      demathBody(dd ?? d ?? paren ?? bracket));
+    return latexMacrosToUnicode(converted) + pending;
+  }).join('');
+}
+
 function renderMarkdown(text) {
-  return sanitizeHtml(marked.parse(text || ''));
+  return sanitizeHtml(marked.parse(demathText(text || '')));
 }
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
@@ -135,7 +270,10 @@ const settingsTemp      = document.getElementById('settings-temp');
 const settingsTempValue = document.getElementById('settings-temp-value');
 const settingsTempReset = document.getElementById('settings-temp-reset');
 const settingsMaxTokens = document.getElementById('settings-max-tokens');
-const reasoningChatToggle = document.getElementById('reasoning-chat-toggle');
+// Chat reasoning sits in the composer row, not the sidebar: the sidebar collapses and used
+// to take the control with it. The Analysis one stays in the sidebar because the composer
+// is hidden in Analysis mode.
+const reasoningChatToggle = document.getElementById('reasoning-toggle');
 const reasoningAnalysisToggle = document.getElementById('reasoning-analysis-toggle');
 const reasoningInfoBtn = document.getElementById('reasoning-info-btn');
 const reasoningInlineInfo = document.getElementById('reasoning-inline-info');
@@ -167,6 +305,8 @@ const cmArrangement     = document.getElementById('cm-arrangement');
 const cmLevelsGroup     = document.getElementById('cm-levels');
 const cmIncludeEvents   = document.getElementById('cm-include-events');
 const cmMaxConcepts     = document.getElementById('cm-max-concepts');
+const cmMaxChars        = document.getElementById('cm-max-chars');
+const cmMinEvidence     = document.getElementById('cm-min-evidence');
 const cmFraming         = document.getElementById('cm-framing');
 const cmFramingReset    = document.getElementById('cm-framing-reset');
 const cmExtractionGuidelines  = document.getElementById('cm-extraction-guidelines');
@@ -189,17 +329,97 @@ const histStatus        = document.getElementById('hist-status');
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
+// ── Persisted-setting defaults ────────────────────────────────────────────────
+// What a Settings tab shows before the user has touched it. These matter far more here
+// than in a normal web app: `tauri dev` serves the frontend on the first free port from
+// 1430 up, so a launch while another Tauri app holds 1430 lands on 1431, 1432, … — and
+// each port is a *separate web origin with its own empty localStorage*. The release build
+// (tauri://localhost) is yet another. So every settings-losing "reset after a patch" is
+// really a dev run that came up on a port it had never used before, as a fresh install.
+// Keeping these in step with the real configuration is what makes that harmless.
+//
+// Defaults only — localStorage still wins the moment the user changes something. Secrets
+// are deliberately NOT here: the Exa key lives in a file under app-data (initExaApiKey),
+// both because source is the wrong place for it and because a file is origin-independent.
+const DEFAULTS = {
+  // General
+  serverUrl: 'http://localhost:1234',
+  selectedModel: 'google/gemma-4-26b-a4b',
+  temperature: '0.7',
+  theme: 'amber',
+  msgMaxWidth: '85',
+  sidebarVisible: '0',
+  // Image analysis / vision
+  imageAnalysisModel: 'google/gemma-4-26b-a4b',
+  modelVisionOverrides: JSON.stringify({
+    'nvidia/nemotron-3-nano-4b': 'no',
+    'google/gemma-4-26b-a4b': 'yes',
+    'nvidia/nemotron-3-nano-omni': 'yes',
+    'nvidia/nemotron-3-super': 'no',
+  }),
+  // Web search (Exa) — the key itself is file-backed, see initExaApiKey
+  webSearchMode: 'off',
+  exaNumResults: '10',
+  webDeepMaxPages: '6',
+  webDeepCharsPerPage: '6000',
+  // Concept map memory
+  conceptMapEnabled: '1',
+  conceptMapPath: 'C:\\Users\\slaur\\AppData\\Roaming\\com.slaur.local-llm-chat\\data\\analysis-projects\\reconciliations\\reconciled_output_graph_reconciled_output__mru4ye0l.json',
+  conceptMapMode: 'overview',
+  conceptMapArrangement: 'hierarchy',
+  conceptMapLevels: 'macro,topic',
+  conceptMapMaxConcepts: '2000',
+  conceptMapMaxChars: '200000',
+  conceptMapMinEvidence: '3',
+  conceptMapIncludeEvents: '0',
+  // Local library
+  libraryEnabled: '0',
+  libraryMode: 'relevant',
+  librarySources: 'D:\\Users\\slaur\\Documents\\_devlog_.txt\n',
+  libraryMaxChars: '24000',
+  // Browser history
+  historyEnabled: '1',
+  historyMode: 'relevant',
+  historyDays: '30',
+  historyMaxEntries: '500',
+  historyMaxChars: '16000',
+  historyIncludeChrome: '0',
+  // Data Analysis
+  analysisProfile: 'fast',
+  activeAnalysisSource: 'anthropic',
+};
+
+// `??`, not `||`: a key the user has never set is null and takes the default, but one they
+// deliberately cleared to '' stays cleared instead of springing back to the default.
+function pref(key) {
+  return localStorage.getItem(key) ?? DEFAULTS[key] ?? '';
+}
+function prefInt(key) {
+  const n = parseInt(pref(key), 10);
+  return Number.isFinite(n) ? n : 0;
+}
+function prefBool(key) {
+  return pref(key) === '1';
+}
+
 let MODELS = {};
-let currentModel = localStorage.getItem('selectedModel') || null;
-let imageAnalysisModel = localStorage.getItem('imageAnalysisModel') || '';
+let currentModel = pref('selectedModel') || null;
+let imageAnalysisModel = pref('imageAnalysisModel');
 let analyzeImagesBeforeSend = false;
 let useCurrentModelForImageAnalysis = localStorage.getItem('useCurrentModelForImageAnalysis') !== '0';
 let includeImageAnalysisInContext = localStorage.getItem('includeImageAnalysisInContext') === '1';
 let currentContextWindow = parseInt(localStorage.getItem('contextWindow') || '0');
-let serverUrl = localStorage.getItem('serverUrl') || 'http://localhost:1234';
+// Size of the context layers spliced in on the last send. They are rebuilt per message and
+// live only inside streamAssistantResponse, so they never reached the context bar — which
+// then read ~2k tokens for a prompt whose concept map alone was ~44k. Carrying the last
+// measured figure is approximate between sends, but it is the difference between a bar
+// that is roughly right and one that is wrong by 20x. Declared up here with the rest of
+// the state so updateContextBar() can never touch it in its temporal dead zone.
+let lastContextSourceTokens = 0;
+let serverUrl = pref('serverUrl');
 let serverOnline = false;
 let systemPrompt = localStorage.getItem('systemPrompt') || '';
-let currentTemp = parseFloat(localStorage.getItem('temperature') || '0.7');
+let currentTemp = parseFloat(pref('temperature'));
 let currentMaxTokens = parseInt(localStorage.getItem('maxTokens') || '0');
 let requestChatReasoning = localStorage.getItem('requestChatReasoning') === '1';
 let requestAnalysisReasoning = localStorage.getItem('requestAnalysisReasoning') === '1';
@@ -223,35 +443,121 @@ let loadedModel = null;
 // Web search depth: 'off' | 'quick' (1 smart query, summaries) | 'deep' (multi-query, full page text).
 // Migrate the old boolean flag: previously-on becomes 'quick'.
 let webSearchMode = localStorage.getItem('webSearchMode')
-  || (localStorage.getItem('webSearchEnabled') === '1' ? 'quick' : 'off');
+  || (localStorage.getItem('webSearchEnabled') === '1' ? 'quick' : DEFAULTS.webSearchMode);
 if (!['off', 'quick', 'deep'].includes(webSearchMode)) webSearchMode = 'off';
 let lastWebSearchOnMode = webSearchMode === 'off' ? 'quick' : webSearchMode; // restored when re-enabling
-let exaApiKey = localStorage.getItem('exaApiKey') || '';
-let exaNumResults = parseInt(localStorage.getItem('exaNumResults') || '5');
+// Backed by exa-api-key.txt under app-data, not localStorage — see initExaApiKey. This
+// starts empty and is filled in during init(); nothing reads it before a search runs.
+let exaApiKey = '';
+let exaNumResults = prefInt('exaNumResults');
 // Deep-mode budget. Built for 256k-context local models with a 50–250k-token/chat ceiling in mind.
-let webDeepMaxPages = parseInt(localStorage.getItem('webDeepMaxPages') || '6');   // pages to inject full text for
-let webDeepCharsPerPage = parseInt(localStorage.getItem('webDeepCharsPerPage') || '6000');
+let webDeepMaxPages = prefInt('webDeepMaxPages');   // pages to inject full text for
+let webDeepCharsPerPage = prefInt('webDeepCharsPerPage');
 const WEB_DEEP_MAX_QUERIES = 4;  // decomposition ceiling for deep mode
+
+// ── Injected-context preamble ─────────────────────────────────────────────────
+// Precedes all four context layers, whichever are on. A system message full of search
+// results is indistinguishable from tool output unless something says otherwise, and with
+// no system prompt set there is nothing to say otherwise — so a "test the tools" style
+// prompt gets answered with an invented execution trace: a Python interpreter that does
+// not exist, a query that was never run, SUCCESS/latency telemetry for none of it. The
+// prohibitions are spelled out one by one rather than stated in general because that is
+// what local models actually follow.
+// One name per source, used for the composer button tooltip, the in-chat note heading, and
+// the heading the model reads. Three surfaces, one string — so "what the user toggled",
+// "what the app injected" and "what the model was told it is" cannot drift apart.
+const CONTEXT_SOURCES = {
+  web:     'Web search',
+  map:     'Concept map',
+  library: 'Local library',
+  history: 'Browser history',
+};
+
+// Sent on every request, whether or not any source is active, and worded so it is true
+// either way. Both properties are deliberate. Unconditional, because testing found the model
+// confabulates tool state worst when NOTHING is attached — with all sources off it invented
+// an Active/Degraded/Unavailable status table for tools it does not have; the preamble is
+// the only thing that stops that, and it used to be omitted in exactly that case. Constant,
+// because it sits at index 0: text that changed with the source count would invalidate the
+// cached prompt prefix — and the primed map behind it — every time a toggle moved.
+const CONTEXT_SOURCES_PREAMBLE = `Any reference material in this conversation appears as blocks headed "Context source: <name>". Those blocks were gathered by this application before you were called and placed into your context; they are not results you produced. If no such block is present, you have only this conversation and your own knowledge.
+
+You have no tools. You cannot search the web, browse, open URLs, run code, execute Python, query a database, or read files on demand — and you cannot observe the status, latency, environment or output of any such tool, because none ran. Never describe yourself as having called, invoked, run, orchestrated or monitored a tool. Never report tool status, execution traces, phases, or telemetry, even hypothetically or as an illustration.
+
+If you are asked about your tools or their state, answer plainly: name the context sources you were given and say that the application retrieved them for you. Anything not present in this context or in your own knowledge, you do not know — say so instead of constructing a plausible account of it.`;
+
+// Header every source block carries, so the name the model reads is the same name the user
+// clicked and the same name on the note in the transcript.
+function contextSourceHeader(key) {
+  return `## Context source: ${CONTEXT_SOURCES[key]}`;
+}
 
 // ── Concept map memory (local analysis graphs as conceptual anchors) ──────────────
 // Experimental: inject a map of the user's own concepts (from Data Analysis output
-// graphs) so the model can calibrate what the user knows. See buildConceptMapContext.
-let conceptMapEnabled = localStorage.getItem('conceptMapEnabled') === '1';
-let conceptMapPath = localStorage.getItem('conceptMapPath') || '';
-let conceptMapMode = localStorage.getItem('conceptMapMode') || 'overview';  // 'overview' | 'relevant'
+// graphs) so the model can calibrate what the user knows. In overview mode the map primes
+// the chat once (buildConceptMapPrime) and later messages get a small relevant slice
+// (buildConceptMapSlice); relevant mode injects a fresh selection every message instead.
+let conceptMapEnabled = prefBool('conceptMapEnabled');
+let conceptMapPath = pref('conceptMapPath');
+let conceptMapMode = pref('conceptMapMode');  // 'overview' | 'relevant'
 // Overview arrangement, mirroring the 3D vector-map viewer's layouts: 'hierarchy' (tree),
 // 'salience' (most-referenced first, like its "size" layout), 'alpha'.
-let conceptMapArrangement = ['hierarchy', 'salience', 'alpha'].includes(localStorage.getItem('conceptMapArrangement'))
-  ? localStorage.getItem('conceptMapArrangement') : 'hierarchy';
-let conceptMapLevels = (localStorage.getItem('conceptMapLevels') || 'macro,topic')
+let conceptMapArrangement = ['hierarchy', 'salience', 'alpha'].includes(pref('conceptMapArrangement'))
+  ? pref('conceptMapArrangement') : 'hierarchy';
+let conceptMapLevels = pref('conceptMapLevels')
   .split(',').map(s => s.trim()).filter(Boolean);
-let conceptMapIncludeEvents = localStorage.getItem('conceptMapIncludeEvents') === '1';
-let conceptMapMaxConcepts = parseInt(localStorage.getItem('conceptMapMaxConcepts') || '200');
+let conceptMapIncludeEvents = prefBool('conceptMapIncludeEvents');
+let conceptMapMaxConcepts = prefInt('conceptMapMaxConcepts');
+// A ceiling for pathological graphs, NOT an operating parameter. It is deliberately set
+// well above normal use (a full macro+topic map here is ~117k) because the trim is crude:
+// salience correlates with evidence, evidence correlates with level, so cutting the tail
+// of a ranked list is in practice a level filter — at 40k it removed 92% of topic entries
+// while keeping every macro one. Fine as a last resort against a runaway map, wrong as a
+// routine size control. Use minimum evidence and the level checkboxes for that.
+let conceptMapMaxChars = prefInt('conceptMapMaxChars');
+// Drop concepts the map barely knows anything about. cmEvidenceWeight is records + chunks,
+// so weight 2 is a single mention — and single mentions are how incidental nouns ("AI &
+// Technology", "AI Model Integration") end up presented as part of the user's conceptual
+// space. 3 excludes exactly those: it costs ~6% of the payload and removes 72 entries.
+let conceptMapMinEvidence = prefInt('conceptMapMinEvidence');
 let conceptGraphCache = { path: null, graph: null };  // avoid re-reading the graph each turn
+// The full map as rendered for the current chat, frozen at first send and re-sent verbatim
+// at the head of every request afterwards. Frozen rather than rebuilt because a prompt
+// prefix only stays cacheable while it is byte-identical, and because the model should not
+// be primed with one map and then quietly handed a different one mid-conversation. Cleared
+// on new/loaded chats, and re-primed if a setting that changes the rendering is edited —
+// tracked by signature rather than cleared from each settings listener, so a setting added
+// later cannot silently leave a stale prime behind.
+let primedConceptMap = null;
+let primedConceptMapSig = '';
+
+function cmPrimeSignature() {
+  return [
+    conceptMapPath, conceptMapArrangement, conceptMapLevels.join(','), conceptMapMaxConcepts,
+    conceptMapMaxChars, conceptMapMinEvidence, conceptMapIncludeEvents ? 1 : 0, conceptMapFraming,
+  ].join('|');
+}
 
 // Default text describing the concept map when it is injected as memory. User-tunable in Settings → Concept map.
-const CM_DEFAULT_FRAMING = `The following is a map of the user's own conceptual space, distilled by this app's Data Analysis from their PAST conversations — the topics they think about and how those relate. Treat it as background on what the user is likely already familiar with and the directions of their thinking. It is NOT the user's current question and NOT facts to recite. Use it to calibrate depth, avoid over-explaining what they clearly know, and connect your answer to their existing concepts where relevant. If it isn't relevant to the message, ignore it.`;
-let conceptMapFraming = localStorage.getItem('conceptMapFraming') || CM_DEFAULT_FRAMING;
+const CM_BASE_FRAMING = `The following is a map of the user's own conceptual space, distilled by this app's Data Analysis from their past conversations — the topics they think about and how those relate. Treat it as background on what the user is likely already familiar with and the directions of their thinking. It is not the user's current question and not facts to recite. Use it to calibrate depth, and connect your answer to their existing concepts where relevant. If it isn't relevant to the message, ignore it.`;
+// The formatting rule rides along with the map rather than living in the system prompt
+// because the map is what triggers the problem: a thousand lines of framework vocabulary
+// pull the model into an academic register where LaTeX arrows are a likely continuation.
+// demathText() cleans up whatever slips through anyway.
+const CM_FORMAT_CLAUSE = `Formatting: this chat renders plain Markdown and has no math renderer. Never use LaTeX — no $...$, $$...$$, \\(...\\) or \\[...\\] delimiters, and no macros such as \\rightarrow, \\times or \\text{...}. Write symbols directly as Unicode instead: → ⇒ ↔ × ÷ ≤ ≥ ≠ ≈ ∈ ∞.`;
+const CM_DEFAULT_FRAMING = `${CM_BASE_FRAMING}\n\n${CM_FORMAT_CLAUSE}`;
+// Framings that were the default, or were pasted in by hand, before the current one. A
+// stored copy of any of these means the user is not actually carrying a customisation, so
+// let the current default supersede it rather than freezing them on an older version.
+// Anything they genuinely wrote themselves is left untouched.
+const CM_LEGACY_FRAMINGS = [
+  CM_BASE_FRAMING,  // same text, before the formatting clause was appended to it
+  `The following is a map of the user's own conceptual space, distilled by this app's Data Analysis from their PAST conversations — the topics they think about and how those relate. Treat it as background on what the user is likely already familiar with and the directions of their thinking. It is NOT the user's current question and NOT facts to recite. Use it to calibrate depth, avoid over-explaining what they clearly know, and connect your answer to their existing concepts where relevant. If it isn't relevant to the message, ignore it.`,
+];
+const cmStoredFraming = (localStorage.getItem('conceptMapFraming') || '').trim();
+let conceptMapFraming = (cmStoredFraming && !CM_LEGACY_FRAMINGS.includes(cmStoredFraming))
+  ? cmStoredFraming
+  : CM_DEFAULT_FRAMING;
 // Extra guidelines appended to the Data Analysis concept-map generation prompts (empty = built-in defaults only).
 let conceptMapExtractionGuidelines = localStorage.getItem('conceptMapExtractionGuidelines') || '';
 let conceptMapCanonizationGuidelines = localStorage.getItem('conceptMapCanonizationGuidelines') || '';
@@ -259,10 +565,10 @@ let conceptMapCanonizationGuidelines = localStorage.getItem('conceptMapCanonizat
 // ── Local library memory (notes/text folders & files as a third context layer) ────
 // The user points at folders/files (their notes vault, exported texts); the model reads
 // them directly as source material. See buildLibraryContext.
-let libraryEnabled = localStorage.getItem('libraryEnabled') === '1';
-let libraryMode = localStorage.getItem('libraryMode') || 'relevant';  // 'relevant' | 'all'
-let librarySourcesText = localStorage.getItem('librarySources') || '';
-let libraryMaxChars = parseInt(localStorage.getItem('libraryMaxChars') || '12000');
+let libraryEnabled = prefBool('libraryEnabled');
+let libraryMode = pref('libraryMode');  // 'relevant' | 'all'
+let librarySourcesText = pref('librarySources');
+let libraryMaxChars = prefInt('libraryMaxChars');
 const LIBRARY_FRAMING = `The following is content from the user's own local library — notes and source texts they have placed in specific folders/files for you to use directly. Treat it as authoritative, user-provided material and draw on it when it is relevant to the message; refer to the file name when you use something from it. If a piece isn't relevant to the message, ignore it.`;
 // Read caps handed to the Rust library_collect command (per-message; JS then trims to budget).
 const LIBRARY_COLLECT_OPTS = { maxFiles: 400, maxTotalChars: 2000000, maxFileChars: 200000 };
@@ -272,20 +578,20 @@ const LIBRARY_COLLECT_OPTS = { maxFiles: 400, maxTotalChars: 2000000, maxFileCha
 // browser history (like the chromium-history-timeline app) and inject what they've
 // recently been looking at. Read fresh & read-only each message; nothing is persisted.
 // See buildHistoryContext.
-let historyEnabled = localStorage.getItem('historyEnabled') === '1';
-let historyMode = localStorage.getItem('historyMode') || 'relevant';  // 'relevant' | 'recent'
-let historyDays = parseInt(localStorage.getItem('historyDays') || '30');
-let historyMaxEntries = parseInt(localStorage.getItem('historyMaxEntries') || '40');
-let historyMaxChars = parseInt(localStorage.getItem('historyMaxChars') || '8000');
-let historyIncludeChrome = localStorage.getItem('historyIncludeChrome') === '1';
+let historyEnabled = prefBool('historyEnabled');
+let historyMode = pref('historyMode');  // 'relevant' | 'recent'
+let historyDays = prefInt('historyDays');
+let historyMaxEntries = prefInt('historyMaxEntries');
+let historyMaxChars = prefInt('historyMaxChars');
+let historyIncludeChrome = prefBool('historyIncludeChrome');
 let historyProfilesText = localStorage.getItem('historyProfiles') || '';
 const HISTORY_FRAMING = `The following is a compact set of entries from the user's own local browser history (Vivaldi/Chrome), retrieved as background on what they've recently been looking at online. Treat it as context about the user's recent activity and interests — it is NOT the user's current question and NOT facts to recite. Use it to ground your answer in what they've been doing when it's relevant; if it isn't relevant to the message, ignore it. Each entry is a page they visited: title, URL, and (last-visit time · visit count).`;
 // Rows the Rust side scans before the JS re-ranks/trims to the entry & char budget.
 const HISTORY_SCAN_LIMIT = 4000;
 let analysisDatasets = [];
 let analysisRuns = [];
-let activeAnalysisSource = ['anthropic', 'openai', 'grok'].includes(localStorage.getItem('activeAnalysisSource'))
-  ? localStorage.getItem('activeAnalysisSource')
+let activeAnalysisSource = ['anthropic', 'openai', 'grok'].includes(pref('activeAnalysisSource'))
+  ? pref('activeAnalysisSource')
   : 'anthropic';
 let activeAnalysisDatasetId = localStorage.getItem(`activeAnalysisDatasetId:${activeAnalysisSource}`) || localStorage.getItem('activeAnalysisDatasetId') || '';
 let activeAnalysisRunId = localStorage.getItem(`activeAnalysisRunId:${activeAnalysisSource}`) || localStorage.getItem('activeAnalysisRunId') || '';
@@ -337,7 +643,7 @@ titlebar?.addEventListener('mousedown', (e) => {
 // ── Theme ─────────────────────────────────────────────────────────────────────
 
 function applyTheme(theme) {
-  theme = theme || localStorage.getItem('theme') || 'amber';
+  theme = theme || pref('theme');
   document.documentElement.setAttribute('data-theme', theme);
   localStorage.setItem('theme', theme);
   document.querySelectorAll('.theme-btn').forEach(btn => {
@@ -368,7 +674,7 @@ document.querySelectorAll('.preset-btn').forEach(btn => {
   btn.addEventListener('click', () => applyMsgWidth(parseInt(btn.dataset.value)));
 });
 
-applyMsgWidth(parseInt(localStorage.getItem('msgMaxWidth') || '85'));
+applyMsgWidth(prefInt('msgMaxWidth'));
 
 // ── Settings inputs init ───────────────────────────────────────────────────────
 
@@ -412,15 +718,35 @@ settingsCtxWindow.addEventListener('change', () => {
 
 // ── Web search (Exa) ────────────────────────────────────────────────────────────
 
-if (settingsExaKey) settingsExaKey.value = exaApiKey;
+// The key field is filled in by initExaApiKey() once the backend has handed it over.
 if (settingsExaResults) settingsExaResults.value = exaNumResults;
 if (settingsExaDeepPages) settingsExaDeepPages.value = webDeepMaxPages;
 if (settingsExaDeepChars) settingsExaDeepChars.value = webDeepCharsPerPage;
 
 settingsExaKey?.addEventListener('change', () => {
   exaApiKey = settingsExaKey.value.trim();
-  localStorage.setItem('exaApiKey', exaApiKey);
+  window.api.setExaApiKey(exaApiKey).catch(() => {});
 });
+
+// The Exa key is persisted by the backend in exa-api-key.txt under app-data, the same way
+// the server URL and bearer token are, rather than in localStorage — localStorage belongs
+// to a web origin, and `tauri dev` hands out a new origin whenever it lands on a different
+// port, which is what kept wiping the key after a frontend change. Also migrates a key
+// still held in this origin's localStorage from before the switch.
+async function initExaApiKey() {
+  try {
+    let key = await window.api.getExaApiKey();
+    const carriedOver = (localStorage.getItem('exaApiKey') || '').trim();
+    if (!key && carriedOver) {
+      key = carriedOver;
+      await window.api.setExaApiKey(key);
+    }
+    // Once the file holds it, drop the copy here: no reason to leave a secret in webview storage.
+    if (carriedOver) localStorage.removeItem('exaApiKey');
+    exaApiKey = key || '';
+  } catch {}
+  if (settingsExaKey) settingsExaKey.value = exaApiKey;
+}
 
 settingsExaResults?.addEventListener('change', () => {
   const val = Math.min(10, Math.max(1, parseInt(settingsExaResults.value) || 5));
@@ -460,8 +786,8 @@ function applyWebSearchUI() {
     webSearchToggle.classList.toggle('active', on);
     webSearchToggle.setAttribute('aria-pressed', on ? 'true' : 'false');
     webSearchToggle.title = on
-      ? `Web search: ${webSearchMode} — click to turn off`
-      : 'Web search — off';
+      ? `Context source: ${CONTEXT_SOURCES.web} (${webSearchMode}) — click to turn off`
+      : `Context source: ${CONTEXT_SOURCES.web} — off`;
   }
   if (webSearchModeGroup) {
     webSearchModeGroup.classList.toggle('hidden', !on);
@@ -493,7 +819,7 @@ function applyConceptMapToggle() {
   if (!conceptMapToggle) return;
   conceptMapToggle.classList.toggle('active', conceptMapEnabled);
   conceptMapToggle.setAttribute('aria-pressed', conceptMapEnabled ? 'true' : 'false');
-  conceptMapToggle.title = `Concept map memory — ${conceptMapEnabled ? 'on' : 'off'}`;
+  conceptMapToggle.title = `Context source: ${CONTEXT_SOURCES.map} — ${conceptMapEnabled ? 'on' : 'off'}`;
 }
 
 conceptMapToggle?.addEventListener('click', () => {
@@ -512,6 +838,8 @@ if (cmModeSelect) cmModeSelect.value = conceptMapMode;
 if (cmArrangement) cmArrangement.value = conceptMapArrangement;
 if (cmIncludeEvents) cmIncludeEvents.checked = conceptMapIncludeEvents;
 if (cmMaxConcepts) cmMaxConcepts.value = conceptMapMaxConcepts;
+if (cmMaxChars) cmMaxChars.value = conceptMapMaxChars;
+if (cmMinEvidence) cmMinEvidence.value = conceptMapMinEvidence;
 if (cmFraming) cmFraming.value = conceptMapFraming;
 if (cmExtractionGuidelines) cmExtractionGuidelines.value = conceptMapExtractionGuidelines;
 if (cmCanonizationGuidelines) cmCanonizationGuidelines.value = conceptMapCanonizationGuidelines;
@@ -544,6 +872,20 @@ cmMaxConcepts?.addEventListener('change', () => {
   conceptMapMaxConcepts = val;
   cmMaxConcepts.value = val;
   localStorage.setItem('conceptMapMaxConcepts', val);
+});
+
+cmMaxChars?.addEventListener('change', () => {
+  const val = Math.min(1000000, Math.max(2000, parseInt(cmMaxChars.value) || 200000));
+  conceptMapMaxChars = val;
+  cmMaxChars.value = val;
+  localStorage.setItem('conceptMapMaxChars', val);
+});
+
+cmMinEvidence?.addEventListener('change', () => {
+  const val = Math.min(40, Math.max(0, parseInt(cmMinEvidence.value) || 0));
+  conceptMapMinEvidence = val;
+  cmMinEvidence.value = val;
+  localStorage.setItem('conceptMapMinEvidence', val);
 });
 
 cmFraming?.addEventListener('change', () => {
@@ -584,7 +926,7 @@ function applyLibraryToggle() {
   if (!libraryToggle) return;
   libraryToggle.classList.toggle('active', libraryEnabled);
   libraryToggle.setAttribute('aria-pressed', libraryEnabled ? 'true' : 'false');
-  libraryToggle.title = `Local library — ${libraryEnabled ? 'on' : 'off'}`;
+  libraryToggle.title = `Context source: ${CONTEXT_SOURCES.library} — ${libraryEnabled ? 'on' : 'off'}`;
 }
 
 libraryToggle?.addEventListener('click', () => {
@@ -644,7 +986,7 @@ function applyHistoryToggle() {
   if (!historyToggle) return;
   historyToggle.classList.toggle('active', historyEnabled);
   historyToggle.setAttribute('aria-pressed', historyEnabled ? 'true' : 'false');
-  historyToggle.title = `Browser history — ${historyEnabled ? 'on' : 'off'}`;
+  historyToggle.title = `Context source: ${CONTEXT_SOURCES.history} — ${historyEnabled ? 'on' : 'off'}`;
 }
 
 historyToggle?.addEventListener('click', () => {
@@ -1024,7 +1366,7 @@ function applyAnalysisProfileDefaults(profile, force = false) {
 
 function initAnalysisProfile() {
   if (!analysisProfile) return;
-  const saved = localStorage.getItem('analysisProfile') || 'fast';
+  const saved = pref('analysisProfile');
   analysisProfile.value = ANALYSIS_PROFILE_DEFAULTS[saved] ? saved : 'fast';
   localStorage.setItem('analysisProfile', analysisProfile.value);
   applyAnalysisProfileDefaults(analysisProfile.value, saved !== 'fast');
@@ -1108,16 +1450,17 @@ function inferReasoningCapability(modelId = currentModel) {
 function renderReasoningInfo() {
   const report = inferReasoningCapability(currentModel);
   const modelLabel = currentModel ? (currentModel.split('/').pop() || currentModel) : 'none';
-  const setButton = (btn, enabled, label) => {
+  const setButton = (btn, enabled, label, extra = '') => {
     if (!btn) return;
     btn.classList.toggle('active', enabled);
     btn.setAttribute('aria-pressed', enabled ? 'true' : 'false');
-    btn.title = `${label} reasoning: ${enabled ? 'ask on' : 'explicit off'}`;
+    btn.title = `${label} reasoning: ${enabled ? 'ask on' : 'explicit off'}${extra}`;
   };
-  setButton(reasoningChatToggle, requestChatReasoning, 'Chat');
+  // The composer button carries what the sidebar's info panel says, since that panel is
+  // only reachable in Analysis mode now.
+  setButton(reasoningChatToggle, requestChatReasoning, 'Chat',
+    `\n${modelLabel}: ${report.state}.\nOff sends no-thinking hints; some model templates think anyway.`);
   setButton(reasoningAnalysisToggle, requestAnalysisReasoning, 'Data analysis');
-  reasoningChatToggle?.classList.toggle('hidden', analysisModeActive);
-  reasoningAnalysisToggle?.classList.toggle('hidden', !analysisModeActive);
   reasoningInfoBtn?.classList.toggle('active', reasoningInfoOpen);
   reasoningInfoBtn?.setAttribute('aria-expanded', reasoningInfoOpen ? 'true' : 'false');
   if (reasoningInlineInfo) {
@@ -4023,7 +4366,7 @@ function getChatMonth(chat) {
 
 function getVisionOverrides() {
   try {
-    return JSON.parse(localStorage.getItem('modelVisionOverrides') || '{}') || {};
+    return JSON.parse(pref('modelVisionOverrides') || '{}') || {};
   } catch {
     return {};
   }
@@ -4152,8 +4495,12 @@ function buildApiMessagesForModel(messages, modelId, { forceImageDescriptionsFor
   });
 }
 
+// Calibrated against real usage from LM Studio rather than guessed: a 96,320-char concept
+// map plus preamble came back as 21,806 prompt tokens on gemma-4-26b-a4b, i.e. ~4.47
+// chars/token. The old 3.5 overstated by ~26%. Still an estimate — tokenisers differ per
+// model — but wrong by a few percent instead of a quarter.
 function estimateTokens(text) {
-  return Math.ceil((text || '').length / 3.5);
+  return Math.ceil((text || '').length / 4.4);
 }
 
 function estimateConversationTokens() {
@@ -4178,7 +4525,8 @@ function getModelContextWindow() {
 
 function updateContextBar() {
   const ctx = getModelContextWindow();
-  const tokens = estimateConversationTokens();
+  const chatTokens = estimateConversationTokens();
+  const tokens = chatTokens + lastContextSourceTokens;
   const vision = inferVisionCapability(currentModel);
   const visionLabel = vision.trusted ? 'vision model' : '';
   const modelLabel = currentModel
@@ -4186,9 +4534,14 @@ function updateContextBar() {
     : '—';
   const parts = [`◈ ${modelLabel}`];
   if (visionLabel) parts.push(visionLabel);
+  // Broken out rather than folded in silently: a jump from 2k to 46k is the layers, and
+  // seeing which half is which is what tells you to trim a layer instead of the chat.
+  const layerNote = lastContextSourceTokens > 0
+    ? `  ·  ${chatTokens.toLocaleString()} chat + ${lastContextSourceTokens.toLocaleString()} context sources`
+    : '';
 
   if (ctx <= 0) {
-    contextBarLabel.textContent = `${parts.join('  ·  ')}  ·  ~${tokens.toLocaleString()} tokens`;
+    contextBarLabel.textContent = `${parts.join('  ·  ')}  ·  ~${tokens.toLocaleString()} tokens${layerNote}`;
     contextBarFill.style.width = '0%';
     contextBarFill.classList.remove('warn');
     return;
@@ -4199,7 +4552,7 @@ function updateContextBar() {
   contextBarFill.style.width = pct + '%';
   contextBarFill.classList.toggle('warn', warn);
   contextBarLabel.textContent =
-    `${parts.join('  ·  ')}  ·  ~${tokens.toLocaleString()} / ${ctx.toLocaleString()} tokens  ·  ${pct}%`;
+    `${parts.join('  ·  ')}  ·  ~${tokens.toLocaleString()} / ${ctx.toLocaleString()} tokens  ·  ${pct}%${layerNote}`;
 }
 
 // ── Server status ──────────────────────────────────────────────────────────────
@@ -4677,7 +5030,7 @@ document.getElementById('settings-dev-console')?.addEventListener('click', () =>
 
 // ── Sidebar ────────────────────────────────────────────────────────────────────
 
-let sidebarVisible = localStorage.getItem('sidebarVisible') !== '0';
+let sidebarVisible = prefBool('sidebarVisible');
 applySidebarState(sidebarVisible, false);
 
 sidebarToggle?.addEventListener('click', () => {
@@ -5413,6 +5766,12 @@ async function loadChatById(chatId) {
   currentChat = chat;
   conversationHistory = (chat.messages || []).map(m => ({ role: m.role, content: m.content }));
   lastSavedCount = conversationHistory.length;
+  // Priming is per-chat and is not stored in the transcript, so a reopened chat re-primes
+  // from the map as it stands now. That map may differ from the one this conversation was
+  // originally primed with; re-priming is the honest option, since silently continuing on a
+  // map the current settings no longer produce would be worse than a one-off cache miss.
+  primedConceptMap = null;
+  primedConceptMapSig = '';
 
   messagesEl.innerHTML = '';
   conversationHistory.forEach((msg, i) => {
@@ -5454,6 +5813,8 @@ function startNewChat() {
   conversationHistory = [];
   lastSavedCount = 0;
   currentChatMeta = [];
+  primedConceptMap = null;
+  primedConceptMapSig = '';
   currentBranchSiblings = [];
   messagesEl.innerHTML = '';
   branchBar.innerHTML = '';
@@ -5870,7 +6231,8 @@ function formatSearchContext(queries, results, mode) {
   const queryLabel = queries.length === 1
     ? `the query "${queries[0]}"`
     : `the queries ${queries.map(q => `"${q}"`).join(', ')}`;
-  return `The user has web search enabled. Here are current web search results for ${queryLabel}. `
+  return `${contextSourceHeader('web')}\n`
+    + `The application ran ${queryLabel} against the web and retrieved these results for you; you did not run the search. `
     + `Use them to inform your answer and cite sources as [n] with their URLs when relevant. `
     + `If they are not useful, rely on your own knowledge.\n\n`
     + lines.join('\n\n');
@@ -5883,8 +6245,8 @@ function renderSearchSources(queries, results) {
   const title = document.createElement('div');
   title.className = 'search-sources-title';
   title.textContent = queries.length === 1
-    ? `Web results for "${queries[0]}"`
-    : `Web results for ${queries.length} queries`;
+    ? `${CONTEXT_SOURCES.web} · "${queries[0]}"`
+    : `${CONTEXT_SOURCES.web} · ${queries.length} queries`;
   div.appendChild(title);
 
   if (queries.length > 1) {
@@ -6043,13 +6405,18 @@ function cmSalienceCompare(a, b, weights) {
 }
 
 // Inline salience markers appended to a rendered concept line. `·N` = reference weight,
-// `★` = a most-central concept (top of the normalized range). [level] shown on flat lists.
-function cmMarkers(c, weights, showLevel) {
+// `★` = a most-central concept (top of the normalized range).
+//
+// The `[level]` tag used to be emitted here too, and is deliberately gone: the levels do
+// not mean what their names say. Canonization assigns them by how often a concept recurs,
+// not by how abstract it is — which is why "clock", "magnifier" and "bug fix" all sit at
+// macro alongside "cognitive sovereignty", and why half this graph is macro. Printing
+// `[macro]` asserted an abstraction hierarchy the data does not support.
+function cmMarkers(c, weights) {
   const info = cmSalienceOf(c, weights);
-  const lvl = showLevel ? ` [${c.level || 'concept'}]` : '';
   const w = info.weight > 0 ? ` ·${info.weight}` : '';
   const star = info.norm >= 0.5 ? ' ★' : '';
-  return `${lvl}${w}${star}`;
+  return `${w}${star}`;
 }
 
 // Smoothed inverse document frequency over the concept corpus, so distinctive tokens
@@ -6104,7 +6471,7 @@ function cmRenderTree(sortedConcepts, maxLines, weights) {
     if (lines.length >= maxLines || (c.concept_id && visited.has(c.concept_id))) return;
     if (c.concept_id) visited.add(c.concept_id);
     const label = (c.canonical_label || c.concept_id || 'Untitled').trim();
-    let line = `${'  '.repeat(depth)}- ${label}${cmMarkers(c, weights, false)}`;
+    let line = `${'  '.repeat(depth)}- ${label}${cmMarkers(c, weights)}`;
     const summary = (c.summary || '').trim();
     if (CM_SUMMARY_LEVELS.has(String(c.level || '').toLowerCase()) && summary && summary !== label) {
       line += `: ${summary.slice(0, 200)}`;
@@ -6138,7 +6505,7 @@ function cmRenderRanked(concepts, maxItems, weights, byIdAll, by) {
     const summary = (c.summary || '').trim();
     const sum = CM_SUMMARY_LEVELS.has(String(c.level || '').toLowerCase()) && summary
       ? `: ${summary.slice(0, 200)}` : '';
-    return `- ${c.canonical_label || c.concept_id}${anchor}${cmMarkers(c, weights, true)}${sum}`;
+    return `- ${c.canonical_label || c.concept_id}${anchor}${cmMarkers(c, weights)}${sum}`;
   });
   return { text: lines.join('\n'), shown: lines.length };
 }
@@ -6165,7 +6532,7 @@ function cmRenderRelevant(concepts, byIdAll, userText, maxItems, weights, idf) {
     const anchor = parent ? ` (under “${parent.canonical_label || parent.concept_id}”)` : '';
     const summary = (c.summary || '').trim();
     const sum = summary ? `: ${summary.slice(0, 220)}` : '';
-    return `- ${c.canonical_label || c.concept_id}${anchor}${cmMarkers(c, weights, true)}${sum}`;
+    return `- ${c.canonical_label || c.concept_id}${anchor}${cmMarkers(c, weights)}${sum}`;
   });
   return { text: lines.join('\n'), shown: lines.length };
 }
@@ -6181,6 +6548,22 @@ function cmRenderTimeline(events, conceptIdFilter, maxItems) {
     .join('\n');
 }
 
+// Cut the rendered map to a character budget on whole-line boundaries. Ordering has
+// already put the most salient concepts first in every arrangement, so trimming the tail
+// drops the least-central entries — the ones whose bare labels contribute vocabulary
+// without meaning. `shown` is corrected so the on-screen note reports what was really sent.
+function cmTrimToBudget(rendered, maxChars) {
+  if (!maxChars || !rendered.text || rendered.text.length <= maxChars) return rendered;
+  const kept = [];
+  let used = 0;
+  for (const line of rendered.text.split('\n')) {
+    if (used + line.length + 1 > maxChars) break;
+    kept.push(line);
+    used += line.length + 1;
+  }
+  return { text: kept.join('\n'), shown: kept.length, trimmed: true };
+}
+
 function cmDisplayName(path, graph) {
   return (graph && graph.graph_id) || path.split(/[\\/]/).pop() || 'concept map';
 }
@@ -6190,27 +6573,40 @@ function renderConceptMapNote(info) {
   div.className = 'message search-sources concept-map-note';
   const title = document.createElement('div');
   title.className = 'search-sources-title';
-  title.textContent = `Concept map memory · ${info.name}`;
+  const detail = info.kind === 'primed' ? 'primed for this chat'
+    : info.kind === 'slice' ? 'relevant entries'
+    : 'memory';
+  title.textContent = `${CONTEXT_SOURCES.map} · ${detail} · ${info.name}`;
   div.appendChild(title);
   const sub = document.createElement('div');
   sub.className = 'search-sources-queries';
-  const arrangeTag = info.mode === 'relevant' ? '' : ` · ${info.arrangement}`;
-  sub.textContent = `${info.mode}${arrangeTag} · ${info.shown}/${info.total} concepts`
-    + `${info.timeline ? ' · timeline' : ''} · levels: ${info.levels.join(', ') || 'none'}`;
+  sub.textContent = `${info.mode} · ${info.shown}/${info.total} concepts`
+    + `${info.trimmed ? ' (char ceiling)' : ''}`
+    + `${info.timeline ? ' · timeline' : ''} · levels: ${info.levels.join(', ') || 'none'}`
+    + `${conceptMapMinEvidence > 0 ? ` · min evidence ${conceptMapMinEvidence}` : ''}`;
   div.appendChild(sub);
   messagesEl.appendChild(div);
   return div;
 }
 
-// Returns a context string to inject as conceptual-anchor memory, or null.
-async function buildConceptMapContext(userText) {
-  if (!conceptMapEnabled) return null;
+const CM_LEGEND = `Legend: \`·N\` = how often a concept recurs across the user's history (higher = more often raised, which is not the same as more important); \`★\` marks the most frequently recurring. These are counts from their past conversations, not a ranking of significance.`;
+
+// Slice size for follow-up messages. Small on purpose: the whole map is already sitting in
+// the prefix, so this exists to point at the handful of entries bearing on THIS message,
+// not to restate the map. Small also means it cannot do much laundering from the
+// high-influence position next to the question.
+const CM_SLICE_MAX_CONCEPTS = 40;
+const CM_SLICE_MAX_CHARS = 4000;
+
+// Shared load + filter for both the prime and the per-message slice. Returns null (after
+// surfacing an error where one is useful) when the map cannot be built.
+async function cmPrepare({ quiet = false } = {}) {
   if (!conceptMapPath) {
-    addMessage('error', 'Concept map memory is on, but no map is selected. Pick one in Settings → Concept map.');
+    if (!quiet) addMessage('error', 'Concept map memory is on, but no map is selected. Pick one in Settings → Concept map.');
     return null;
   }
   if (!conceptMapLevels.length) {
-    addMessage('error', 'Concept map memory is on, but no levels are selected. Enable at least one in Settings → Concept map.');
+    if (!quiet) addMessage('error', 'Concept map memory is on, but no levels are selected. Enable at least one in Settings → Concept map.');
     return null;
   }
 
@@ -6218,7 +6614,7 @@ async function buildConceptMapContext(userText) {
   try {
     graph = await loadConceptGraph(conceptMapPath);
   } catch (err) {
-    addMessage('error', `Concept map failed to load: ${err?.message || err}`);
+    if (!quiet) addMessage('error', `Concept map failed to load: ${err?.message || err}`);
     return null;
   }
 
@@ -6229,68 +6625,121 @@ async function buildConceptMapContext(userText) {
   for (const c of allConcepts) if (c.concept_id) byIdAll.set(c.concept_id, c);
 
   const levelSet = new Set(conceptMapLevels);
-  const filtered = allConcepts.filter(c => levelSet.has(String(c.level || '').toLowerCase()));
-  if (!filtered.length) return null;
+  const atLevel = allConcepts.filter(c => levelSet.has(String(c.level || '').toLowerCase()));
+  if (!atLevel.length) return null;
+
+  // A graph whose concepts carry no evidence arrays scores 0 everywhere, and the threshold
+  // would then silently delete the entire map. Treat that as "this graph does not record
+  // evidence" and fall back to the unfiltered set rather than injecting nothing.
+  let filtered = atLevel.filter(c => cmEvidenceWeight(c) >= conceptMapMinEvidence);
+  if (!filtered.length) filtered = atLevel;
 
   // Salience (evidence weight) + IDF depend only on the graph, not the level filter, so
   // memoize them on the cached graph object to avoid recomputing every message.
   if (!graph.__cmWeights) graph.__cmWeights = cmComputeSalience(allConcepts);
   if (!graph.__cmIdf) graph.__cmIdf = cmBuildIdf(allConcepts);
-  const weights = graph.__cmWeights;
-  const idf = graph.__cmIdf;
+
+  return {
+    graph,
+    allConcepts,
+    filtered,
+    byIdAll,
+    weights: graph.__cmWeights,
+    idf: graph.__cmIdf,
+    name: cmDisplayName(conceptMapPath, graph),
+  };
+}
+
+// The one-time orientation: the whole map at the configured accuracy level, rendered once
+// and then frozen for the life of the chat by its caller. Goes at the head of the request,
+// which does two things at once — it keeps the prompt prefix byte-identical across turns so
+// the server's KV cache can be reused instead of re-reading ~33k tokens every message, and
+// it moves the map away from the position immediately before the question, where it was
+// exerting the most pull on the wording of answers.
+async function buildConceptMapPrime() {
+  const p = await cmPrepare();
+  if (!p) return null;
 
   const renderOverview = (maxLines) => {
-    if (conceptMapArrangement === 'salience') return cmRenderRanked(filtered, maxLines, weights, byIdAll, 'salience');
-    if (conceptMapArrangement === 'alpha') return cmRenderRanked(filtered, maxLines, weights, byIdAll, 'alpha');
-    return cmRenderTree(cmSortConcepts(filtered), maxLines, weights);
+    if (conceptMapArrangement === 'salience') return cmRenderRanked(p.filtered, maxLines, p.weights, p.byIdAll, 'salience');
+    if (conceptMapArrangement === 'alpha') return cmRenderRanked(p.filtered, maxLines, p.weights, p.byIdAll, 'alpha');
+    return cmRenderTree(cmSortConcepts(p.filtered), maxLines, p.weights);
   };
 
-  let rendered;
-  const conceptIdFilter = new Set();
-  if (conceptMapMode === 'relevant') {
-    rendered = cmRenderRelevant(filtered, byIdAll, userText, conceptMapMaxConcepts, weights, idf);
-    if (!rendered.shown) {
-      // No lexical hit — fall back to a compact overview so the anchor still helps.
-      rendered = renderOverview(Math.min(conceptMapMaxConcepts, 60));
-    } else {
-      // Collect ids of shown concepts for timeline filtering.
-      for (const c of filtered) if (c.concept_id) conceptIdFilter.add(c.concept_id);
-    }
-  } else {
-    rendered = renderOverview(conceptMapMaxConcepts);
-    for (const c of filtered) if (c.concept_id) conceptIdFilter.add(c.concept_id);
-  }
+  let rendered = cmTrimToBudget(renderOverview(conceptMapMaxConcepts), conceptMapMaxChars);
   if (!rendered.text) return null;
 
   let timeline = '';
-  if (conceptMapIncludeEvents && Array.isArray(graph.events) && graph.events.length) {
-    // In relevant mode, scope events to the shown concepts; in overview, show all (capped).
-    const filter = conceptMapMode === 'relevant' ? conceptIdFilter : null;
-    timeline = cmRenderTimeline(graph.events, filter, 40);
+  if (conceptMapIncludeEvents && Array.isArray(p.graph.events) && p.graph.events.length) {
+    timeline = cmRenderTimeline(p.graph.events, null, 40);
   }
 
-  const name = cmDisplayName(conceptMapPath, graph);
   renderConceptMapNote({
-    name,
-    mode: conceptMapMode,
-    arrangement: conceptMapArrangement,
+    kind: 'primed',
+    name: p.name,
+    mode: `overview · ${conceptMapArrangement}`,
     shown: rendered.shown,
-    total: allConcepts.length,
+    total: p.allConcepts.length,
+    trimmed: !!rendered.trimmed,
     timeline: !!timeline,
     levels: conceptMapLevels,
   });
 
-  const framing = conceptMapFraming || CM_DEFAULT_FRAMING;
-  const modeTag = conceptMapMode === 'relevant' ? 'relevant to this message' : `overview / ${conceptMapArrangement}`;
-
   const parts = [
-    framing,
-    `\n# Concept map: ${name} (${rendered.shown} of ${allConcepts.length} concepts shown · ${modeTag} · levels: ${conceptMapLevels.join(', ')})`,
-    `Legend: \`·N\` = how often a concept recurs across the user's history (higher = more central to them); \`★\` marks their most central concepts; \`[level]\` (where shown) is macro→motif granularity.`,
+    `${contextSourceHeader('map')}\n${conceptMapFraming || CM_DEFAULT_FRAMING}`,
+    `\nYou are being shown this map once, here, as orientation for the whole conversation. It is not tied to any particular message and does not need answering.`,
+    `\n### ${p.name} — ${rendered.shown} of ${p.allConcepts.length} concepts · overview / ${conceptMapArrangement} · levels: ${conceptMapLevels.join(', ')}`,
+    CM_LEGEND,
     rendered.text,
   ];
   if (timeline) parts.push(`\n## Timeline (events)\n${timeline}`);
   return parts.join('\n');
+}
+
+// The per-message slice: the few entries that bear on what was just asked, injected next to
+// the question. `standalone` is the pre-priming behaviour (relevant mode), where this is the
+// only concept-map content in the request and so carries the full framing and budget.
+async function buildConceptMapSlice(userText, { standalone = false } = {}) {
+  const p = await cmPrepare({ quiet: !standalone });
+  if (!p) return null;
+
+  const maxConcepts = standalone ? conceptMapMaxConcepts : CM_SLICE_MAX_CONCEPTS;
+  let rendered = cmRenderRelevant(p.filtered, p.byIdAll, userText, maxConcepts, p.weights, p.idf);
+
+  if (!rendered.shown) {
+    // Nothing in the map touches this message. With a primed map already in context there
+    // is nothing useful to add, so stay quiet rather than padding with a generic overview.
+    if (!standalone) return null;
+    if (conceptMapArrangement === 'salience' || conceptMapArrangement === 'alpha') {
+      rendered = cmRenderRanked(p.filtered, Math.min(conceptMapMaxConcepts, 60), p.weights, p.byIdAll, conceptMapArrangement);
+    } else {
+      rendered = cmRenderTree(cmSortConcepts(p.filtered), Math.min(conceptMapMaxConcepts, 60), p.weights);
+    }
+  }
+
+  rendered = cmTrimToBudget(rendered, standalone ? conceptMapMaxChars : CM_SLICE_MAX_CHARS);
+  if (!rendered.text) return null;
+
+  renderConceptMapNote({
+    kind: standalone ? 'relevant' : 'slice',
+    name: p.name,
+    mode: 'relevant to this message',
+    shown: rendered.shown,
+    total: p.allConcepts.length,
+    trimmed: !!rendered.trimmed,
+    timeline: false,
+    levels: conceptMapLevels,
+  });
+
+  if (standalone) {
+    return [
+      `${contextSourceHeader('map')}\n${conceptMapFraming || CM_DEFAULT_FRAMING}`,
+      `\n### ${p.name} — ${rendered.shown} of ${p.allConcepts.length} concepts · relevant to this message · levels: ${conceptMapLevels.join(', ')}`,
+      CM_LEGEND,
+      rendered.text,
+    ].join('\n');
+  }
+  return `${contextSourceHeader('map')}\nFrom the concept map you were shown at the start of this conversation, these entries touch on the message below. They are the user's own recurring topics, offered so you can pitch the answer at the right depth and connect it to what they already work on — not terminology to adopt, and not a subject to write about unless they asked about it.\n\n${rendered.text}`;
 }
 
 // ── Local library context layer ───────────────────────────────────────────────────
@@ -6378,7 +6827,7 @@ function renderLibraryNote(info) {
   div.className = 'message search-sources library-note';
   const title = document.createElement('div');
   title.className = 'search-sources-title';
-  title.textContent = `Local library · ${info.files} file${info.files === 1 ? '' : 's'}`;
+  title.textContent = `${CONTEXT_SOURCES.library} · ${info.files} file${info.files === 1 ? '' : 's'}`;
   div.appendChild(title);
   const sub = document.createElement('div');
   sub.className = 'search-sources-queries';
@@ -6435,7 +6884,7 @@ async function buildLibraryContext(userText) {
 
   const parts = [
     LIBRARY_FRAMING,
-    `\n# Local library — ${picked.length} file${picked.length === 1 ? '' : 's'} (zones: ${zoneNames.join(', ')})${libraryMode === 'all' ? '' : ' · selected as relevant to this message'}`,
+    `\n${contextSourceHeader('library')} — ${picked.length} file${picked.length === 1 ? '' : 's'} (zones: ${zoneNames.join(', ')})${libraryMode === 'all' ? '' : ' · selected as relevant to this message'}`,
   ];
   for (const [zone, items] of byZone) {
     parts.push(`\n## ${zone}`);
@@ -6489,7 +6938,7 @@ function renderHistoryNote(info) {
   div.className = 'message search-sources history-note';
   const title = document.createElement('div');
   title.className = 'search-sources-title';
-  title.textContent = `Browser history · ${info.count} entr${info.count === 1 ? 'y' : 'ies'}`;
+  title.textContent = `${CONTEXT_SOURCES.history} · ${info.count} entr${info.count === 1 ? 'y' : 'ies'}`;
   div.appendChild(title);
   const sub = document.createElement('div');
   sub.className = 'search-sources-queries';
@@ -6548,7 +6997,7 @@ async function buildHistoryContext(userText) {
 
   return [
     HISTORY_FRAMING,
-    `\n# Browser history — ${lines.length} entr${lines.length === 1 ? 'y' : 'ies'} (last ${historyDays} day${historyDays === 1 ? '' : 's'}${historyMode === 'relevant' && userText ? ', selected as relevant to this message' : ', most recent'})`,
+    `\n${contextSourceHeader('history')} — ${lines.length} entr${lines.length === 1 ? 'y' : 'ies'} (last ${historyDays} day${historyDays === 1 ? '' : 's'}${historyMode === 'relevant' && userText ? ', selected as relevant to this message' : ', most recent'})`,
     ...lines,
   ].join('\n');
 }
@@ -6607,9 +7056,23 @@ async function sendMessage() {
     webSearchContext = await runWebSearch(text, webSearchMode);
   }
 
+  // Concept map. In overview mode the map is a one-time priming of the chat: the first send
+  // with the toggle on renders it in full and freezes it, and every send after that gets
+  // only a small slice of entries relevant to that message. Once primed the map stays in
+  // the request for the rest of the chat whatever the toggle does — it is already part of
+  // what the model has seen, and removing it would invalidate the cached prefix for nothing.
+  // Relevant mode keeps the older behaviour: no prime, a fresh relevant selection each turn.
   let conceptMapContext = null;
   if (conceptMapEnabled && text) {
-    conceptMapContext = await buildConceptMapContext(text);
+    if (conceptMapMode === 'relevant') {
+      conceptMapContext = await buildConceptMapSlice(text, { standalone: true });
+    } else if (!primedConceptMap || primedConceptMapSig !== cmPrimeSignature()) {
+      const sig = cmPrimeSignature();
+      primedConceptMap = await buildConceptMapPrime();  // full map, then frozen for this chat
+      primedConceptMapSig = primedConceptMap ? sig : '';
+    } else {
+      conceptMapContext = await buildConceptMapSlice(text);
+    }
   }
 
   let libraryContext = null;
@@ -6729,15 +7192,31 @@ async function streamAssistantResponse({ forceImageDescriptionsForLastUser = fal
   // concept-map memory (long-term background), then the user's local library (curated
   // source material), then their browser history (recent activity), then web results
   // (external/current), then the user turn.
-  const injectedContexts = [conceptMapContext, libraryContext, historyContext, webSearchContext].filter(Boolean);
-  if (injectedContexts.length) {
+  // Per-message context sources go next to the newest user turn, where being adjacent to the
+  // question is the point: they are about this message.
+  const contextSources = [conceptMapContext, libraryContext, historyContext, webSearchContext].filter(Boolean);
+  if (contextSources.length) {
     let lastUserIdx = -1;
     for (let i = apiMessages.length - 1; i >= 0; i--) {
       if (apiMessages[i].role === 'user') { lastUserIdx = i; break; }
     }
     const insertAt = lastUserIdx >= 0 ? lastUserIdx : apiMessages.length;
-    apiMessages.splice(insertAt, 0, ...injectedContexts.map(content => ({ role: 'system', content })));
+    apiMessages.splice(insertAt, 0, ...contextSources.map(content => ({ role: 'system', content })));
   }
+
+  // Front matter goes at the head of the array — index 0 here, index 1 once the backend
+  // prepends the system prompt. Two reasons it belongs there rather than beside the user
+  // turn: it is identical on every request, so the whole block stays a reusable prompt
+  // prefix instead of forcing the server to re-read the map each message; and the map stops
+  // occupying the slot immediately before the question, which is where it had the most pull
+  // on how answers were worded. The preamble leads so it governs everything after it.
+  const frontMatter = [CONTEXT_SOURCES_PREAMBLE];
+  if (primedConceptMap) frontMatter.push(primedConceptMap);
+  apiMessages.unshift(...frontMatter.map(content => ({ role: 'system', content })));
+
+  lastContextSourceTokens = [...frontMatter, ...contextSources]
+    .reduce((n, c) => n + estimateTokens(c) + 4, 0);
+  updateContextBar();  // context sources dominate the real prompt; show it as soon as it's known
   const requestSentActualImages = apiMessages.some(messageHasImages);
 
   const result = await window.api.sendMessage(
@@ -6784,6 +7263,13 @@ async function streamAssistantResponse({ forceImageDescriptionsForLastUser = fal
       assistantDiv.innerHTML = renderMarkdown(finalText);
     } else if (finalText) {
       assistantDiv = addMessage('assistant', finalText);
+    }
+    // An empty reply with reasoning on and a token cap set is almost always the cap being
+    // spent entirely on thinking: measured on gemma-4-26b-a4b, a 500-token cap went 500/500
+    // to reasoning and returned no content at all. Silent by nature — the model does not
+    // report it and the reply just arrives blank — so say what happened.
+    if (!finalText.trim() && requestChatReasoning && currentMaxTokens > 0) {
+      addMessage('system', `The reply came back empty. Reasoning is on and max tokens is capped at ${currentMaxTokens.toLocaleString()}, and thinking is drawn from that same budget — it can consume all of it before any answer is written. Raise or clear the cap in Settings, or turn reasoning off.`);
     }
 
     if (finalText) {
@@ -7228,6 +7714,7 @@ async function init() {
     const savedToken = await window.api.getApiToken();
     if (settingsApiToken) settingsApiToken.value = savedToken || '';
   } catch {}
+  await initExaApiKey();
 
   await loadModels();
   await loadChats();

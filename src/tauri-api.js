@@ -51,6 +51,8 @@
     setServerUrl: (url) => invoke('set_server_url', { url }),
     getApiToken: () => invoke('get_api_token'),
     setApiToken: (token) => invoke('set_api_token', { token }),
+    getExaApiKey: () => invoke('get_exa_api_key'),
+    setExaApiKey: (key) => invoke('set_exa_api_key', { key }),
 
     saveChat: (chat, baseCount) => invoke('chat_save', { chat, baseCount }),
     listChats: () => invoke('chat_list'),

@@ -30,6 +30,11 @@ struct AppState {
     // Optional bearer token for servers that require auth (LM Studio's "require API key").
     // Empty string = send no Authorization header (the common local, no-auth case).
     api_token: Mutex<String>,
+    // Exa web-search key. Backed by a file here rather than the webview's localStorage
+    // because `tauri dev` binds the first free port from 1430 up, so each dev launch can
+    // land on a different origin with its own empty storage — which lost the key every
+    // time the frontend changed. app-data is the same directory whatever the origin.
+    exa_api_key: Mutex<String>,
     // Cache of chat_id -> file path so single-chat ops don't rescan the whole chats tree.
     // Rebuilt wholesale on a lookup miss (e.g. externally-added files) to stay correct.
     chat_index: Mutex<Option<HashMap<String, PathBuf>>>,
@@ -137,6 +142,17 @@ fn api_token_file(app: &AppHandle) -> PathBuf {
 
 fn load_api_token_from_file(app: &AppHandle) -> String {
     fs::read_to_string(api_token_file(app))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+fn exa_key_file(app: &AppHandle) -> PathBuf {
+    app_root(app).join("exa-api-key.txt")
+}
+
+fn load_exa_api_key_from_file(app: &AppHandle) -> String {
+    fs::read_to_string(exa_key_file(app))
         .ok()
         .map(|s| s.trim().to_string())
         .unwrap_or_default()
@@ -2887,9 +2903,13 @@ async fn load_model(window: WebviewWindow, state: tauri::State<'_, AppState>, mo
 #[tauri::command]
 async fn exa_search(
     window: WebviewWindow,
+    state: tauri::State<'_, AppState>,
     query: String,
     options: Option<Value>,
 ) -> Result<Value, String> {
+    // Prefer whatever the frontend passed, but fall back to the persisted key so a webview
+    // that came up on a fresh origin — a dev launch on a new port, with empty localStorage
+    // — can still search instead of reporting the key as missing.
     let api_key = options
         .as_ref()
         .and_then(|o| o.get("apiKey"))
@@ -2897,6 +2917,10 @@ async fn exa_search(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
+        .or_else(|| {
+            let stored = state.exa_api_key.lock().unwrap().clone();
+            Some(stored).filter(|s| !s.is_empty())
+        })
         .ok_or_else(|| "Missing Exa API key. Add it in Settings → General.".to_string())?;
 
     let num_results = options
@@ -3054,6 +3078,23 @@ fn set_api_token(
     let token = token.trim().to_string();
     *state.api_token.lock().unwrap() = token.clone();
     fs::write(api_token_file(&app), &token).map_err(|e| format!("Failed to save token: {e}"))?;
+    Ok(json!({ "ok": true }))
+}
+
+#[tauri::command]
+fn get_exa_api_key(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    Ok(state.exa_api_key.lock().unwrap().clone())
+}
+
+#[tauri::command]
+fn set_exa_api_key(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    key: String,
+) -> Result<Value, String> {
+    let key = key.trim().to_string();
+    *state.exa_api_key.lock().unwrap() = key.clone();
+    fs::write(exa_key_file(&app), &key).map_err(|e| format!("Failed to save Exa key: {e}"))?;
     Ok(json!({ "ok": true }))
 }
 
@@ -3897,12 +3938,14 @@ pub fn run() {
         .setup(|app| {
             let url = load_server_url_from_file(app.handle());
             let api_token = load_api_token_from_file(app.handle());
+            let exa_api_key = load_exa_api_key_from_file(app.handle());
             let state = AppState {
                 current_cancel: Mutex::new(HashMap::new()),
                 next_generation: Mutex::new(0),
                 current_model_load_cancel: Mutex::new(None),
                 server_url: Mutex::new(url),
                 api_token: Mutex::new(api_token),
+                exa_api_key: Mutex::new(exa_api_key),
                 chat_index: Mutex::new(None),
             };
             app.manage(state);
@@ -3952,6 +3995,8 @@ pub fn run() {
             get_models,
             load_model,
             exa_search,
+            get_exa_api_key,
+            set_exa_api_key,
             get_server_url,
             set_server_url,
             get_api_token,

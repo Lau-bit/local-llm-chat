@@ -364,7 +364,10 @@ const DEFAULTS = {
   webDeepCharsPerPage: '6000',
   // Concept map memory
   conceptMapEnabled: '1',
-  conceptMapPath: 'C:\\Users\\slaur\\AppData\\Roaming\\com.slaur.local-llm-chat\\data\\analysis-projects\\reconciliations\\reconciled_output_graph_reconciled_output__mru4ye0l.json',
+  // Empty on purpose: an absolute path here only exists on one machine, and anyone else
+  // running this would get an error on their first message. Blank means "use the newest
+  // graph on disk" — see cmResolvePath.
+  conceptMapPath: '',
   conceptMapMode: 'overview',
   conceptMapArrangement: 'hierarchy',
   conceptMapLevels: 'macro,topic',
@@ -375,7 +378,7 @@ const DEFAULTS = {
   // Local library
   libraryEnabled: '0',
   libraryMode: 'relevant',
-  librarySources: 'D:\\Users\\slaur\\Documents\\_devlog_.txt\n',
+  librarySources: '',  // machine-specific; set in Settings → Library
   libraryMaxChars: '24000',
   // Browser history
   historyEnabled: '1',
@@ -530,12 +533,36 @@ let conceptGraphCache = { path: null, graph: null };  // avoid re-reading the gr
 // later cannot silently leave a stale prime behind.
 let primedConceptMap = null;
 let primedConceptMapSig = '';
+// Which graph an empty conceptMapPath resolved to last time, so the prime signature can
+// notice when "newest on disk" starts pointing somewhere else.
+let conceptMapAutoPath = '';
 
 function cmPrimeSignature() {
   return [
-    conceptMapPath, conceptMapArrangement, conceptMapLevels.join(','), conceptMapMaxConcepts,
-    conceptMapMaxChars, conceptMapMinEvidence, conceptMapIncludeEvents ? 1 : 0, conceptMapFraming,
+    conceptMapPath || conceptMapAutoPath, conceptMapArrangement, conceptMapLevels.join(','),
+    conceptMapMaxConcepts, conceptMapMaxChars, conceptMapMinEvidence,
+    conceptMapIncludeEvents ? 1 : 0, conceptMapFraming,
   ].join('|');
+}
+
+// An explicit choice wins; otherwise pick a graph off disk. analysis_list_graphs already
+// sorts newest-first, so it is the head of the list — but reconciliations are preferred over
+// single-run outputs. A reconciliation is a deliberate union of runs, and it is what a map
+// is normally pinned to; without this preference the next Data Analysis run would silently
+// swap the whole chat over to that one run's narrower graph just for being newer.
+// This is what makes "concept map on by default" work on a machine that has never opened
+// Settings, and what lets the default stay free of anyone's absolute paths.
+async function cmResolvePath() {
+  if (conceptMapPath) return conceptMapPath;
+  try {
+    const res = await window.api.analysisListGraphs();
+    const graphs = Array.isArray(res?.graphs) ? res.graphs : [];
+    const pick = graphs.find(g => g.kind === 'reconciliation') || graphs[0];
+    conceptMapAutoPath = pick?.path || '';
+  } catch {
+    conceptMapAutoPath = '';
+  }
+  return conceptMapAutoPath;
 }
 
 // Default text describing the concept map when it is injected as memory. User-tunable in Settings → Concept map.
@@ -822,12 +849,14 @@ function applyConceptMapToggle() {
   conceptMapToggle.title = `Context source: ${CONTEXT_SOURCES.map} — ${conceptMapEnabled ? 'on' : 'off'}`;
 }
 
-conceptMapToggle?.addEventListener('click', () => {
+conceptMapToggle?.addEventListener('click', async () => {
   conceptMapEnabled = !conceptMapEnabled;
   localStorage.setItem('conceptMapEnabled', conceptMapEnabled ? '1' : '0');
   applyConceptMapToggle();
-  if (conceptMapEnabled && !conceptMapPath) {
-    addMessage('error', 'Concept map memory is on, but no map is selected. Pick one in Settings → Concept map.');
+  // Only complain when there is genuinely nothing to use. With no explicit selection the
+  // newest graph on disk is used, so an empty conceptMapPath is not by itself a problem.
+  if (conceptMapEnabled && !(await cmResolvePath())) {
+    addMessage('error', 'Concept map memory is on, but there are no concept maps on disk yet. Run Data Analysis to build one, or pick a map in Settings → Concept map.');
   }
 });
 
@@ -1090,7 +1119,9 @@ async function renderConceptMapSettings() {
   cmMapSelect.innerHTML = '';
   const placeholder = document.createElement('option');
   placeholder.value = '';
-  placeholder.textContent = graphs.length ? '— select a concept map —' : '— no concept maps found (run Data Analysis first) —';
+  placeholder.textContent = graphs.length
+    ? '— newest map, chosen automatically —'
+    : '— no concept maps found (run Data Analysis first) —';
   cmMapSelect.appendChild(placeholder);
 
   for (const g of graphs) {
@@ -1117,10 +1148,19 @@ async function renderConceptMapSettings() {
 
 function updateConceptMapStatus(graphs) {
   if (!cmMapStatus) return;
+  // No explicit selection is a valid state: the newest graph on disk is used. Name it, so
+  // "automatic" does not read as "nothing is happening".
   if (!conceptMapPath) {
-    cmMapStatus.textContent = conceptMapEnabled
-      ? 'No map selected — the toggle will do nothing until you pick one.'
-      : 'No map selected.';
+    const list = Array.isArray(graphs) ? graphs : [];
+    const auto = list.find(g => g.kind === 'reconciliation') || list[0];
+    if (!auto) {
+      cmMapStatus.textContent = 'No concept maps on disk yet — run Data Analysis to build one.';
+    } else {
+      const name = auto.graphId || auto.fileName || 'graph';
+      const kind = auto.kind === 'reconciliation' ? 'newest reconciled map' : 'newest map';
+      cmMapStatus.textContent = `Automatic: ${kind} on disk — ${name}, ${auto.conceptCount} concepts.`
+        + ' Pick one above to pin it instead.';
+    }
     return;
   }
   const g = Array.isArray(graphs) ? graphs.find(x => x.path === conceptMapPath) : null;
@@ -6601,8 +6641,9 @@ const CM_SLICE_MAX_CHARS = 4000;
 // Shared load + filter for both the prime and the per-message slice. Returns null (after
 // surfacing an error where one is useful) when the map cannot be built.
 async function cmPrepare({ quiet = false } = {}) {
-  if (!conceptMapPath) {
-    if (!quiet) addMessage('error', 'Concept map memory is on, but no map is selected. Pick one in Settings → Concept map.');
+  const path = await cmResolvePath();
+  if (!path) {
+    if (!quiet) addMessage('error', 'Concept map memory is on, but there are no concept maps on disk yet. Run Data Analysis to build one, or pick a map in Settings → Concept map.');
     return null;
   }
   if (!conceptMapLevels.length) {
@@ -6612,7 +6653,7 @@ async function cmPrepare({ quiet = false } = {}) {
 
   let graph;
   try {
-    graph = await loadConceptGraph(conceptMapPath);
+    graph = await loadConceptGraph(path);
   } catch (err) {
     if (!quiet) addMessage('error', `Concept map failed to load: ${err?.message || err}`);
     return null;
@@ -6646,7 +6687,7 @@ async function cmPrepare({ quiet = false } = {}) {
     byIdAll,
     weights: graph.__cmWeights,
     idf: graph.__cmIdf,
-    name: cmDisplayName(conceptMapPath, graph),
+    name: cmDisplayName(path, graph),
   };
 }
 
@@ -7067,9 +7108,11 @@ async function sendMessage() {
     if (conceptMapMode === 'relevant') {
       conceptMapContext = await buildConceptMapSlice(text, { standalone: true });
     } else if (!primedConceptMap || primedConceptMapSig !== cmPrimeSignature()) {
-      const sig = cmPrimeSignature();
       primedConceptMap = await buildConceptMapPrime();  // full map, then frozen for this chat
-      primedConceptMapSig = primedConceptMap ? sig : '';
+      // Signature taken AFTER the build, not before: an auto-resolved path is only known
+      // once cmResolvePath has run, and a signature captured beforehand would miss it and
+      // force a needless re-prime on the very next message.
+      primedConceptMapSig = primedConceptMap ? cmPrimeSignature() : '';
     } else {
       conceptMapContext = await buildConceptMapSlice(text);
     }

@@ -1597,6 +1597,18 @@ async fn post_stream(
         "stream": true
     });
 
+    // Function definitions, passed straight through when the caller supplies them. Verified
+    // working on gemma-4-26b-a4b via LM Studio: it emits tool_calls with finish_reason
+    // "tool_calls", reassembles across stream chunks, and declines to call when the question
+    // does not need the tool.
+    if let Some(tools) = options
+        .as_ref()
+        .and_then(|o| o.get("tools"))
+        .filter(|t| t.as_array().map(|a| !a.is_empty()).unwrap_or(false))
+    {
+        body["tools"] = tools.clone();
+    }
+
     if let Some(v) = options.as_ref().and_then(|o| o.get("temperature")).cloned() {
         body["temperature"] = v;
     }
@@ -1738,6 +1750,7 @@ async fn post_stream(
 
     let mut stream = response.bytes_stream();
     let mut full_content = String::new();
+    let mut tool_calls: Vec<Value> = Vec::new();
     // Raw bytes, not a String: network chunk boundaries aren't guaranteed to land on
     // UTF-8 character boundaries, so decoding each chunk independently (as before) could
     // split a multi-byte character and turn it into replacement-character garbage.
@@ -1808,6 +1821,44 @@ async fn post_stream(
                 chunk_count += 1;
                 let _ = stream_channel.send(delta.to_string());
             }
+
+            // Tool calls arrive split across chunks: the id and function name appear once,
+            // the arguments accumulate as JSON fragments, and `index` says which call each
+            // fragment belongs to. Reassemble per index rather than assuming one call, and
+            // do not forward any of it to the stream channel — it is not answer text.
+            if let Some(deltas) = json_event
+                .pointer("/choices/0/delta/tool_calls")
+                .and_then(Value::as_array)
+            {
+                for d in deltas {
+                    let idx = d.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    while tool_calls.len() <= idx {
+                        tool_calls.push(json!({
+                            "id": "", "type": "function",
+                            "function": { "name": "", "arguments": "" }
+                        }));
+                    }
+                    let slot = &mut tool_calls[idx];
+                    if let Some(id) = d.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                        slot["id"] = json!(id);
+                    }
+                    if let Some(name) = d
+                        .pointer("/function/name")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                    {
+                        slot["function"]["name"] = json!(name);
+                    }
+                    if let Some(args) = d.pointer("/function/arguments").and_then(Value::as_str) {
+                        let joined = format!(
+                            "{}{}",
+                            slot["function"]["arguments"].as_str().unwrap_or(""),
+                            args
+                        );
+                        slot["function"]["arguments"] = json!(joined);
+                    }
+                }
+            }
         }
 
         if stream_error.is_some() {
@@ -1834,7 +1885,12 @@ async fn post_stream(
         }),
     );
 
-    json!({ "content": full_content, "reasoningRequested": reasoning_preference, "reasoningFallback": reasoning_fallback })
+    json!({
+        "content": full_content,
+        "toolCalls": tool_calls,
+        "reasoningRequested": reasoning_preference,
+        "reasoningFallback": reasoning_fallback
+    })
 }
 
 async fn post_image_analysis_stream(

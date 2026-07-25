@@ -98,13 +98,19 @@ const LATEX_SUBSCRIPTS = {
 // fence has not arrived yet, but the contents are still code and must not be rewritten.
 const MD_CODE_RE = /(```[\s\S]*?```|~~~[\s\S]*?~~~|```[\s\S]*$|~~~[\s\S]*$|`[^`\n]*`)/g;
 
-// $$…$$ / $…$ / \(…\) / \[…\]. The single-$ form takes one of three shapes, none of which a
-// price can have: a lone symbol name ("$N$", "$k$" — models write these constantly in
-// "returned $N$ results"); an identifier applied to arguments ("$O(N)$", "$f(x)$", "$P(A|B)$"
-// — big-O survived an earlier version of this and showed up in testing); or a body carrying
-// a macro, superscript or subscript. So "$5 to $10" is still never read as math. The residue
-// is bare algebra with none of those markers ("$a + b$"), left as written.
-const MATH_SPAN_RE = /\$\$([\s\S]*?)\$\$|\$((?:[A-Za-z][A-Za-z0-9]{0,8}\([^()$\n]{1,24}\))|(?:[A-Za-z])|(?:[^$\n]*[\\^_][^$\n]*))\$|\\\(([\s\S]*?)\\\)|\\\[([\s\S]*?)\\\]/g;
+// $$…$$ / $…$ / \(…\) / \[…\]. The single-$ form takes one of two shapes.
+//
+// 1. A compact algebraic body: no whitespace, at least one letter, and only characters that
+//    appear in algebra. That covers everything the local models actually emit — "$N$", "$2N$",
+//    "$n/2$", "$k=100$", "$O(N)$", "$x^2$", "$H_2O$" — all of which were observed leaking
+//    through earlier versions of this rule across gemma-4-12b, -26b-a4b and -31b-qat.
+// 2. A body carrying a macro, superscript or subscript, which may contain spaces
+//    ("$T = N \times k$").
+//
+// The no-whitespace requirement in (1) is what keeps prices safe: in "$5 to $10" the span
+// between the dollars is "5 to ", and in "$1,000 and $2,000" it is "1,000 and " — both have
+// spaces, so neither can match. The letter requirement stops bare amounts ("$100$").
+const MATH_SPAN_RE = /\$\$([\s\S]*?)\$\$|\$((?:(?=[^$\n]*[A-Za-z])[A-Za-z0-9()+\-*/=,.^_|]{1,24})|(?:[^$\n]*[\\^_][^$\n]*))\$|\\\(([\s\S]*?)\\\)|\\\[([\s\S]*?)\\\]/g;
 
 // Wrappers whose whole job is styling literal words — unwrap to the words themselves.
 const LATEX_TEXT_WRAPPER_RE =
@@ -7014,12 +7020,18 @@ async function buildHistoryContext(userText) {
     return null;
   }
 
+  // The backend returns rows ordered by visit_count DESC, so "most recent" has to re-sort by
+  // last visit — otherwise it silently means "most visited", which on real history is
+  // dominated by navigation chrome ("New tab", "YouTube", "Parked") and was being handed to
+  // the model labelled as what the user had recently been looking at.
+  const byRecency = () => items.slice().sort((a, b) => (b.lastVisitMs || 0) - (a.lastVisitMs || 0));
+
   let picked;
   if (historyMode === 'relevant' && userText) {
     picked = historyRankRelevant(items, userText).slice(0, historyMaxEntries);
-    if (!picked.length) picked = items.slice(0, Math.min(historyMaxEntries, 20));  // no lexical hit → recent
+    if (!picked.length) picked = byRecency().slice(0, Math.min(historyMaxEntries, 20));  // no lexical hit → recent
   } else {
-    picked = items.slice(0, historyMaxEntries);
+    picked = byRecency().slice(0, historyMaxEntries);
   }
   if (!picked.length) return null;
 

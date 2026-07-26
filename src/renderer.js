@@ -211,6 +211,10 @@ const analysisTemp = document.getElementById('analysis-temp');
 const analysisNewRunBtn = document.getElementById('analysis-new-run-btn');
 const analysisRunSelect = document.getElementById('analysis-run-select');
 const analysisRunRefreshBtn = document.getElementById('analysis-run-refresh-btn');
+const analysisRunHealthBox = document.getElementById('analysis-run-health');
+const analysisHealthVerdict = document.getElementById('analysis-health-verdict');
+const analysisHealthMetrics = document.getElementById('analysis-health-metrics');
+const analysisHealthNote = document.getElementById('analysis-health-note');
 const analysisProcessBtn = document.getElementById('analysis-process-btn');
 const analysisReprocessBtn = document.getElementById('analysis-reprocess-btn');
 const analysisCanonizeBtn = document.getElementById('analysis-canonize-btn');
@@ -489,11 +493,24 @@ const CONTEXT_SOURCES = {
 // the only thing that stops that, and it used to be omitted in exactly that case. Constant,
 // because it sits at index 0: text that changed with the source count would invalidate the
 // cached prompt prefix — and the primed map behind it — every time a toggle moved.
-const CONTEXT_SOURCES_PREAMBLE = `Any reference material in this conversation appears as blocks headed "Context source: <name>". Those blocks were gathered by this application before you were called and placed into your context; they are not results you produced. If no such block is present, you have only this conversation and your own knowledge.
+const CS_PREAMBLE_HEAD = `Any reference material in this conversation appears as blocks headed "Context source: <name>". Those blocks were gathered by this application before you were called and placed into your context; they are not results you produced. If no such block is present, you have only this conversation and your own knowledge.`;
 
-You have no tools. You cannot search the web, browse, open URLs, run code, execute Python, query a database, or read files on demand — and you cannot observe the status, latency, environment or output of any such tool, because none ran. Never describe yourself as having called, invoked, run, orchestrated or monitored a tool. Never report tool status, execution traces, phases, or telemetry, even hypothetically or as an illustration.
+const CS_PREAMBLE_NO_TOOLS = `You have no tools. You cannot search the web, browse, open URLs, run code, execute Python, query a database, or read files on demand — and you cannot observe the status, latency, environment or output of any such tool, because none ran. Never describe yourself as having called, invoked, run, orchestrated or monitored a tool. Never report tool status, execution traces, phases, or telemetry, even hypothetically or as an illustration.`;
 
-If you are asked about your tools or their state, answer plainly: name the context sources you were given and say that the application retrieved them for you. Anything not present in this context or in your own knowledge, you do not know — say so instead of constructing a plausible account of it.`;
+// Swapped in for the paragraph above when concept_search is genuinely attached (the concept
+// map's on-demand mode). The denial has to be narrowed rather than dropped: the confabulation
+// it prevents is about *other* tools, and a model handed one real function will otherwise
+// narrate a whole toolchain around it. Everything either variant says stays literally true of
+// the request it ships with, which is the only reason this preamble works at all.
+const CS_PREAMBLE_ONE_TOOL = `You have exactly one tool: concept_search, which looks up entries in the user's own concept map. Call it when the answer depends on what this particular user works on or already knows, and answer directly when it does not. It is your only tool — you cannot search the web, browse, open URLs, run code, execute Python, query a database, or read files, and you cannot observe the status, latency or environment of any tool. Never describe yourself as having called, invoked, run, orchestrated or monitored anything other than concept_search, and never report tool status, execution traces, phases, or telemetry.`;
+
+const CS_PREAMBLE_TAIL = `If you are asked about your tools or their state, answer plainly: name the context sources you were given and say that the application retrieved them for you. Anything not present in this context or in your own knowledge, you do not know — say so instead of constructing a plausible account of it.`;
+
+const CONTEXT_SOURCES_PREAMBLE = [CS_PREAMBLE_HEAD, CS_PREAMBLE_NO_TOOLS, CS_PREAMBLE_TAIL].join('\n\n');
+// The variant is chosen per request from whether tools are attached, not per turn, so within
+// one chat it is still byte-identical and the prefix stays cacheable. It only changes when the
+// user changes concept-map mode mid-chat, which already invalidates the prefix anyway.
+const CONTEXT_SOURCES_PREAMBLE_TOOL = [CS_PREAMBLE_HEAD, CS_PREAMBLE_ONE_TOOL, CS_PREAMBLE_TAIL].join('\n\n');
 
 // Header every source block carries, so the name the model reads is the same name the user
 // clicked and the same name on the note in the transcript.
@@ -505,10 +522,13 @@ function contextSourceHeader(key) {
 // Experimental: inject a map of the user's own concepts (from Data Analysis output
 // graphs) so the model can calibrate what the user knows. In overview mode the map primes
 // the chat once (buildConceptMapPrime) and later messages get a small relevant slice
-// (buildConceptMapSlice); relevant mode injects a fresh selection every message instead.
+// (buildConceptMapSlice); relevant mode injects a fresh selection every message instead;
+// on-demand mode injects nothing at all and hands the model a concept_search function to
+// pull entries with (cmConceptSearch, driven by the tool loop in streamAssistantResponse).
+const CM_MODES = ['overview', 'relevant', 'ondemand'];
 let conceptMapEnabled = prefBool('conceptMapEnabled');
 let conceptMapPath = pref('conceptMapPath');
-let conceptMapMode = pref('conceptMapMode');  // 'overview' | 'relevant'
+let conceptMapMode = CM_MODES.includes(pref('conceptMapMode')) ? pref('conceptMapMode') : 'overview';
 // Overview arrangement, mirroring the 3D vector-map viewer's layouts: 'hierarchy' (tree),
 // 'salience' (most-referenced first, like its "size" layout), 'alpha'.
 let conceptMapArrangement = ['hierarchy', 'salience', 'alpha'].includes(pref('conceptMapArrangement'))
@@ -539,6 +559,9 @@ let conceptGraphCache = { path: null, graph: null };  // avoid re-reading the gr
 // later cannot silently leave a stale prime behind.
 let primedConceptMap = null;
 let primedConceptMapSig = '';
+// On-demand mode forces reasoning off (see the tool loop). Say so once per chat rather than
+// on every send — it is a standing consequence of the mode, not a per-message event.
+let cmToolReasoningNoticed = false;
 // Which graph an empty conceptMapPath resolved to last time, so the prime signature can
 // notice when "newest on disk" starts pointing somewhere else.
 let conceptMapAutoPath = '';
@@ -886,7 +909,8 @@ if (cmLevelsGroup) {
 }
 
 cmModeSelect?.addEventListener('change', () => {
-  conceptMapMode = cmModeSelect.value === 'relevant' ? 'relevant' : 'overview';
+  conceptMapMode = CM_MODES.includes(cmModeSelect.value) ? cmModeSelect.value : 'overview';
+  cmModeSelect.value = conceptMapMode;
   localStorage.setItem('conceptMapMode', conceptMapMode);
 });
 
@@ -1701,8 +1725,141 @@ async function loadAnalysisRuns() {
     localStorage.setItem(analysisStorageKey('activeAnalysisRunId'), activeAnalysisRunId || '');
     await refreshAnalysisPaths();
     await refreshAnalysisRunProgress();
+    refreshAnalysisRunHealth();
   } finally {
     setAnalysisLoading(false);
+  }
+}
+
+// Thresholds come from measured runs on real exports, not from taste: a clean pass on this
+// machine sat at 0.1% repeated rows / 0% self-parents / 2% unknown ids, while a degenerate
+// one on the same model and code hit 40.9% / 19.8% / 26.4%. "warn" is set well above the
+// clean run's noise floor so a healthy pass never cries wolf.
+const RUN_HEALTH_CHECKS = [
+  {
+    key: 'repeatedPct',
+    label: 'repeated topic rows',
+    warn: 5,
+    bad: 20,
+    why: 'the extractor emitted the same TOPIC block more than once in a single chunk',
+  },
+  {
+    key: 'selfParentPct',
+    label: 'self-parenting rows',
+    warn: 5,
+    bad: 15,
+    why: 'rows naming themselves as their own parent, which flattens the hierarchy',
+  },
+  {
+    key: 'unknownRecordPct',
+    label: 'unknown record ids',
+    warn: 10,
+    bad: 20,
+    why: 'cited evidence ids that do not exist in this dataset',
+  },
+];
+
+function runHealthGrade(value, check) {
+  if (!Number.isFinite(value)) return 'unknown';
+  if (value >= check.bad) return 'bad';
+  if (value >= check.warn) return 'warn';
+  return 'good';
+}
+
+function renderRunHealth(health, { pending = false, error = '', idle = '' } = {}) {
+  if (!analysisRunHealthBox) return;
+  analysisRunHealthBox.classList.remove('is-good', 'is-warn', 'is-bad', 'is-idle');
+  analysisHealthMetrics.innerHTML = '';
+
+  if (idle) {
+    analysisRunHealthBox.classList.add('is-idle');
+    analysisHealthVerdict.textContent = idle;
+    analysisHealthNote.textContent = '';
+    return;
+  }
+  if (pending) {
+    analysisRunHealthBox.classList.add('is-idle');
+    analysisHealthVerdict.textContent = 'checking…';
+    analysisHealthNote.textContent = '';
+    return;
+  }
+  if (error) {
+    analysisRunHealthBox.classList.add('is-idle');
+    analysisHealthVerdict.textContent = 'unavailable';
+    analysisHealthNote.textContent = error;
+    return;
+  }
+  if (!health || !health.hasResults) {
+    analysisRunHealthBox.classList.add('is-idle');
+    analysisHealthVerdict.textContent = 'no topic pass yet';
+    analysisHealthNote.textContent = 'Run Process Topics, then this reports what the extractor actually produced.';
+    return;
+  }
+
+  const grades = [];
+  for (const check of RUN_HEALTH_CHECKS) {
+    // Record-id validation needs the dataset's chunks; say so rather than showing a
+    // reassuring 0% when the file is missing.
+    const checked = check.key !== 'unknownRecordPct' || health.recordIdsChecked;
+    const value = checked ? Number(health[check.key]) : NaN;
+    const grade = checked ? runHealthGrade(value, check) : 'unknown';
+    grades.push(grade);
+    const el = document.createElement('span');
+    el.className = `analysis-health-metric is-${grade}`;
+    el.textContent = checked ? `${value.toFixed(1)}% ${check.label}` : `${check.label} not checked`;
+    el.title = check.why;
+    analysisHealthMetrics.appendChild(el);
+  }
+
+  const total = Number(health.totalChunks) || 0;
+  const done = Number(health.processedChunks) || 0;
+  const partial = total > 0 && done < total;
+  const coverage = document.createElement('span');
+  coverage.className = `analysis-health-metric is-${partial ? 'warn' : 'good'}`;
+  coverage.textContent = `${done}/${total || '?'} chunks covered`;
+  coverage.title = partial
+    ? 'This run has not seen the whole dataset — a graph built from it is a sample, not the corpus.'
+    : 'Every chunk in the dataset has a topic result.';
+  analysisHealthMetrics.appendChild(coverage);
+  if (partial) grades.push('warn');
+
+  const worst = grades.includes('bad') ? 'bad' : grades.includes('warn') ? 'warn' : 'good';
+  analysisRunHealthBox.classList.add(`is-${worst}`);
+  analysisHealthVerdict.textContent = worst === 'bad'
+    ? 'Degraded'
+    : worst === 'warn' ? 'Check before use' : 'Healthy';
+
+  if (worst === 'bad') {
+    analysisHealthNote.textContent =
+      'Canonization discards this noise, so the graph will be sound — but the topics the model failed to '
+      + 'extract are simply absent, and only re-processing this dataset can recover them. Do not reconcile '
+      + 'a degraded run into a clean graph: reconciliation unions, so the worse input wins on volume.';
+  } else if (worst === 'warn') {
+    analysisHealthNote.textContent = partial && grades.filter(g => g === 'warn').length === 1
+      ? 'Partial coverage: fine for a test slice, misleading if you read the graph as your whole history.'
+      : 'Slightly above a clean run. Usable, but compare against another run before building on it.';
+  } else {
+    analysisHealthNote.textContent = 'Extractor output looks clean for this run.';
+  }
+}
+
+async function refreshAnalysisRunHealth() {
+  if (!analysisRunHealthBox) return;
+  if (!activeAnalysisDatasetId || !activeAnalysisRunId) {
+    renderRunHealth(null, { idle: activeAnalysisDatasetId ? 'no run selected' : 'no dataset selected' });
+    return;
+  }
+  const datasetId = activeAnalysisDatasetId;
+  const runId = activeAnalysisRunId;
+  renderRunHealth(null, { pending: true });
+  try {
+    const health = await window.api.analysisRunHealth(datasetId, runId);
+    // The user can switch runs while a first, uncached scan of a large dataset is running.
+    if (datasetId !== activeAnalysisDatasetId || runId !== activeAnalysisRunId) return;
+    renderRunHealth(health);
+  } catch (err) {
+    if (datasetId !== activeAnalysisDatasetId || runId !== activeAnalysisRunId) return;
+    renderRunHealth(null, { error: `Could not read run health: ${err?.message || err}` });
   }
 }
 
@@ -2985,6 +3142,9 @@ async function processAnalysisTopics(options = {}) {
     return;
   }
   const phaseDurationMs = performance.now() - phaseStartedAt;
+  // Re-read health here specifically: this is the moment the extractor's output is final,
+  // and it is the last point before canonization where re-processing is still the cheap fix.
+  refreshAnalysisRunHealth();
   analysisLogLine(`Topic phase finished in ${formatDuration(phaseDurationMs)}. Total elapsed ${formatDuration(performance.now() - totalStartedAt)}.`);
   analysisResultLine('Topic phase complete', [
     `duration ${formatDuration(phaseDurationMs)}`,
@@ -3037,14 +3197,28 @@ function addUniqueLimited(values, additions, limit) {
   return out;
 }
 
-function deterministicGraphFromTopicResults(datasetId, runId, results, profile) {
+// options.validRecordIds  Set of record ids the dataset actually contains. When given,
+//                         cited ids outside it are dropped as extractor noise.
+// options.conceptLimit    how many concepts survive the final ranking (default 900).
+// options.evidenceChunks  how many evidence rows to store per concept (default 8). This
+//                         only bounds the stored sample — `evidence_totals` stays exact.
+// Results may carry `source_dataset`; when they do, each concept records which sources
+// contributed to it. Callers combining several datasets MUST namespace `chunk_id` per
+// dataset first: chunk ids are assigned per dataset (`chunk_000048` exists in all of
+// them), so unprefixed ids from different providers collide and undercount evidence.
+function deterministicGraphFromTopicResults(datasetId, runId, results, profile, options = {}) {
   const concepts = new Map();
   const parentEdges = new Map();
   const events = [];
   const chunkConceptIds = new Map();
+  const validRecordIds = options.validRecordIds instanceof Set ? options.validRecordIds : null;
+  const conceptLimit = Math.max(1, options.conceptLimit || 900);
+  const evidenceChunks = Math.max(1, options.evidenceChunks || 8);
+  const recordsPerChunk = Math.max(1, options.recordsPerChunk || 4);
 
   for (const result of results || []) {
     const chunkIdsForEvent = [];
+    const sourceTag = sanitizeFastField(result.source_dataset || '', 60);
     for (const topic of result.topics || []) {
       const label = sanitizeFastField(topic.label || topic.canonical_label, 120);
       if (!label) continue;
@@ -3060,8 +3234,11 @@ function deterministicGraphFromTopicResults(datasetId, runId, results, profile) 
         subtopics: [],
         evidence: [],
         _count: 0,
-        _summary_chars: 0
+        _summary_chars: 0,
+        _ev: new Map(),
+        _sources: new Set()
       };
+      if (sourceTag) existing._sources.add(sourceTag);
       existing._count += 1;
       existing.canonical_label = chooseCanonicalLabel(existing.canonical_label, label);
       existing.aliases = addUniqueLimited(existing.aliases, [label, ...(topic.aliases || [])], 8);
@@ -3071,8 +3248,14 @@ function deterministicGraphFromTopicResults(datasetId, runId, results, profile) 
         existing._summary_chars = summary.length;
       }
       existing.subtopics = addUniqueLimited(existing.subtopics, topic.subtopics || [], 12);
-      if (topic.parent_label) {
-        const parentId = normalizeConceptId(conceptMergeKey(topic.parent_label));
+      // A self-parent is not a hierarchy. The extractor echoes the label back as its own
+      // parent on some datasets (19.8% of rows on the openai export); accepting it makes
+      // a concept its own ancestor, and the self-edge is dropped downstream anyway, which
+      // strands the concept at the root and flattens the whole tree.
+      const parentId = topic.parent_label
+        ? normalizeConceptId(conceptMergeKey(topic.parent_label))
+        : '';
+      if (parentId && parentId !== conceptId) {
         existing.parent_id = existing.parent_id || parentId;
         parentEdges.set(`${parentId}->${conceptId}`, {
           source: parentId,
@@ -3091,19 +3274,34 @@ function deterministicGraphFromTopicResults(datasetId, runId, results, profile) 
             subtopics: [label],
             evidence: [],
             _count: 0,
-            _summary_chars: 0
+            _summary_chars: 0,
+            _ev: new Map(),
+            // A parent synthesized from a child's parent_label is still evidenced by the
+            // dataset that produced that child; without this it lands in the graph with
+            // no provenance at all (7,092 of 23,811 concepts on the 3-provider build).
+            _sources: new Set(sourceTag ? [sourceTag] : [])
           });
         } else {
           const parent = concepts.get(parentId);
           parent.subtopics = addUniqueLimited(parent.subtopics, [label], 12);
+          if (sourceTag) parent._sources.add(sourceTag);
         }
       }
+      // Evidence accumulates per chunk, not per TOPIC row. The extractor repeats whole
+      // topic blocks verbatim on some datasets (40.9% of rows on the openai export) and
+      // an unkeyed push counted every copy as fresh evidence. Deduping BEFORE the cap
+      // matters more than it looks: the cap keeps the FIRST rows, so copies used to fill
+      // the quota and lock a concept onto a single chunk no matter what came later.
       if (topic.evidence_record_ids?.length) {
-        existing.evidence.push({
-          chunk_id: result.chunk_id,
-          record_ids: topic.evidence_record_ids.slice(0, 4)
-        });
-        existing.evidence = existing.evidence.slice(0, 8);
+        const bucket = existing._ev.get(result.chunk_id) || new Set();
+        for (const rid of topic.evidence_record_ids) {
+          if (bucket.size >= recordsPerChunk) break;
+          const clean = sanitizeFastField(rid, 60);
+          // An id the dataset has never contained is model noise, not evidence — 26.4%
+          // of cited ids on the openai export, some of them prose fragments.
+          if (clean && (!validRecordIds || validRecordIds.has(clean))) bucket.add(clean);
+        }
+        if (bucket.size) existing._ev.set(result.chunk_id, bucket);
       }
       concepts.set(conceptId, existing);
       chunkIdsForEvent.push(conceptId);
@@ -3123,26 +3321,66 @@ function deterministicGraphFromTopicResults(datasetId, runId, results, profile) 
     }
   }
 
+  // Exact and uncapped totals; `evidence` is only a stored sample for traceability, so
+  // anything ranking or filtering on weight must read the totals instead of counting rows.
+  const materialize = (concept) => {
+    const clean = { ...concept };
+    const ev = concept._ev || new Map();
+    let recordTotal = 0;
+    for (const ids of ev.values()) recordTotal += ids.size;
+    clean.evidence_totals = { chunks: ev.size, records: recordTotal };
+    clean.evidence = [...ev.entries()]
+      .slice(0, evidenceChunks)
+      .map(([chunk_id, ids]) => ({ chunk_id, record_ids: [...ids] }));
+    if (concept._sources && concept._sources.size) clean.sources = [...concept._sources].sort();
+    clean.aliases = (clean.aliases || []).filter(alias => alias && alias !== clean.canonical_label).slice(0, 8);
+    clean.summary = clean.summary || clean.canonical_label;
+    delete clean._count;
+    delete clean._summary_chars;
+    delete clean._ev;
+    delete clean._sources;
+    return clean;
+  };
+
   const conceptList = [...concepts.values()]
-    .map(concept => {
-      const clean = { ...concept };
-      clean.aliases = (clean.aliases || []).filter(alias => alias && alias !== clean.canonical_label).slice(0, 8);
-      clean.summary = clean.summary || clean.canonical_label;
-      delete clean._count;
-      delete clean._summary_chars;
-      return clean;
-    })
+    .map(materialize)
     .sort((a, b) => {
-      const ac = (a.evidence || []).length + (a.aliases || []).length;
-      const bc = (b.evidence || []).length + (b.aliases || []).length;
+      // Rank on true totals, not stored rows. Rows are capped, so ranking by them ties
+      // every saturated concept at the ceiling and lets a narrow one that hit the cap
+      // outrank a concept genuinely spread across far more of the history.
+      const ac = a.evidence_totals.chunks + a.evidence_totals.records + (a.aliases || []).length;
+      const bc = b.evidence_totals.chunks + b.evidence_totals.records + (b.aliases || []).length;
       return bc - ac || a.canonical_label.localeCompare(b.canonical_label);
     })
-    .slice(0, 900);
+    .slice(0, conceptLimit);
+
+  // Ranking is by evidence, but a parent synthesized from a child's parent_label carries
+  // no evidence of its own and so always ranks last. Cutting on rank alone therefore
+  // deletes the macro layer and strands every survivor at the root — the hierarchy
+  // collapses precisely because the ranking worked. Pull the ancestors of kept concepts
+  // back in; `conceptLimit` bounds the evidenced set, not the tree that explains it.
+  const byId = new Map([...concepts.values()].map(c => [c.concept_id, c]));
+  const kept = new Map(conceptList.map(c => [c.concept_id, c]));
+  for (const concept of conceptList) {
+    let parentId = concept.parent_id;
+    // Bounded by depth, and guarded against a parent cycle the extractor could produce.
+    for (let hops = 0; parentId && hops < 12; hops++) {
+      if (kept.has(parentId)) break;
+      const ancestor = byId.get(parentId);
+      if (!ancestor) break;
+      const added = materialize(ancestor);
+      kept.set(parentId, added);
+      conceptList.push(added);
+      parentId = ancestor.parent_id;
+    }
+  }
 
   const conceptIds = new Set(conceptList.map(c => c.concept_id));
+  // Scaled to the concept count: a flat 1000 silently truncated the tree as soon as the
+  // graph grew past the old fixed 900-concept ceiling.
   const edges = [...parentEdges.values()]
     .filter(edge => conceptIds.has(edge.source) && conceptIds.has(edge.target))
-    .slice(0, 1000);
+    .slice(0, Math.max(1000, conceptList.length * 2));
 
   return {
     schema_version: '0.1.0',
@@ -3739,7 +3977,7 @@ function reconcileGraphs(graphA, graphB, options = {}) {
     let summary = '';
     let aliases = [];
     let subtopics = [];
-    const evidence = [];
+    const evidenceByChunk = new Map();
 
     for (const node of ranked) {
       sources.add(node.set);
@@ -3753,15 +3991,21 @@ function reconcileGraphs(graphA, graphB, options = {}) {
       if (s && s.length > summary.length) summary = s;
       aliases = addUniqueLimited(aliases, [sanitizeFastField(c.canonical_label, 140), ...(c.aliases || [])], 16);
       subtopics = addUniqueLimited(subtopics, c.subtopics || [], 18);
+      // Keyed by set+chunk, like aliases and subtopics are keyed by value. This was the
+      // one field merged with a bare push, so every near-duplicate node in a merge group
+      // donated another copy of the same row and evidence weight multiplied per merge.
+      // Set-qualified because chunk ids are per-dataset and collide across sets.
       for (const ev of c.evidence || []) {
-        if (evidence.length >= 12) break;
-        if (ev && typeof ev === 'object') {
-          evidence.push({
-            set: node.set,
-            chunk_id: ev.chunk_id,
-            record_ids: Array.isArray(ev.record_ids) ? ev.record_ids.slice(0, 6) : [],
-          });
+        if (!ev || typeof ev !== 'object') continue;
+        const key = `${node.set}:${ev.chunk_id}`;
+        const bucket = evidenceByChunk.get(key) || { set: node.set, chunk_id: ev.chunk_id, ids: new Set() };
+        if (Array.isArray(ev.record_ids)) {
+          for (const rid of ev.record_ids) {
+            if (bucket.ids.size >= 6) break;
+            bucket.ids.add(rid);
+          }
         }
+        evidenceByChunk.set(key, bucket);
       }
     }
 
@@ -3779,7 +4023,17 @@ function reconcileGraphs(graphA, graphB, options = {}) {
         aliases: aliases.filter(a => a && a.toLowerCase() !== (canonicalLabel || '').toLowerCase()).slice(0, 14),
         summary: summary || canonicalLabel || mergedId,
         subtopics: subtopics.slice(0, 16),
-        evidence: evidence.slice(0, 12),
+        evidence: [...evidenceByChunk.values()]
+          .slice(0, 12)
+          .map(e => ({ set: e.set, chunk_id: e.chunk_id, record_ids: [...e.ids] })),
+        // Counted off the deduped map. These are a lower bound: the inputs store only a
+        // capped sample of their own evidence, so a reconciled total can never exceed
+        // what its inputs kept. Canonizing the datasets together in one pass gives exact
+        // totals; reconciling two finished graphs cannot.
+        evidence_totals: {
+          chunks: evidenceByChunk.size,
+          records: [...evidenceByChunk.values()].reduce((n, e) => n + e.ids.size, 0),
+        },
         sources: sourceList,
       },
     });
@@ -4063,6 +4317,7 @@ analysisRunSelect?.addEventListener('change', async () => {
   localStorage.setItem(analysisStorageKey('activeAnalysisRunId'), activeAnalysisRunId);
   await refreshAnalysisPaths();
   await refreshAnalysisRunProgress();
+  refreshAnalysisRunHealth();
 });
 analysisOpenOutputBtn?.addEventListener('click', async () => {
   const paths = activeAnalysisPaths || await refreshAnalysisPaths();
@@ -5818,6 +6073,7 @@ async function loadChatById(chatId) {
   // map the current settings no longer produce would be worse than a one-off cache miss.
   primedConceptMap = null;
   primedConceptMapSig = '';
+  cmToolReasoningNoticed = false;
 
   messagesEl.innerHTML = '';
   conversationHistory.forEach((msg, i) => {
@@ -5861,6 +6117,7 @@ function startNewChat() {
   currentChatMeta = [];
   primedConceptMap = null;
   primedConceptMapSig = '';
+  cmToolReasoningNoticed = false;
   currentBranchSiblings = [];
   messagesEl.innerHTML = '';
   branchBar.innerHTML = '';
@@ -6406,14 +6663,25 @@ function cmConceptSearchText(c) {
 // The viewer sizes each node by evidence weight = (# record refs) + (# evidence chunks),
 // normalized to the graph max. We reuse the exact same signal so the model's sense of
 // "what's central to the user" matches what the user sees in the 3D map.
+// Graphs canonized after the evidence-dedup fix carry exact, uncapped totals; their
+// `evidence` array is only a stored sample, so counting rows would undercount them. Older
+// graphs have no totals AND repeat rows, so the fallback dedups by chunk before counting
+// rather than trusting row count — otherwise a concept seen once in one chunk can outrank
+// everything else purely because the extractor emitted its line eight times.
 function cmEvidenceWeight(c) {
-  let records = 0;
-  let chunks = 0;
-  for (const e of (Array.isArray(c.evidence) ? c.evidence : [])) {
-    chunks += 1;
-    records += Array.isArray(e.record_ids) ? e.record_ids.length : 0;
+  const totals = c && c.evidence_totals;
+  if (totals && Number.isFinite(totals.chunks) && Number.isFinite(totals.records)) {
+    return totals.chunks + totals.records;
   }
-  return records + chunks;
+  const byChunk = new Map();
+  for (const e of (Array.isArray(c.evidence) ? c.evidence : [])) {
+    const key = `${e.set || ''}:${e.chunk_id}`;
+    if (!byChunk.has(key)) byChunk.set(key, new Set());
+    for (const rid of (Array.isArray(e.record_ids) ? e.record_ids : [])) byChunk.get(key).add(rid);
+  }
+  let records = 0;
+  for (const ids of byChunk.values()) records += ids.size;
+  return records + byChunk.size;
 }
 
 // Per-concept salience index over the WHOLE graph: reference weight (as above), child
@@ -6789,6 +7057,262 @@ async function buildConceptMapSlice(userText, { standalone = false } = {}) {
   return `${contextSourceHeader('map')}\nFrom the concept map you were shown at the start of this conversation, these entries touch on the message below. They are the user's own recurring topics, offered so you can pitch the answer at the right depth and connect it to what they already work on — not terminology to adopt, and not a subject to write about unless they asked about it.\n\n${rendered.text}`;
 }
 
+// ── On-demand concept map: the concept_search tool ────────────────────────────────
+// The third mode. Instead of putting the map in front of the model — ~22k tokens of it in
+// overview mode — nothing is injected and the model is given one function to pull entries
+// with. It is the most direct lever available on vocabulary bleed short of changing the
+// analysis pipeline: a handful of concepts the model actually asked for cannot laundered
+// into an answer the way a thousand ambient lines of framework vocabulary can.
+//
+// Costs, so the trade is visible: an extra round trip whenever the model does search, and
+// reasoning off for the whole exchange (see the tool loop). It also puts retrieval in the
+// model's hands, so a question it misjudges gets no map at all — which is the point in one
+// direction and a regression in the other.
+
+const CM_TOOL_NAME = 'concept_search';
+const CM_TOOL_DEFAULT_LIMIT = 8;
+const CM_TOOL_MAX_LIMIT = 25;
+// Rounds of call → result → call allowed before the tool is withdrawn and the model has to
+// answer with what it has. Three covers "broad look, then a narrower follow-up" with room to
+// spare; the cap exists because a model that keeps re-querying otherwise never answers.
+const CM_TOOL_MAX_ROUNDS = 3;
+
+const CM_TOOL_DEF = {
+  type: 'function',
+  function: {
+    name: CM_TOOL_NAME,
+    description: "Search the user's own concept map — the topics they have thought and written about, distilled by this application from their past conversations — and return the matching entries with short descriptions. Call it when the answer depends on what this particular user works on, cares about, or already knows. Query the subject the user actually asked about. Use \"*\" only when the question is about their interests in general; it returns their most frequently recurring concepts overall, which have nothing to do with any specific subject.",
+    parameters: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: 'The subject to look for, in a few words — normally the subject of the question. Use "*" only for a general picture of what they think about.',
+        },
+        limit: {
+          type: 'integer',
+          description: `Maximum entries to return (default ${CM_TOOL_DEFAULT_LIMIT}, maximum ${CM_TOOL_MAX_LIMIT}).`,
+        },
+      },
+      required: ['query'],
+    },
+  },
+};
+
+// Queries with nothing specific to match on. The model really does this — the feasibility
+// test caught it opening with concept_search({"query":"*"}) — and lexical retrieval returns
+// nothing for those, from which it concluded the map was empty. Broad queries are answered
+// from salience instead, which is the honest answer to "what does this user think about".
+const CM_WILDCARD_QUERY = /^[\s*%_.…"'?-]*$/;
+// Tested against the query's tokens, not the raw string. "my topics" survives the regex above
+// but lexically matches the two concepts that happen to contain the word "topics" — which is
+// worse than returning nothing, because those two then stand as the answer to "what does this
+// user think about". A query whose every meaningful token is one of these is asking for the
+// map in general, whatever its phrasing. Short words ("my", "me") and question words ("what",
+// "how", "about") are already dropped by cmTokens as stopwords or by length.
+const CM_BROAD_TOKENS = new Set([
+  'all', 'any', 'anything', 'everything', 'general', 'generally', 'overview', 'summary',
+  'topic', 'topics', 'concept', 'concepts', 'interest', 'interests', 'theme', 'themes',
+  'subject', 'subjects', 'area', 'areas', 'domain', 'domains', 'user', 'mine', 'main',
+  'primary', 'key', 'important', 'idea', 'ideas', 'thing', 'things', 'stuff', 'everyone',
+  'think', 'thinks', 'thinking', 'thought', 'thoughts', 'know', 'knows', 'care', 'cares',
+  'work', 'works', 'map', 'everybody',
+]);
+
+function cmIsBroadQuery(q, tokens) {
+  if (!q || CM_WILDCARD_QUERY.test(q)) return true;
+  if (!tokens.size) return true;
+  for (const t of tokens) if (!CM_BROAD_TOKENS.has(t)) return false;
+  return true;
+}
+
+function cmToolEntry(c, byIdAll, weights) {
+  const parent = c.parent_id ? byIdAll.get(c.parent_id) : null;
+  const summary = String(c.summary || '').trim();
+  const entry = {
+    concept: c.canonical_label || c.concept_id,
+    recurrence: cmSalienceOf(c, weights).weight,
+  };
+  if (parent) entry.under = parent.canonical_label || parent.concept_id;
+  if (summary) entry.summary = summary.slice(0, 300);
+  return entry;
+}
+
+function renderConceptSearchNote(info) {
+  const div = document.createElement('div');
+  div.className = 'message search-sources concept-map-note';
+  const title = document.createElement('div');
+  title.className = 'search-sources-title';
+  title.textContent = `${CONTEXT_SOURCES.map} · searched by the model · ${info.name}`;
+  div.appendChild(title);
+  const sub = document.createElement('div');
+  sub.className = 'search-sources-queries';
+  sub.textContent = info.matched === 'none'
+    ? `“${info.query}” → nothing in the map matches (${info.total} concepts searched)`
+    : info.matched === 'blocked'
+      ? `“${info.query}” → declined · general list withheld after a miss on this question`
+      : `“${info.query}” → ${info.shown} of ${info.total} concepts`
+        + (info.matched === 'salience' ? ' · broad query, most-recurring returned' : '');
+  div.appendChild(sub);
+  messagesEl.appendChild(div);
+  return div;
+}
+
+// Runs against the same level / minimum-evidence filtered set the injected modes use, so what
+// the model can reach is exactly what the user configured — the mode changes when the map is
+// consulted, not which parts of it exist.
+//
+// `state` carries what has already been searched during THIS send (see cmNewToolState), which
+// is what makes the guard below possible.
+async function cmConceptSearch({ query, limit } = {}, state = null) {
+  const p = await cmPrepare({ quiet: true });
+  if (!p) {
+    return {
+      error: 'No concept map is available. Answer from the conversation and your own knowledge, and say the map was unavailable if it matters.',
+      concepts: [],
+    };
+  }
+
+  const n = Math.min(CM_TOOL_MAX_LIMIT, Math.max(1, parseInt(limit, 10) || CM_TOOL_DEFAULT_LIMIT));
+  const q = String(query ?? '').trim();
+  const queryTokens = new Set(cmTokens(q));
+  let matched = 'lexical';
+  let picked = [];
+
+  if (cmIsBroadQuery(q, queryTokens)) {
+    matched = 'salience';
+  } else {
+    // A longer query has to be matched on more than one of its words. One token in three is
+    // usually coincidence, and coincidence here is expensive: "kubernetes ingress controller"
+    // hit two concepts about game controllers on the strength of "controller" alone, which
+    // the model would then have taken as the user's view of Kubernetes. Short queries keep the
+    // single-token rule — there is nothing else to go on.
+    const minMatched = queryTokens.size >= 3 ? 2 : 1;
+    const scored = [];
+    for (const c of p.filtered) {
+      let lex = 0;
+      let hits = 0;
+      for (const t of new Set(cmTokens(cmConceptSearchText(c)))) {
+        if (queryTokens.has(t)) { lex += p.idf(t); hits += 1; }
+      }
+      if (hits >= minMatched) scored.push({ c, score: lex * (1 + 0.35 * cmSalienceOf(c, p.weights).norm) });
+    }
+    scored.sort((a, b) => b.score - a.score
+      || String(a.c.canonical_label || '').localeCompare(String(b.c.canonical_label || '')));
+    picked = scored.slice(0, n).map(x => x.c);
+    // A specific query that matched nothing does NOT fall back to salience. Handing back the
+    // user's top concepts because they asked about, say, Kubernetes would park their personal
+    // vocabulary next to a question it has nothing to do with — the exact laundering this mode
+    // exists to prevent, and worse here than in the injected modes because the model asked for
+    // it and will treat it as an answer. Report the miss instead; the risk of an empty list
+    // reading as an empty map is handled by saying outright that it is not one.
+    if (!picked.length) matched = 'none';
+  }
+
+  // The guard that prose could not enforce. Measured: asked about Kubernetes ingress, the model
+  // searched for it specifically, was told the map has nothing on it — and said so, correctly —
+  // then immediately searched "*", took the general list, and framed Kubernetes through the
+  // user's personal concepts anyway. Warnings in the note did not stop it, because the material
+  // was there and the model wanted something to connect to. So after a miss in the same send,
+  // the general list stops being available: there is nothing to connect, and the honest answer
+  // is the one it had already reached.
+  if (matched === 'salience' && state && state.missed.length) {
+    renderConceptSearchNote({ query: q || '*', matched: 'blocked', shown: 0, total: p.allConcepts.length, name: p.name });
+    return {
+      query: q || '*',
+      matched: 'blocked',
+      returned: 0,
+      total_concepts: p.allConcepts.length,
+      concepts: [],
+      note: `You already searched this map for "${state.missed[state.missed.length - 1]}" and it holds nothing on that subject. A general list of the user's most recurring concepts is not a substitute for that answer — those concepts have no bearing on what was asked, and connecting them to it would misrepresent the user. The map has nothing to contribute to this question: say so plainly and answer from your own knowledge.`,
+    };
+  }
+
+  if (matched === 'salience') {
+    picked = p.filtered.slice().sort((a, b) => cmSalienceCompare(a, b, p.weights)).slice(0, n);
+  }
+  if (matched === 'none' && state) state.missed.push(q);
+
+  const RECURRENCE_NOTE = '"recurrence" counts how often a concept comes up across the user\'s past conversations — a frequency count, not a ranking of importance.';
+  // The broad-query warning is doing real work, not being polite. Measured: asked "given what I
+  // usually work on, how should I approach Kubernetes ingress controllers", the model queried
+  // "*", got this list, and framed Kubernetes in terms of the user's personal concepts — the
+  // very laundering this mode exists to prevent, arriving through the fallback that was added
+  // to stop a different failure. The list is unavoidably general, so it has to say so.
+  const note = matched === 'lexical'
+    ? `These entries matched your query. ${RECURRENCE_NOTE}`
+    : matched === 'salience'
+      ? `This is a general list: the user's most frequently recurring concepts overall, NOT results for any particular subject. ${RECURRENCE_NOTE} If the question was about a specific subject, these concepts are almost certainly unrelated to it — do not frame that subject in their terms, and search again with the subject itself as the query. Use this list only when the question really is about the user's interests in general.`
+      : `The map holds ${p.filtered.length} concepts at the levels in use and none of them matched "${q}". The map is NOT empty — this subject simply is not in it, which means the user has not written about it. Answer from your own knowledge, and do not substitute their other concepts for it. If you think it is there under different words, you may search once more with different terms.`;
+
+  renderConceptSearchNote({
+    query: q || '*',
+    matched,
+    shown: picked.length,
+    total: p.allConcepts.length,
+    name: p.name,
+  });
+
+  // "no match" is a real, useful answer, so it is reported as one rather than as an error —
+  // the model is told the subject is absent and to answer from its own knowledge.
+
+  return {
+    query: q || '*',
+    matched,
+    returned: picked.length,
+    total_concepts: p.allConcepts.length,
+    concepts: picked.map(c => cmToolEntry(c, p.byIdAll, p.weights)),
+    note,
+  };
+}
+
+// Arguments arrive as a JSON string reassembled from stream fragments, so a malformed one is
+// a real possibility. Hand every failure back as a tool result rather than throwing: the model
+// can then correct the call or answer without it, where an exception would kill the send.
+async function cmExecuteToolCall(call, state = null) {
+  const name = call?.function?.name || '';
+  if (name !== CM_TOOL_NAME) {
+    return { error: `Unknown tool "${name}". The only tool available is ${CM_TOOL_NAME}.` };
+  }
+  const raw = call?.function?.arguments || '';
+  let args = {};
+  if (raw.trim()) {
+    try {
+      args = JSON.parse(raw);
+    } catch {
+      return { error: `Could not parse those arguments as JSON: ${raw.slice(0, 200)}. Retry with an object like {"query": "..."}.` };
+    }
+  }
+  try {
+    return await cmConceptSearch(args, state);
+  } catch (err) {
+    return { error: `${CM_TOOL_NAME} failed: ${err?.message || err}` };
+  }
+}
+
+// One per send. Scoped to the send rather than the chat because the guard it drives is about
+// one question: a miss on an earlier turn says nothing about what this turn may legitimately
+// look up.
+function cmNewToolState() {
+  return { missed: [] };
+}
+
+// The tool ships only in on-demand mode. In overview mode the whole map is already in the
+// prefix and in relevant mode a slice is attached to the message, so offering a search there
+// would only let the model re-fetch what it has been handed.
+async function cmToolsForRequest() {
+  if (!conceptMapEnabled || conceptMapMode !== 'ondemand') return null;
+  // Switching a primed chat over to on-demand does not un-prime it — the map stays in the
+  // request for the rest of that chat, because the model has already seen it and dropping it
+  // would invalidate the cached prefix for nothing. But then the whole map IS in the prompt,
+  // so attaching a search over it is redundant and says something untrue: the preamble would
+  // announce a tool for looking up what is already sitting in front of the model. Measured
+  // before this guard: 91,685 chars of map plus `concept_search`, in the same request.
+  if (primedConceptMap) return null;
+  if (!(await cmResolvePath())) return null;
+  return [CM_TOOL_DEF];
+}
+
 // ── Local library context layer ───────────────────────────────────────────────────
 // Each source line is "Zone label | path" or just "path" (zone defaults to the basename).
 function libParseSources(text) {
@@ -7115,8 +7639,10 @@ async function sendMessage() {
   // the request for the rest of the chat whatever the toggle does — it is already part of
   // what the model has seen, and removing it would invalidate the cached prefix for nothing.
   // Relevant mode keeps the older behaviour: no prime, a fresh relevant selection each turn.
+  // On-demand mode injects nothing here at all — streamAssistantResponse attaches
+  // concept_search instead and the model pulls what it wants through the tool loop.
   let conceptMapContext = null;
-  if (conceptMapEnabled && text) {
+  if (conceptMapEnabled && text && conceptMapMode !== 'ondemand') {
     if (conceptMapMode === 'relevant') {
       conceptMapContext = await buildConceptMapSlice(text, { standalone: true });
     } else if (!primedConceptMap || primedConceptMapSig !== cmPrimeSignature()) {
@@ -7241,6 +7767,24 @@ async function streamAssistantResponse({ forceImageDescriptionsForLastUser = fal
     maxTokens: currentMaxTokens > 0 ? currentMaxTokens : undefined,
     reasoningRequested: requestChatReasoning,
   };
+
+  // On-demand concept map: attach concept_search and let the model pull what it needs.
+  const conceptTools = await cmToolsForRequest();
+  if (conceptTools) {
+    options.tools = conceptTools;
+    // Measured on gemma-4-26b-a4b: with thinking on, reasoning spends the entire max_tokens
+    // budget and the reply arrives empty with finish_reason "length" and no tool call at all.
+    // The failure is silent — the model simply never calls — so reasoning is forced off for
+    // the whole exchange rather than just the first round, since every round can call.
+    if (options.reasoningRequested) {
+      options.reasoningRequested = false;
+      if (!cmToolReasoningNoticed) {
+        cmToolReasoningNoticed = true;
+        addMessage('system', 'Reasoning is off for this chat: the concept map is set to "On demand", and with thinking on the model spends its whole token budget reasoning and never issues the search. Switch the map to "Prime once" or "Relevant only" in Settings to use reasoning.');
+      }
+    }
+  }
+  const reasoningSent = options.reasoningRequested;
   const requestHadImages = conversationHistory.some(messageHasImages);
   const apiMessages = buildApiMessagesForModel(conversationHistory, currentModel, { forceImageDescriptionsForLastUser });
   // Inject extra context as system messages just before the last user turn. Order:
@@ -7265,35 +7809,92 @@ async function streamAssistantResponse({ forceImageDescriptionsForLastUser = fal
   // prefix instead of forcing the server to re-read the map each message; and the map stops
   // occupying the slot immediately before the question, which is where it had the most pull
   // on how answers were worded. The preamble leads so it governs everything after it.
-  const frontMatter = [CONTEXT_SOURCES_PREAMBLE];
+  // The tool variant is truthful only when a tool is actually attached, so it is picked from
+  // options.tools rather than from the mode — a chat where the map resolves to nothing gets
+  // the plain "you have no tools" text, which is then still exactly right.
+  const frontMatter = [options.tools ? CONTEXT_SOURCES_PREAMBLE_TOOL : CONTEXT_SOURCES_PREAMBLE];
   if (primedConceptMap) frontMatter.push(primedConceptMap);
   apiMessages.unshift(...frontMatter.map(content => ({ role: 'system', content })));
 
-  lastContextSourceTokens = [...frontMatter, ...contextSources]
+  let promptExtraTokens = [...frontMatter, ...contextSources]
     .reduce((n, c) => n + estimateTokens(c) + 4, 0);
+  if (options.tools) promptExtraTokens += estimateTokens(JSON.stringify(options.tools)) + 4;
+  lastContextSourceTokens = promptExtraTokens;
   updateContextBar();  // context sources dominate the real prompt; show it as soon as it's known
   const requestSentActualImages = apiMessages.some(messageHasImages);
 
-  const result = await window.api.sendMessage(
-    apiMessages,
-    options,
-    (chunk) => {
-      if (generation.stopped) return;
-      if (!assistantDiv) {
-        thinkingIndicator.remove();
-        assistantDiv = document.createElement('div');
-        assistantDiv.className = 'message assistant';
-        messagesEl.appendChild(assistantDiv);
-      }
-      streamedText += chunk;
-      if (!rafPending) {
-        rafPending = true;
-        requestAnimationFrame(renderStreamedMarkdown);
-      }
+  function handleChunk(chunk) {
+    if (generation.stopped) return;
+    if (!assistantDiv) {
+      thinkingIndicator?.remove();
+      assistantDiv = document.createElement('div');
+      assistantDiv.className = 'message assistant';
+      messagesEl.appendChild(assistantDiv);
     }
-  );
+    streamedText += chunk;
+    if (!rafPending) {
+      rafPending = true;
+      requestAnimationFrame(renderStreamedMarkdown);
+    }
+  }
 
-  if (generation.stopped) return;
+  // Tool loop. Without concept_search attached this runs exactly once and breaks on the first
+  // result, which is every mode but on-demand. With it attached the model may answer straight
+  // away or ask for a search first; each round gets its own message bubble so the search note
+  // lands between them in the transcript rather than above text that arrived after it.
+  let result;
+  let toolRounds = 0;
+  const priorRoundTexts = [];
+  const toolState = cmNewToolState();
+
+  for (;;) {
+    result = await window.api.sendMessage(apiMessages, options, handleChunk);
+    if (generation.stopped) return;
+    if (result?.error || result?.cancelled) break;
+
+    const calls = (Array.isArray(result.toolCalls) ? result.toolCalls : [])
+      .filter(c => c?.function?.name);
+    // No call, or a call arriving after the tool was withdrawn (nothing left to feed it) —
+    // either way this round's text is the answer.
+    if (!calls.length || !options.tools) break;
+
+    // Close this round's bubble, and take the spinner down, before the search notes are
+    // appended — both are at the end of the message list, so anything still standing would
+    // end up above a note describing something that happened after it.
+    if (streamedText.trim() && assistantDiv) {
+      assistantDiv.innerHTML = renderMarkdown(streamedText);
+      priorRoundTexts.push(streamedText);
+    } else if (assistantDiv) {
+      assistantDiv.remove();
+    }
+    streamedText = '';
+    assistantDiv = null;
+    thinkingIndicator?.remove();
+    thinkingIndicator = null;
+
+    apiMessages.push({ role: 'assistant', content: result.content || '', tool_calls: calls });
+    for (const call of calls) {
+      const output = await cmExecuteToolCall(call, toolState);   // renders its own note itself
+      const content = JSON.stringify(output);
+      promptExtraTokens += estimateTokens(content) + 4;
+      apiMessages.push({
+        role: 'tool',
+        tool_call_id: call.id || '',
+        name: call.function.name,
+        content,
+      });
+    }
+    if (generation.stopped) return;
+
+    toolRounds += 1;
+    // Withdraw the tool once the cap is reached so the next round has to be an answer —
+    // the server keeps returning tool_calls for as long as tools are offered.
+    if (toolRounds >= CM_TOOL_MAX_ROUNDS) delete options.tools;
+
+    lastContextSourceTokens = promptExtraTokens;
+    updateContextBar();
+    thinkingIndicator = createThinkingIndicator();
+  }
 
   finishStreaming();
   if (result?.reasoningFallback) {
@@ -7313,18 +7914,25 @@ async function streamAssistantResponse({ forceImageDescriptionsForLastUser = fal
     // A completed response means LM Studio has this model loaded — record it so we
     // don't redundantly reload it later.
     loadedModel = options.model || currentModel || loadedModel;
-    const finalText = streamedText || result?.content || '';
+    // Only this round goes into this round's bubble; earlier rounds already have theirs, and
+    // re-rendering the joined text here would duplicate them on screen.
+    const roundText = streamedText || result?.content || '';
     if (assistantDiv) {
-      assistantDiv.innerHTML = renderMarkdown(finalText);
-    } else if (finalText) {
-      assistantDiv = addMessage('assistant', finalText);
+      assistantDiv.innerHTML = renderMarkdown(roundText);
+    } else if (roundText) {
+      assistantDiv = addMessage('assistant', roundText);
     }
+    const finalText = [...priorRoundTexts, roundText].filter(t => t.trim()).join('\n\n');
     // An empty reply with reasoning on and a token cap set is almost always the cap being
     // spent entirely on thinking: measured on gemma-4-26b-a4b, a 500-token cap went 500/500
     // to reasoning and returned no content at all. Silent by nature — the model does not
-    // report it and the reply just arrives blank — so say what happened.
-    if (!finalText.trim() && requestChatReasoning && currentMaxTokens > 0) {
+    // report it and the reply just arrives blank — so say what happened. Keyed to what was
+    // actually sent, not to the setting: on-demand mode forces reasoning off, and blaming
+    // thinking for an empty reply there would send the user after the wrong thing.
+    if (!finalText.trim() && reasoningSent && currentMaxTokens > 0) {
       addMessage('system', `The reply came back empty. Reasoning is on and max tokens is capped at ${currentMaxTokens.toLocaleString()}, and thinking is drawn from that same budget — it can consume all of it before any answer is written. Raise or clear the cap in Settings, or turn reasoning off.`);
+    } else if (!finalText.trim() && toolRounds > 0) {
+      addMessage('system', `The concept map was searched ${toolRounds === 1 ? 'once' : `${toolRounds} times`}, but no answer followed. The token budget may be going on the searches — raise or clear the max-tokens cap in Settings, or switch the concept map out of "On demand".`);
     }
 
     if (finalText) {

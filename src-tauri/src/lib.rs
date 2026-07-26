@@ -2,7 +2,7 @@ use base64::{engine::general_purpose, Engine as _};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     fs,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
@@ -2632,6 +2632,154 @@ fn analysis_list_graphs(app: AppHandle) -> Result<Value, String> {
     Ok(json!({ "graphs": out }))
 }
 
+// Set of every record id a dataset actually contains, cached per dataset and invalidated on
+// (mtime, len). chunks.jsonl reaches 77 MB on the largest dataset here, so re-reading it for
+// every run selection would make the health readout too slow to run automatically — and a
+// readout you have to ask for does not catch the run you did not think to check.
+static RECORD_ID_CACHE: Mutex<Option<HashMap<String, (u64, u64, std::sync::Arc<HashSet<String>>)>>> =
+    Mutex::new(None);
+
+fn dataset_record_ids(
+    app: &AppHandle,
+    dataset_id: &str,
+) -> Result<std::sync::Arc<HashSet<String>>, String> {
+    let path = chunks_path(app, dataset_id);
+    let meta = fs::metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let len = meta.len();
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    {
+        let guard = RECORD_ID_CACHE.lock().map_err(|e| e.to_string())?;
+        if let Some(map) = guard.as_ref() {
+            if let Some((cached_mtime, cached_len, ids)) = map.get(dataset_id) {
+                if *cached_mtime == mtime && *cached_len == len {
+                    return Ok(ids.clone());
+                }
+            }
+        }
+    }
+
+    let file = fs::File::open(&path).map_err(|e| e.to_string())?;
+    let mut ids = HashSet::new();
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(|e| e.to_string())?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(&line) {
+            if let Some(arr) = v.get("record_ids").and_then(Value::as_array) {
+                for r in arr {
+                    if let Some(s) = r.as_str() {
+                        ids.insert(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let ids = std::sync::Arc::new(ids);
+
+    let mut guard = RECORD_ID_CACHE.lock().map_err(|e| e.to_string())?;
+    guard
+        .get_or_insert_with(HashMap::new)
+        .insert(dataset_id.to_string(), (mtime, len, ids.clone()));
+    Ok(ids)
+}
+
+// Quality of a run's topic pass, measured off the saved results rather than inferred.
+// Computed in Rust and streamed so the whole check stays cheap enough to run on every run
+// selection. The four numbers are the ones that actually separated a clean run from a
+// degenerate one on this machine: verbatim-repeated TOPIC rows, self-parenting, cited record
+// ids the dataset never contained, and coverage.
+#[tauri::command]
+fn analysis_run_health(
+    app: AppHandle,
+    dataset_id: String,
+    run_id: String,
+) -> Result<Value, String> {
+    let valid_ids = dataset_record_ids(&app, &dataset_id).unwrap_or_default();
+    let known_ids = !valid_ids.is_empty();
+    let total_chunks = count_jsonl(&chunks_path(&app, &dataset_id));
+
+    let results_path = run_dir(&app, &dataset_id, &run_id).join("pass_topic_chunks.jsonl");
+    if !results_path.exists() {
+        return Ok(json!({
+            "hasResults": false,
+            "totalChunks": total_chunks,
+            "processedChunks": 0
+        }));
+    }
+
+    let file = fs::File::open(&results_path).map_err(|e| e.to_string())?;
+    let mut processed: HashSet<String> = HashSet::new();
+    let (mut topic_rows, mut repeated_rows, mut self_parent_rows) = (0u64, 0u64, 0u64);
+    let (mut cited_ids, mut unknown_ids) = (0u64, 0u64);
+
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(|e| e.to_string())?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if let Some(cid) = v.get("chunk_id").and_then(Value::as_str) {
+            processed.insert(cid.to_string());
+        }
+        let Some(topics) = v.get("topics").and_then(Value::as_array) else {
+            continue;
+        };
+        // Repetition is counted per chunk result: the failure mode is the model emitting the
+        // same block twice in ONE response, not the same label recurring across the corpus.
+        let mut seen: HashSet<String> = HashSet::new();
+        for t in topics {
+            topic_rows += 1;
+            let label = t.get("label").and_then(Value::as_str).unwrap_or("").to_lowercase();
+            let level = t.get("level").and_then(Value::as_str).unwrap_or("").to_lowercase();
+            if !seen.insert(format!("{label}|{level}")) {
+                repeated_rows += 1;
+            }
+            if let Some(parent) = t.get("parent_label").and_then(Value::as_str) {
+                if !parent.is_empty() && parent.to_lowercase() == label {
+                    self_parent_rows += 1;
+                }
+            }
+            if let Some(ids) = t.get("evidence_record_ids").and_then(Value::as_array) {
+                for id in ids {
+                    if let Some(s) = id.as_str() {
+                        cited_ids += 1;
+                        if known_ids && !valid_ids.contains(s) {
+                            unknown_ids += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let rate = |n: u64, d: u64| if d == 0 { 0.0 } else { (n as f64) * 100.0 / (d as f64) };
+    Ok(json!({
+        "hasResults": topic_rows > 0,
+        "totalChunks": total_chunks,
+        "processedChunks": processed.len(),
+        "topicRows": topic_rows,
+        "repeatedRows": repeated_rows,
+        "repeatedPct": rate(repeated_rows, topic_rows),
+        "selfParentRows": self_parent_rows,
+        "selfParentPct": rate(self_parent_rows, topic_rows),
+        "citedRecordIds": cited_ids,
+        "unknownRecordIds": unknown_ids,
+        "unknownRecordPct": rate(unknown_ids, cited_ids),
+        // False when the dataset's chunks are missing, so the UI can say "not checked"
+        // instead of reporting a reassuring 0%.
+        "recordIdsChecked": known_ids
+    }))
+}
+
 #[tauri::command]
 fn analysis_save_reconciliation(
     app: AppHandle,
@@ -4040,6 +4188,7 @@ pub fn run() {
             analysis_save_graph,
             analysis_read_graph,
             analysis_list_graphs,
+            analysis_run_health,
             analysis_save_reconciliation,
             analysis_append_log,
             analysis_paths,

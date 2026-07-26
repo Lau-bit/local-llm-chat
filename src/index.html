@@ -238,6 +238,7 @@
               <select id="cm-mode">
                 <option value="overview">Prime once — whole map at the start of a chat, then relevant slices</option>
                 <option value="relevant">Relevant only — concepts related to each message, no priming</option>
+                <option value="ondemand">On demand — nothing injected; the model searches the map itself</option>
               </select>
             </div>
             <div class="settings-hint" style="margin: 4px 0 12px;">
@@ -249,6 +250,18 @@
               vocabulary into unrelated answers — asked how to structure error handling in Tauri, it framed the answer
               around personal frameworks, where priming gave a straight technical answer.
               Prefer priming unless you want the map kept deliberately weak.
+            </div>
+            <div class="settings-hint" style="margin: 4px 0 12px;">
+              <strong>On demand</strong> puts none of the map in the prompt and gives the model a
+              <code>concept_search</code> function instead, so it pulls a handful of entries only when it judges the
+              question needs them — the strongest available check on your vocabulary bleeding into unrelated answers,
+              since nothing is in front of the model unless it asked. The trade: an extra round trip whenever it does
+              search, a question it misjudges gets no map at all, and <strong>reasoning is forced off</strong> — with
+              thinking on the model spends its whole token budget reasoning and never issues the search. Needs a model
+              that supports tool calling; verified on gemma-4-26b-a4b.
+              When the map holds nothing on what you asked, the search returns nothing and says so rather than offering
+              your other topics instead — so the model answers from its own knowledge instead of bending the subject
+              towards your usual ones. Each search appears in the transcript with what it looked for and what came back.
             </div>
 
             <label class="settings-label">Arrangement <span class="settings-hint">(overview ordering, like the 3D map's layouts)</span></label>
@@ -468,6 +481,14 @@
               <button id="analysis-new-run-btn">New Run</button>
               <select id="analysis-run-select"></select>
               <button id="analysis-run-refresh-btn">Load Run</button>
+            </div>
+            <div id="analysis-run-health" class="analysis-run-health" aria-live="polite">
+              <div class="analysis-health-head">
+                <span class="analysis-health-title">Run health</span>
+                <span id="analysis-health-verdict" class="analysis-health-verdict">—</span>
+              </div>
+              <div id="analysis-health-metrics" class="analysis-health-metrics"></div>
+              <div id="analysis-health-note" class="analysis-health-note"></div>
             </div>
             <div class="analysis-run-actions">
               <div class="analysis-actions-row analysis-run-primary-actions">

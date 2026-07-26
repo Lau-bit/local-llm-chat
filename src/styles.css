@@ -1279,6 +1279,79 @@ body.analysis-mode #analysis-container:not(.hidden) {
 .analysis-actions-row select { flex: 1; }
 .analysis-actions-row button { flex: 0 1 auto; }
 
+/* Run health — sits between picking a run and acting on it, because that is the moment the
+   answer changes what you do next. Colour carries the verdict; the numbers stay readable
+   without it. */
+.analysis-run-health {
+  margin: 10px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: 6px;
+  background: var(--panel-bg, rgba(127, 127, 127, 0.05));
+  font-size: 12px;
+}
+
+.analysis-health-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.analysis-health-title {
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  font-size: 11px;
+  opacity: 0.75;
+}
+
+.analysis-health-verdict { font-weight: 700; }
+
+.analysis-health-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.analysis-health-metric {
+  padding: 1px 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  white-space: nowrap;
+  cursor: help;
+}
+
+.analysis-health-note {
+  margin-top: 6px;
+  opacity: 0.72;
+  line-height: 1.45;
+}
+
+.analysis-health-note:empty { display: none; }
+
+.analysis-run-health.is-good { border-left-color: var(--accent-secondary); }
+.analysis-run-health.is-warn { border-left-color: var(--accent); }
+.analysis-run-health.is-bad {
+  border-left-color: var(--danger);
+  background: var(--danger-bg-subtle);
+}
+.analysis-run-health.is-idle { border-left-color: var(--border); }
+
+.analysis-run-health.is-good .analysis-health-verdict { color: var(--accent-secondary); }
+.analysis-run-health.is-warn .analysis-health-verdict { color: var(--accent); }
+.analysis-run-health.is-bad .analysis-health-verdict { color: var(--danger-text); }
+
+.analysis-health-metric.is-good { border-color: var(--accent-secondary); }
+.analysis-health-metric.is-warn { border-color: var(--accent); color: var(--accent); }
+.analysis-health-metric.is-bad {
+  border-color: var(--danger);
+  color: var(--danger-text);
+  font-weight: 600;
+}
+.analysis-health-metric.is-unknown { opacity: 0.6; }
+
 .analysis-run-actions {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;

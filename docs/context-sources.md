@@ -1,9 +1,14 @@
 # Context sources — design and measured behaviour
 
 The app has four **context sources**: Web search, Concept map, Local library, Browser history.
-They are not tools. Nothing is invoked by the model — each source is built by the app *before* the
-request is sent and injected as a `system` message. This document records how they are assembled and
-what was measured on real hardware, so the design decisions are not re-derived from scratch.
+Each is built by the app *before* the request is sent and injected as a `system` message — the model
+invokes nothing and is told so explicitly. This document records how they are assembled and what was
+measured on real hardware, so the design decisions are not re-derived from scratch.
+
+The one exception is the concept map's **on-demand mode**, where the map is not injected at all and
+the model is handed a single `concept_search` function to pull entries with. That mode is the only
+place in the app where the model calls anything, and the preamble is swapped for a variant that says
+so. Everything else on this page describes the injected path.
 
 Terminology is deliberately shared across three surfaces — `CONTEXT_SOURCES` in `renderer.js` is the
 single source of truth for the composer tooltip, the in-chat note, and the `## Context source: <name>`
@@ -39,6 +44,92 @@ leave a stale prime behind).
 
 `relevant` mode skips priming entirely and injects a fresh selection each message.
 
+#### Priming mid-chat
+
+Priming is not tied to the first message of a chat — it happens on the first *send* that needs it,
+whenever that falls. Verified against the running app by intercepting the outgoing request:
+
+| mid-chat action | result |
+|---|---|
+| map switched on at turn 3 | primes on turn 3; full map at index 1, "primed for this chat" note |
+| level/render setting changed | re-primes, new content (64,968 → 91,685 chars) |
+| `ondemand` → `overview` | primes on the next send |
+| chat closed and reopened | re-primes on the next send |
+| later turn whose words match | prime *and* a per-message slice both ride along |
+
+Turning the map **off** mid-chat does not remove an existing prime, and re-enabling does not
+re-prime — once the model has seen the map, dropping it would invalidate the cached prefix for
+nothing. Switching a primed chat to `ondemand` keeps the prime and, because the whole map is then
+already in the prompt, **withholds `concept_search`** (`cmToolsForRequest` returns null when
+`primedConceptMap` is set). Without that guard the request carried 91,685 chars of map alongside a
+tool for looking it up, and a preamble announcing a search over content already in front of the model.
+
+### Concept map: on demand (`ondemand`)
+
+The third mode injects nothing and attaches one function instead:
+
+```
+concept_search(query: string, limit?: integer) → { concepts: [...], matched, note }
+```
+
+The model calls it when it judges the question needs the user's own context, and a JS loop in
+`streamAssistantResponse` executes the call, appends the assistant message plus a `role: "tool"`
+result, and re-sends. Each round streams into its own message bubble so the search note in the
+transcript lands between them rather than above text that arrived after it.
+
+Why the mode exists: injection puts the map in front of the model whether or not it is wanted, and
+that is where personal vocabulary leaks into unrelated answers. Eight concepts the model asked for
+cannot do that the way a thousand ambient lines of framework vocabulary can. What it costs: an extra
+round trip whenever the model does search, retrieval moved into the model's judgement (a question it
+misreads gets no map at all), and reasoning forced off.
+
+Three constraints are designed in, each from a measured failure:
+
+- **Reasoning is forced off whenever the tool is attached.** With thinking on, reasoning consumes the
+  whole `max_tokens` budget and the reply arrives empty with `finish_reason: "length"` and *no tool
+  call at all*. The failure is silent — the model simply never calls — so the app forces it off for
+  the entire exchange and says so once per chat.
+- **Broad queries are answered from salience, not lexical matching.** The model opens with
+  `concept_search({"query": "*"})`; IDF matching returns nothing for that, and the model reads an
+  empty list as an empty map. `cmIsBroadQuery()` tests the query's *tokens* — a string test lets
+  `"my topics"` through to lexically match the concepts that merely contain the word "topics", which
+  is worse than returning nothing, because those then stand as the answer.
+- **The tool is withdrawn at `CM_TOOL_MAX_ROUNDS` (3).** The server keeps returning `tool_calls` for
+  as long as tools are offered, so the cap is what forces an answer.
+
+Malformed arguments — a real possibility, since they are reassembled from stream fragments — come back
+to the model as an error tool result rather than throwing, so it can correct the call or answer
+without it.
+
+#### Three results, and why "no match" is not one of the fallbacks
+
+`concept_search` returns `matched: "lexical" | "salience" | "none" | "blocked"`.
+
+A **specific query that matches nothing returns `none` and no concepts at all.** It deliberately does
+*not* fall back to salience: handing back the user's most recurring concepts because they asked about
+a subject they have never touched parks their personal vocabulary next to an unrelated question, which
+is the laundering this whole mode exists to prevent — and worse here than in the injected modes,
+because the model asked for it and treats it as an answer. The risk that an empty list reads as an
+empty map is handled by the note saying outright that it is not one, and stating how many concepts
+were searched.
+
+Matching also requires **two matched tokens once a query has three or more**. One token in three is
+usually coincidence, and coincidence is expensive: `"kubernetes ingress controller"` matched two
+concepts about *game* controllers on the strength of "controller" alone, which the model would have
+taken as the user's view of Kubernetes. Short queries keep the single-token rule, and a wordy natural
+-language query still reaches its concept because it only needs two.
+
+`blocked` is the structural guard, and it is there because prose was measured failing. Asked *"given
+what I usually work on, how should I approach Kubernetes ingress controllers?"*, the model searched
+the subject specifically, was told the map holds nothing on it, **said so correctly** — and then
+searched `"*"`, took the general list, and framed Kubernetes through the user's personal concepts
+anyway. Strengthening the warning in the note did not stop it: the material was present and the model
+wanted something to connect to. So within one send (`cmNewToolState()`, scoped per send because a miss
+on an earlier turn says nothing about this one), a broad query *after* a miss returns nothing and says
+why. With the guard in place the same question is answered *"I cannot tailor an approach to your
+existing workflows… here is a general framework"*, which is the correct answer. A specific retry after
+a miss is unaffected.
+
 ## Measured on gemma-4-26b-a4b (RTX 5090, 100% GPU offload)
 
 Model explicitly loaded with `lms load --gpu max -c 65536` (16.76 GiB resident). **Load configuration
@@ -73,6 +164,16 @@ tools in this conversation… I cannot search the web, browse URLs, run code, or
 The text is constant rather than varying with the source count, because it sits at index 0 — text that
 changed as toggles moved would invalidate the cached prefix, and the primed map behind it, on every
 change.
+
+There are two variants, and which one ships is decided by whether a tool is actually attached to that
+request — not by the concept map's mode, so a chat whose map resolves to nothing still gets the plain
+text, which is then still exactly right. `CONTEXT_SOURCES_PREAMBLE_TOOL` replaces the blanket "you have
+no tools" paragraph with one that names `concept_search` and then denies everything else in the same
+breath. Narrowing the denial rather than dropping it is deliberate: the confabulation it prevents is
+about *other* tools, and a model handed one real function will otherwise narrate a whole toolchain
+around it. Both variants keep the same three-paragraph shape, and each is literally true of the request
+it ships with — which is the only reason the preamble works at all. Switching between them costs a
+prefix invalidation, but only when the user changes concept-map mode mid-chat, which already re-primes.
 
 ## LaTeX is handled at render time, not by prompting
 
@@ -111,3 +212,10 @@ becomes a level filter. Use minimum evidence and the level checkboxes to control
   all of it, returning empty content. The app detects this case and explains it.
 - Attribution between stacked sources is not guaranteed — the model may credit the wrong source for a
   fact when several are active.
+- On-demand mode needs a model that supports tool calling. There is no capability probe: a model that
+  ignores the `tools` field simply answers without ever searching, which looks like the map being off.
+- On-demand mode and reasoning are mutually exclusive, and the mode wins.
+- Upstream of all of this, the graphs themselves are the limiting factor. Levels encode recurrence
+  rather than abstraction, and canonization flattens relations — so however the map is delivered, it
+  can currently only supply frequency-ranked nouns, not the *directions* the map is meant to give.
+  That lives in the Data Analysis pipeline, not here.

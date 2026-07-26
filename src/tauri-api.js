@@ -74,6 +74,7 @@
     analysisCreateRun: (datasetId, settings) => invoke('analysis_create_run', { datasetId, settings }),
     analysisListRuns: (datasetId) => invoke('analysis_list_runs', { datasetId }),
     analysisRunState: (datasetId, runId) => invoke('analysis_run_state', { datasetId, runId }),
+    analysisRunHealth: (datasetId, runId) => invoke('analysis_run_health', { datasetId, runId }),
     analysisSaveTopicResult: (datasetId, runId, result) => invoke('analysis_save_topic_result', { datasetId, runId, result }),
     analysisSaveError: (datasetId, runId, error) => invoke('analysis_save_error', { datasetId, runId, error }),
     analysisLoadTopicResults: (datasetId, runId) => invoke('analysis_load_topic_results', { datasetId, runId }),

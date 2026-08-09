@@ -16,9 +16,10 @@ Built with [Tauri 2](https://tauri.app) + vanilla HTML/CSS/JS frontend and a Rus
 - Read marker
 - Multiple themes
 - Developer console for inspecting requests
-- Four **context sources** you can toggle per message — web search, a concept map built from your own
-  past conversations, a local folder of notes, and browser history — see
-  [docs/context-sources.md](docs/context-sources.md) for how each is assembled and what was measured
+- Five **context sources** you can toggle per message — web search, a concept map built from your own
+  past conversations, a local folder of notes, browser history, and a read-only view of an agent's
+  warm-memory workspace — see [docs/context-sources.md](docs/context-sources.md) for how each is
+  assembled and what was measured
 
 ## Requirements
 

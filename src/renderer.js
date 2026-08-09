@@ -336,6 +336,13 @@ const histIncludeChrome = document.getElementById('hist-include-chrome');
 const histProfiles      = document.getElementById('hist-profiles');
 const histPreview       = document.getElementById('hist-preview');
 const histStatus        = document.getElementById('hist-status');
+const hermesToggle      = document.getElementById('hermes-toggle');
+const hermesRootInput   = document.getElementById('hermes-root');
+const hermesTiersGroup  = document.getElementById('hermes-tiers');
+const hermesMaxTopicsEl = document.getElementById('hermes-max-topics');
+const hermesMaxCharsEl  = document.getElementById('hermes-max-chars');
+const hermesPreview     = document.getElementById('hermes-preview');
+const hermesStatus      = document.getElementById('hermes-status');
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -351,6 +358,10 @@ const histStatus        = document.getElementById('hist-status');
 // Defaults only — localStorage still wins the moment the user changes something. Secrets
 // are deliberately NOT here: the Exa key lives in a file under app-data (initExaApiKey),
 // both because source is the wrong place for it and because a file is origin-independent.
+// Neither are the settings that name a folder on THIS machine — librarySources,
+// conceptMapPath, historyProfiles, hermesRoot. A default cannot help those (a real path
+// must not ship in a public repo), so they were the ones that actually kept resetting;
+// they are file-backed for the same origin-independence reason, see initMachinePaths.
 const DEFAULTS = {
   // General
   serverUrl: 'http://localhost:1234',
@@ -388,7 +399,7 @@ const DEFAULTS = {
   // Local library
   libraryEnabled: '0',
   libraryMode: 'relevant',
-  librarySources: '',  // machine-specific; set in Settings → Library
+  librarySources: '',  // machine-specific → file-backed, see initMachinePaths
   libraryMaxChars: '24000',
   // Browser history
   historyEnabled: '1',
@@ -397,6 +408,15 @@ const DEFAULTS = {
   historyMaxEntries: '500',
   historyMaxChars: '16000',
   historyIncludeChrome: '0',
+  // Hermes warm memory — off until explicitly turned on, and the root stays blank so it
+  // resolves to <home>/Hermes-General rather than shipping one machine's absolute path.
+  hermesEnabled: '0',
+  hermesRoot: '',
+  // active/ is implicit and always searched; this holds only the tiers whose material is
+  // NOT current evidence, which is why the default is none of them.
+  hermesTiers: '',
+  hermesMaxTopics: '5',
+  hermesMaxChars: '9000',
   // Data Analysis
   analysisProfile: 'fast',
   activeAnalysisSource: 'anthropic',
@@ -469,7 +489,7 @@ let webDeepCharsPerPage = prefInt('webDeepCharsPerPage');
 const WEB_DEEP_MAX_QUERIES = 4;  // decomposition ceiling for deep mode
 
 // ── Injected-context preamble ─────────────────────────────────────────────────
-// Precedes all four context layers, whichever are on. A system message full of search
+// Precedes all five context sources, whichever are on. A system message full of search
 // results is indistinguishable from tool output unless something says otherwise, and with
 // no system prompt set there is nothing to say otherwise — so a "test the tools" style
 // prompt gets answered with an invented execution trace: a Python interpreter that does
@@ -484,6 +504,7 @@ const CONTEXT_SOURCES = {
   map:     'Concept map',
   library: 'Local library',
   history: 'Browser history',
+  hermes:  'Hermes warm memory',
 };
 
 // Sent on every request, whether or not any source is active, and worded so it is true
@@ -595,7 +616,18 @@ async function cmResolvePath() {
 }
 
 // Default text describing the concept map when it is injected as memory. User-tunable in Settings → Concept map.
-const CM_BASE_FRAMING = `The following is a map of the user's own conceptual space, distilled by this app's Data Analysis from their past conversations — the topics they think about and how those relate. Treat it as background on what the user is likely already familiar with and the directions of their thinking. It is not the user's current question and not facts to recite. Use it to calibrate depth, and connect your answer to their existing concepts where relevant. If it isn't relevant to the message, ignore it.`;
+// "Connect your answer to their existing concepts where relevant" used to end this
+// paragraph, and it is an invitation the model accepts too readily. Measured 2026-08-09
+// against gemma-4-26b: a plain "how do I structure error handling in a Tauri command"
+// answered correctly for 700 tokens and then closed with a "Why this structure works for
+// your workflow" section asserting "your preference for high-quality, distinctive
+// interfaces" — which is the verbatim summary of the map entry "Frontend Design
+// Principles", recited back as a preference the user never stated. The map records what
+// somebody has discussed, not what they want, and nothing in it licenses telling them what
+// they prefer. The earlier finding that priming launders less than relevant mode still
+// holds; this is the residue of it, and it surfaces in the epilogue of a long answer, which
+// is why a short-answer test missed it. Calibration is kept, commentary is not.
+const CM_BASE_FRAMING = `The following is a map of the user's own conceptual space, distilled by this app's Data Analysis from their past conversations — the topics they think about and how those relate. Treat it as background on what the user is likely already familiar with, and use it to calibrate how much you explain. It is not the user's current question, not facts to recite, and not a record of what they want. Do not quote or paraphrase its entries back at them, do not tell them what they prefer or believe, and do not add a section explaining how your answer relates to their concepts. Where a real overlap makes the answer better, let it show in the depth and wording you choose, not in commentary about them. If it isn't relevant to the message, ignore it entirely.`;
 // The formatting rule rides along with the map rather than living in the system prompt
 // because the map is what triggers the problem: a thousand lines of framework vocabulary
 // pull the model into an academic register where LaTeX arrows are a likely continuation.
@@ -608,6 +640,11 @@ const CM_DEFAULT_FRAMING = `${CM_BASE_FRAMING}\n\n${CM_FORMAT_CLAUSE}`;
 // Anything they genuinely wrote themselves is left untouched.
 const CM_LEGACY_FRAMINGS = [
   CM_BASE_FRAMING,  // same text, before the formatting clause was appended to it
+  // The 2026-07-26 default, retired 2026-08-09 for inviting the model to narrate the
+  // connection between its answer and the user's concepts. Listed both bare and with the
+  // formatting clause, since that is how it was stored depending on when it was saved.
+  `The following is a map of the user's own conceptual space, distilled by this app's Data Analysis from their past conversations — the topics they think about and how those relate. Treat it as background on what the user is likely already familiar with and the directions of their thinking. It is not the user's current question and not facts to recite. Use it to calibrate depth, and connect your answer to their existing concepts where relevant. If it isn't relevant to the message, ignore it.`,
+  `The following is a map of the user's own conceptual space, distilled by this app's Data Analysis from their past conversations — the topics they think about and how those relate. Treat it as background on what the user is likely already familiar with and the directions of their thinking. It is not the user's current question and not facts to recite. Use it to calibrate depth, and connect your answer to their existing concepts where relevant. If it isn't relevant to the message, ignore it.\n\n${CM_FORMAT_CLAUSE}`,
   `The following is a map of the user's own conceptual space, distilled by this app's Data Analysis from their PAST conversations — the topics they think about and how those relate. Treat it as background on what the user is likely already familiar with and the directions of their thinking. It is NOT the user's current question and NOT facts to recite. Use it to calibrate depth, avoid over-explaining what they clearly know, and connect your answer to their existing concepts where relevant. If it isn't relevant to the message, ignore it.`,
 ];
 const cmStoredFraming = (localStorage.getItem('conceptMapFraming') || '').trim();
@@ -644,6 +681,50 @@ let historyProfilesText = localStorage.getItem('historyProfiles') || '';
 const HISTORY_FRAMING = `The following is a compact set of entries from the user's own local browser history (Vivaldi/Chrome), retrieved as background on what they've recently been looking at online. Treat it as context about the user's recent activity and interests — it is NOT the user's current question and NOT facts to recite. Use it to ground your answer in what they've been doing when it's relevant; if it isn't relevant to the message, ignore it. Each entry is a page they visited: title, URL, and (last-visit time · visit count).`;
 // Rows the Rust side scans before the JS re-ranks/trims to the entry & char budget.
 const HISTORY_SCAN_LIMIT = 4000;
+
+// ── Hermes warm memory (the Hermes agent's cross-project topic notes) ─────────────
+// A fifth context source, and the only one whose material carries an explicit evidentiary
+// standing of its own. The Hermes-General workspace sorts documents into tiers, and the
+// tier is not filing — it says how a claim in that document may be used. Everything below
+// exists to keep that intact across the trip into the prompt: the tier travels with each
+// document, only `active/` is searched unless the user opts in, non-active tiers must
+// actually match the message before they appear at all, and freshness is read from the
+// document's own `information_as_of` rather than from the file's mtime (the workspace
+// rewrites documents long after the observations they record).
+// Read-only in every direction: nothing in this app writes to that workspace.
+// See buildHermesContext, and C:\Users\slaur\Hermes-General\CLAUDE.md for the contract.
+const HERMES_TIERS = ['active', 'parked', 'inbox', 'archive'];
+// The standing that ships next to every document, in the words the model has to apply.
+// Keyed by tier so a document can never be rendered without one.
+const HERMES_TIER_STANDING = {
+  active:  'current topic — still point-in-time, judge it by the dates below',
+  parked:  'HISTORICAL until revalidated — present tense here describes what was true then',
+  archive: 'HISTORICAL — retained for provenance, not as a current claim',
+  inbox:   'UNTRIAGED — not evidence, may be wrong or superseded',
+};
+let hermesEnabled = prefBool('hermesEnabled');
+let hermesRoot = pref('hermesRoot');
+// Only the optional tiers live here; 'active' is added at request time and cannot be
+// switched off, because a Hermes read with no active tier is not a smaller read — it is
+// one made entirely of material that is not current.
+let hermesTiers = pref('hermesTiers').split(',').map(s => s.trim()).filter(t => HERMES_TIERS.includes(t) && t !== 'active');
+let hermesMaxTopics = prefInt('hermesMaxTopics');
+let hermesMaxChars = prefInt('hermesMaxChars');
+// Per-document read cap handed to Rust. Generous: the trimming that matters is the excerpt
+// selection below, and a document truncated mid-read would lose the closing sections where
+// this workspace puts its decisions.
+const HERMES_COLLECT_OPTS = { maxFilesPerTier: 40, maxFileChars: 60000 };
+const HERMES_FRAMING = `The following is a read-only view of the Hermes agent's warm-memory workspace — cross-project notes, assessments and decision records kept outside this app. This application retrieved it; you did not, and neither did the user in this chat.
+
+How to weigh it, in order:
+
+1. A live check outranks every document here. Report what a document recorded and when — never restate an old observation as the current state of anything.
+2. Judge age by the "information as of" stamp shown with each document, never by how recently a file changed. A document marked "review due" is stale until someone revalidates it.
+3. The tier shown with each document is its standing, not its location. Only "active" holds current topics. Anything marked parked, archive or inbox is historical or untriaged — treat it as what was thought at that time, even where it is written in the present tense, and never as evidence for what is true now.
+4. Ideas are not evidence, and a decision record says what was decided then, not necessarily what applies now.
+5. The "sources" line is where that document's claims came from. If a claim matters, say which document carried it.
+
+If none of it bears on the message, ignore it. Do not fill gaps in it — a topic that is not here is one the workspace does not cover.`;
 let analysisDatasets = [];
 let analysisRuns = [];
 let activeAnalysisSource = ['anthropic', 'openai', 'grok'].includes(pref('activeAnalysisSource'))
@@ -802,6 +883,70 @@ async function initExaApiKey() {
     exaApiKey = key || '';
   } catch {}
   if (settingsExaKey) settingsExaKey.value = exaApiKey;
+}
+
+// ── Machine-specific paths (origin-independent, like the Exa key) ───────────────────
+// The settings that name a folder on THIS machine. They are the ones that visibly "reset
+// after a code change", and for a reason none of the others share: every other setting has
+// a default in DEFAULTS that makes a new web origin harmless, but a machine-specific path
+// must never be a default in a public repo — so when `tauri dev` lands on a new port, or
+// the release build (`tauri://localhost`) is opened instead, there is nothing to restore
+// them from. Measured: four origins had accumulated on this machine, and only one of them
+// held librarySources.
+//
+// So they live in machine-paths.json under app-data, which every origin sees. localStorage
+// is still written, because the rest of the app reads these through pref() at load; the
+// file is what makes them survive.
+const MACHINE_PATH_KEYS = ['librarySources', 'conceptMapPath', 'historyProfiles', 'hermesRoot'];
+
+function saveMachinePath(key, value) {
+  localStorage.setItem(key, value);
+  window.api.setMachinePath(key, value).catch(() => {});   // never block a settings edit
+}
+
+async function initMachinePaths() {
+  let stored = {};
+  try {
+    stored = (await window.api.getMachinePaths()) || {};
+  } catch {
+    return;   // no bridge (or an unreadable file) — localStorage still works as before
+  }
+  for (const key of MACHINE_PATH_KEYS) {
+    const fromFile = String(stored[key] ?? '').trim();
+    const fromOrigin = (localStorage.getItem(key) || '').trim();
+    // The file wins when it has a value. When it does not, an origin that still holds one
+    // seeds it — that is the migration, and it runs from whichever origin was configured
+    // first, so nobody has to re-enter what they already set.
+    if (fromFile) {
+      if (fromFile !== fromOrigin) localStorage.setItem(key, fromFile);
+    } else if (fromOrigin) {
+      window.api.setMachinePath(key, fromOrigin).catch(() => {});
+      continue;   // already live in this origin
+    } else {
+      continue;
+    }
+    applyMachinePath(key, fromFile);
+  }
+}
+
+// Push a value the file supplied into the live variable and its settings field. Only the
+// four keys above reach here, and each is handled explicitly rather than through a lookup
+// table, so adding a fifth cannot silently do nothing.
+function applyMachinePath(key, value) {
+  if (key === 'librarySources') {
+    librarySourcesText = value;
+    if (libSources) libSources.value = value;
+  } else if (key === 'conceptMapPath') {
+    conceptMapPath = value;
+    conceptGraphCache = { path: null, graph: null };   // a different graph than we loaded
+    if (cmMapSelect) cmMapSelect.value = value;
+  } else if (key === 'historyProfiles') {
+    historyProfilesText = value;
+    if (histProfiles) histProfiles.value = value;
+  } else if (key === 'hermesRoot') {
+    hermesRoot = value;
+    if (hermesRootInput) hermesRootInput.value = value;
+  }
 }
 
 settingsExaResults?.addEventListener('change', () => {
@@ -1005,7 +1150,7 @@ if (libMaxChars) libMaxChars.value = libraryMaxChars;
 
 libSources?.addEventListener('change', () => {
   librarySourcesText = libSources.value;
-  localStorage.setItem('librarySources', librarySourcesText);
+  saveMachinePath('librarySources', librarySourcesText);
 });
 
 libMode?.addEventListener('change', () => {
@@ -1096,7 +1241,7 @@ histIncludeChrome?.addEventListener('change', () => {
 
 histProfiles?.addEventListener('change', () => {
   historyProfilesText = histProfiles.value;
-  localStorage.setItem('historyProfiles', historyProfilesText);
+  saveMachinePath('historyProfiles', historyProfilesText);
 });
 
 histPreview?.addEventListener('click', async () => {
@@ -1121,9 +1266,92 @@ histPreview?.addEventListener('click', async () => {
   }
 });
 
+// ── Hermes warm memory: composer toggle + settings ────────────────────────────────
+function applyHermesToggle() {
+  if (!hermesToggle) return;
+  hermesToggle.classList.toggle('active', hermesEnabled);
+  hermesToggle.setAttribute('aria-pressed', hermesEnabled ? 'true' : 'false');
+  const extra = hermesTiers.length ? ` (+ ${hermesTiers.join(', ')})` : '';
+  hermesToggle.title = `Context source: ${CONTEXT_SOURCES.hermes} — ${hermesEnabled ? `on${extra}` : 'off'}`;
+}
+
+hermesToggle?.addEventListener('click', () => {
+  hermesEnabled = !hermesEnabled;
+  localStorage.setItem('hermesEnabled', hermesEnabled ? '1' : '0');
+  applyHermesToggle();
+});
+
+applyHermesToggle();
+
+if (hermesRootInput) hermesRootInput.value = hermesRoot;
+if (hermesMaxTopicsEl) hermesMaxTopicsEl.value = hermesMaxTopics;
+if (hermesMaxCharsEl) hermesMaxCharsEl.value = hermesMaxChars;
+if (hermesTiersGroup) {
+  for (const cb of hermesTiersGroup.querySelectorAll('input[data-tier]')) {
+    cb.checked = hermesTiers.includes(cb.dataset.tier);
+  }
+}
+
+hermesRootInput?.addEventListener('change', () => {
+  hermesRoot = hermesRootInput.value.trim().replace(/^"|"$/g, '');
+  hermesRootInput.value = hermesRoot;
+  saveMachinePath('hermesRoot', hermesRoot);
+});
+
+hermesTiersGroup?.addEventListener('change', () => {
+  const tiers = [];
+  for (const cb of hermesTiersGroup.querySelectorAll('input[data-tier]')) {
+    if (cb.checked && HERMES_TIERS.includes(cb.dataset.tier) && cb.dataset.tier !== 'active') tiers.push(cb.dataset.tier);
+  }
+  hermesTiers = tiers;
+  localStorage.setItem('hermesTiers', tiers.join(','));
+  applyHermesToggle();  // the tooltip names the non-current tiers, so it changes with them
+});
+
+hermesMaxTopicsEl?.addEventListener('change', () => {
+  const val = Math.min(30, Math.max(1, parseInt(hermesMaxTopicsEl.value) || 5));
+  hermesMaxTopics = val;
+  hermesMaxTopicsEl.value = val;
+  localStorage.setItem('hermesMaxTopics', val);
+});
+
+hermesMaxCharsEl?.addEventListener('change', () => {
+  const val = Math.min(200000, Math.max(1000, parseInt(hermesMaxCharsEl.value) || 9000));
+  hermesMaxChars = val;
+  hermesMaxCharsEl.value = val;
+  localStorage.setItem('hermesMaxChars', val);
+});
+
+hermesPreview?.addEventListener('click', async () => {
+  if (hermesStatus) hermesStatus.textContent = 'Reading workspace…';
+  try {
+    const res = await window.api.hermesCollect({
+      root: hermesRootInput ? hermesRootInput.value.trim() : hermesRoot,
+      tiers: hermesRequestTiers(),
+      ...HERMES_COLLECT_OPTS,
+    });
+    const docs = (Array.isArray(res?.docs) ? res.docs : []).map(hermesReadDoc);
+    const counts = res?.stats?.tiers || {};
+    const issues = res?.stats?.missing || [];
+    const due = docs.filter(d => d.fresh.state === 'review-due').length;
+    const undated = docs.filter(d => d.fresh.state === 'undated').length;
+    if (hermesStatus) {
+      hermesStatus.textContent = docs.length
+        ? `${res.root} · ${Object.entries(counts).map(([t, n]) => `${t} ${n}`).join(' · ')}`
+          + ` · index ${res.indexFound ? 'found' : 'missing'}`
+          + (due ? ` · ${due} past review date` : '')
+          + (undated ? ` · ${undated} undated (cannot be aged)` : '')
+          + (issues.length ? ` · ${issues.join('; ')}` : '')
+        : `No topic documents found in ${res?.root || 'the workspace'}${issues.length ? ` · ${issues.join('; ')}` : ''}.`;
+    }
+  } catch (err) {
+    if (hermesStatus) hermesStatus.textContent = `Read failed: ${err?.message || err}`;
+  }
+});
+
 cmMapSelect?.addEventListener('change', () => {
   conceptMapPath = cmMapSelect.value || '';
-  localStorage.setItem('conceptMapPath', conceptMapPath);
+  saveMachinePath('conceptMapPath', conceptMapPath);
   conceptGraphCache = { path: null, graph: null };  // invalidate on map switch
   updateConceptMapStatus();
 });
@@ -7338,9 +7566,41 @@ function libPackAll(files, budget) {
   return out;
 }
 
+// Paragraphs, with a bare markdown heading folded into the section it introduces. A
+// heading alone is a label, not content: left as its own block it can be *selected* as an
+// excerpt, and a Hermes document from the workspace template always opens with
+// "## Current question", so the no-match fallback below was structurally guaranteed to
+// return that and nothing else. Folding it in also lets a section's heading words help
+// score its prose, which is usually where the subject word actually appears.
+function libSplitBlocks(text) {
+  const raw = String(text || '').split(/\n\s*\n/).map(b => b.trim()).filter(Boolean);
+  const out = [];
+  let heading = '';
+  for (const b of raw) {
+    if (/^#{1,6}\s+\S/.test(b) && !b.includes('\n')) {
+      heading = heading ? `${heading}\n${b}` : b;
+      continue;
+    }
+    out.push(heading ? `${heading}\n${b}` : b);
+    heading = '';
+  }
+  if (heading) out.push(heading);   // trailing heading with nothing under it
+  return out;
+}
+
 // Pick the highest-scoring paragraphs of a file for the query, kept in original order.
 function libBestBlocks(text, q, idf, cap) {
-  const blocks = String(text || '').split(/\n\s*\n/).map(b => b.trim()).filter(Boolean);
+  const full = String(text || '').trim();
+  if (!full) return '';
+  // Relevance-trimming a file that already fits is pure loss. Measured: asked "what Node
+  // version, and where does CI run", a 600-character note was reduced to the Node paragraph
+  // alone against a 24,000-character budget — the CI paragraph scored zero because cmTokens
+  // drops tokens under three characters ("ci") and does not stem ("run" vs "runs"), so the
+  // half of the answer the query happened to word differently was dropped. Selection is for
+  // files too big to send, not for deciding what the user meant.
+  if (full.length <= cap) return full;
+
+  const blocks = libSplitBlocks(full);
   if (!blocks.length) return '';
   const scored = blocks.map((b, i) => {
     const toks = new Set(cmTokens(b));
@@ -7348,18 +7608,32 @@ function libBestBlocks(text, q, idf, cap) {
     for (const t of q) if (toks.has(t)) s += idf(t);
     return { b, i, s };
   }).filter(x => x.s > 0).sort((a, b) => b.s - a.s);
-  if (!scored.length) return blocks[0].slice(0, cap);  // filename-only match → give the head
   const chosen = [];
+  const taken = new Set();
   let used = 0;
   for (const { b, i } of scored) {
     if (used >= cap) break;
     let bb = b;
     if (bb.length > cap - used) bb = bb.slice(0, Math.max(0, cap - used)) + '…';
     chosen.push({ i, b: bb });
+    taken.add(i);
     used += bb.length + 4;
   }
+  // Top up in document order with whatever else fits. The file was already judged relevant;
+  // leaving budget unspent to withhold its other paragraphs helps nothing, and it is how a
+  // question with two halves loses one of them.
+  for (let i = 0; i < blocks.length && used < cap; i++) {
+    if (taken.has(i)) continue;
+    const b = blocks[i];
+    if (b.length + 4 > cap - used) continue;
+    chosen.push({ i, b });
+    taken.add(i);
+    used += b.length + 4;
+  }
+  if (!chosen.length) return blocks[0].slice(0, cap);
   chosen.sort((a, b) => a.i - b.i);
-  return chosen.map(c => c.b).join('\n…\n');
+  // Only mark a gap where one was actually skipped.
+  return chosen.map((c, n) => (n > 0 && c.i !== chosen[n - 1].i + 1 ? '…\n' : '') + c.b).join('\n');
 }
 
 // "Relevant" packing: IDF-rank files against the message, take the best blocks of each.
@@ -7494,11 +7768,22 @@ function historyRankRelevant(items, userText) {
   return scored.map(x => x.it);
 }
 
+// Local wall-clock, but written unambiguously. toLocaleString() was emitting Finnish
+// d.m.yyyy here ("9.8.2026"), which a model reads as either 9 August or 8 September with no
+// way to tell — and the app hands these dates to the model, not to a human who knows the
+// machine's locale. Local components rather than toISOString(), so the timestamp still
+// matches what the user saw in their browser.
+function historyStamp(ms) {
+  const d = new Date(ms);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
 function historyFormatEntry(it) {
   const title = (it.title || '').trim() || '(untitled)';
   const meta = [];
   if (it.lastVisitMs) {
-    try { meta.push(new Date(it.lastVisitMs).toLocaleString()); } catch { /* ignore */ }
+    try { meta.push(historyStamp(it.lastVisitMs)); } catch { /* ignore */ }
   }
   if (it.visitCount) meta.push(`${it.visitCount} visit${it.visitCount === 1 ? '' : 's'}`);
   return `- ${title} — ${it.url}${meta.length ? ` [${meta.join(' · ')}]` : ''}`;
@@ -7577,6 +7862,320 @@ async function buildHistoryContext(userText) {
     `\n${contextSourceHeader('history')} — ${lines.length} entr${lines.length === 1 ? 'y' : 'ies'} (last ${historyDays} day${historyDays === 1 ? '' : 's'}${historyMode === 'relevant' && userText ? ', selected as relevant to this message' : ', most recent'})`,
     ...lines,
   ].join('\n');
+}
+
+// ── Hermes warm memory context source ─────────────────────────────────────────────
+// 'active' is prepended at request time rather than stored, so it is present on every read
+// whatever is in localStorage — including a value written by an older build, or one hand-
+// edited to drop it. There is no configuration in which this source reads only tiers whose
+// material is not current.
+function hermesRequestTiers() {
+  return ['active', ...hermesTiers.filter(t => t !== 'active')];
+}
+
+// Enough YAML for the metadata block the workspace's own template defines: scalars, and
+// the one block-list form it uses (`sources:` followed by `  - item`). Not a YAML parser
+// and not trying to be — anything it does not recognise is left out rather than guessed
+// at, because a mis-parsed date here would put a wrong freshness stamp on a real claim.
+function hermesParseFrontMatter(text) {
+  const src = String(text || '');
+  const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(src);
+  if (!m) return { meta: {}, body: src.trim() };
+  const meta = {};
+  let listKey = null;
+  for (const line of m[1].split(/\r?\n/)) {
+    const item = /^\s+-\s+(.*)$/.exec(line);
+    if (item && listKey) {
+      meta[listKey].push(item[1].trim().replace(/^["']|["']$/g, ''));
+      continue;
+    }
+    const kv = /^([A-Za-z_][\w-]*)\s*:\s*(.*)$/.exec(line);
+    if (!kv) continue;
+    const key = kv[1];
+    const val = kv[2].trim().replace(/^["']|["']$/g, '');
+    if (!val) { listKey = key; meta[key] = []; continue; }   // `sources:` then indented items
+    listKey = null;
+    meta[key] = (val === 'null' || val === '~') ? '' : val;
+  }
+  return { meta, body: src.slice(m[0].length).trim() };
+}
+
+const HERMES_DAY_MS = 86400000;
+
+// Whole elapsed days, floored — never rounded. Most stamps here are date-only, which parses
+// to midnight, so rounding reports a document written yesterday evening as two days old and
+// a review date as falling a day earlier than the calendar says. Flooring makes both read as
+// the plain calendar difference, and cannot make a stale document look fresher than it is.
+function hermesDaysFromNow(iso) {
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return null;
+  return Math.floor((Date.now() - t) / HERMES_DAY_MS);
+}
+
+// Freshness comes from the document's own stamps, never from the file's mtime — the
+// workspace rewrites documents long after the observations they record, so an mtime here
+// would date the edit and present it as the observation.
+function hermesFreshness(meta) {
+  const asOf = String(meta.information_as_of || '').trim();
+  const reviewAfter = String(meta.review_after || '').trim();
+  const ageDays = asOf ? hermesDaysFromNow(asOf) : null;
+  const dueDays = reviewAfter ? hermesDaysFromNow(reviewAfter) : null;
+  let state = 'current';
+  if (!asOf || ageDays === null) state = 'undated';          // nothing to age it by
+  else if (dueDays !== null && dueDays > 0) state = 'review-due';
+  return { asOf, reviewAfter, ageDays, dueDays, state };
+}
+
+function hermesAgeText(fresh) {
+  const parts = [];
+  if (fresh.state === 'undated') {
+    parts.push('information as of: not stated (this document cannot be aged — treat every claim in it as undated)');
+  } else {
+    const age = fresh.ageDays === 0 ? 'today'
+      : fresh.ageDays === 1 ? '1 day ago'
+      : fresh.ageDays > 0 ? `${fresh.ageDays} days ago`
+      : 'stamped in the future';
+    parts.push(`information as of: ${fresh.asOf} (${age})`);
+  }
+  if (fresh.reviewAfter) {
+    parts.push(fresh.dueDays > 0
+      ? `REVIEW DUE — past its review date ${fresh.reviewAfter} by ${fresh.dueDays} day${fresh.dueDays === 1 ? '' : 's'}; stale until revalidated`
+      : `review due ${fresh.reviewAfter}${fresh.dueDays === null ? '' : ` (in ${Math.abs(fresh.dueDays)} day${Math.abs(fresh.dueDays) === 1 ? '' : 's'})`}`);
+  }
+  return parts.join(' · ');
+}
+
+// Normalise one document as Rust handed it over: front matter split off, title and section
+// headings pulled out, freshness resolved. Everything downstream works on this shape.
+function hermesReadDoc(raw) {
+  const { meta, body } = hermesParseFrontMatter(raw?.text || '');
+  const h1 = /^#\s+(.+)$/m.exec(body);
+  const headings = (body.match(/^##\s+(.+)$/gm) || [])
+    .map(h => h.replace(/^##\s+/, '').trim()).slice(0, 8);
+  return {
+    ...raw,
+    meta,
+    // The H1 is dropped from the body because the title already leads the document header.
+    // Left in, it scores as a block like any other and is usually the top-ranked one, so
+    // the excerpt opens by repeating the heading two lines above it.
+    body: h1 ? body.slice(h1.index + h1[0].length).trim() : body,
+    headings,
+    title: (h1 ? h1[1].trim() : String(raw?.name || 'document').replace(/\.(md|markdown|txt)$/i, '').replace(/[-_]/g, ' ')),
+    fresh: hermesFreshness(meta),
+  };
+}
+
+// ACTIVE.md is the workspace's own short cache of what is current, and being listed in it
+// is provenance a directory listing cannot give: a document can sit in active/ after its
+// entry was removed. Bullets look like `- **Title** — blurb` followed by a backticked path.
+function hermesParseIndex(indexText) {
+  const byPath = new Map();
+  for (const chunk of String(indexText || '').split(/\n-\s+/).slice(1)) {
+    const path = /`([^`]+\.(?:md|markdown|txt))`/.exec(chunk);
+    if (!path) continue;
+    const title = /\*\*(.+?)\*\*/.exec(chunk);
+    const blurb = chunk
+      .replace(/`[^`]*`/g, '')
+      .replace(/\*\*/g, '')
+      .split(/\s+—\s+/).slice(1).join(' — ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    byPath.set(path[1].toLowerCase().replace(/\\/g, '/'), { title: title ? title[1].trim() : '', blurb });
+  }
+  return byPath;
+}
+
+// IDF over the retrieved set, the same shape libPackRelevant uses, with the title and
+// section headings weighted up: a Hermes document is a topic, so its title is a much
+// stronger signal of what it is about than a word buried in its evidence section.
+//
+// The matched-token floor is the same rule `concept_search` needs and for the same reason,
+// measured again here: "how do I re-tension a bicycle chain" retrieved the UI-shock
+// assessment, because that document happens to use the word "chain". A whole document is a
+// far bigger surface than a concept label, so a single common word will nearly always land
+// somewhere in one — and the result is a dated assessment of something else presented as
+// relevant to the question. Below three tokens there is nothing else to go on, so the
+// single-token rule stands there.
+function hermesRankDocs(docs, userText) {
+  const q = [...new Set(cmTokens(userText))];
+  if (!q.length) return docs.map(d => ({ doc: d, score: 0 }));
+  const minMatched = q.length >= 3 ? 2 : 1;
+  const df = new Map();
+  const docToks = docs.map(d => {
+    const toks = new Set(cmTokens(`${d.title} ${d.headings.join(' ')} ${d.body}`));
+    for (const t of toks) df.set(t, (df.get(t) || 0) + 1);
+    return toks;
+  });
+  const total = docs.length || 1;
+  const idf = (t) => Math.log((total + 1) / ((df.get(t) || 0) + 1)) + 1;
+  return docs.map((d, i) => {
+    const head = new Set(cmTokens(`${d.title} ${d.headings.join(' ')}`));
+    let score = 0;
+    let hits = 0;
+    for (const t of q) {
+      if (!docToks[i].has(t)) continue;
+      score += idf(t) * (head.has(t) ? 3 : 1);
+      hits += 1;
+    }
+    return { doc: d, score: hits >= minMatched ? score : 0, idf, q };
+  }).sort((a, b) => b.score - a.score);
+}
+
+// The metadata block that travels with every document, excerpted or not. The tier standing
+// leads because it governs how everything under it may be used; provenance and freshness
+// follow. A document that says it was superseded is not current whatever tier it sits in,
+// so that overrides the tier's own wording.
+function hermesDocHeader(doc, indexed) {
+  const superseded = String(doc.meta.superseded_by || '').trim();
+  const status = String(doc.meta.status || '').trim();
+  const standing = superseded
+    ? `SUPERSEDED by ${superseded} — historical`
+    : (HERMES_TIER_STANDING[doc.tier] || 'unknown standing — do not treat as current');
+  const lines = [`### [${doc.tier} · ${standing}] ${doc.title}`];
+  lines.push(`- document: ${doc.rel}${status ? ` · status: ${status}` : ''}${indexed ? ' · listed in ACTIVE.md as a current topic' : ''}`);
+  lines.push(`- ${hermesAgeText(doc.fresh)}`);
+  const sources = Array.isArray(doc.meta.sources) ? doc.meta.sources.filter(Boolean) : [];
+  if (sources.length) lines.push(`- what it was built from: ${sources.join(' · ')}`);
+  if (doc.headings.length) lines.push(`- sections: ${doc.headings.join(' · ')}`);
+  if (doc.truncated) lines.push(`- note: this document was read only up to ${HERMES_COLLECT_OPTS.maxFileChars} characters`);
+  return lines.join('\n');
+}
+
+// Restates the standing AFTER the excerpt, for the two kinds of document whose content
+// would otherwise read as a plain statement of fact. Measured 2026-08-09 with a stand-in
+// weak model: given a parked survey correctly headed "HISTORICAL until revalidated", it
+// answered "Node version: Node 18 · CI vendor: GitHub Actions" as a headline and put the
+// caveat underneath — the header was read, then out-weighed by the prose beneath it. A
+// small model attends to what it read last, so the standing has to be on both sides of the
+// content, not only above it. Current, in-review documents get no footer: qualifying
+// everything equally is how a caveat stops meaning anything.
+function hermesExcerptFooter(doc) {
+  const superseded = String(doc.meta.superseded_by || '').trim();
+  const when = doc.fresh.state === 'undated'
+    ? 'at an unstated time'
+    : `${doc.fresh.ageDays} day${doc.fresh.ageDays === 1 ? '' : 's'} ago`;
+  if (superseded || doc.tier !== 'active') {
+    return `\n\n— end of ${superseded ? 'superseded' : doc.tier} material, recorded ${when}.`
+      + ` The above is what was true then. Do not answer with it as the current situation;`
+      + ` if it is all you have on the subject, say that this is a ${when} record and that`
+      + ` nothing current confirms it.`;
+  }
+  if (doc.fresh.state === 'review-due') {
+    return `\n\n— end of excerpt from a document past its review date (recorded ${when}).`
+      + ` It has not been revalidated since, so state it as what was observed then, not as`
+      + ` what is the case now.`;
+  }
+  return '';
+}
+
+function renderHermesNote(info) {
+  const div = document.createElement('div');
+  div.className = 'message search-sources hermes-note';
+  const title = document.createElement('div');
+  title.className = 'search-sources-title';
+  title.textContent = `${CONTEXT_SOURCES.hermes} · ${info.excerpted} topic${info.excerpted === 1 ? '' : 's'}`;
+  div.appendChild(title);
+  const sub = document.createElement('div');
+  sub.className = 'search-sources-queries';
+  const bits = [info.tiers.map(([t, n]) => `${t} ${n}`).join(' · ') || 'nothing matched'];
+  if (info.listed) bits.push(`${info.listed} listed by title only`);
+  if (info.reviewDue) bits.push(`${info.reviewDue} past review date`);
+  if (info.undated) bits.push(`${info.undated} undated`);
+  if (info.historical) bits.push(`${info.historical} historical/untriaged`);
+  sub.textContent = bits.join(' · ');
+  div.appendChild(sub);
+  messagesEl.appendChild(div);
+  return div;
+}
+
+// Returns a context string built from the Hermes warm-memory workspace, or null.
+async function buildHermesContext(userText) {
+  if (!hermesEnabled) return null;
+
+  let res;
+  try {
+    res = await window.api.hermesCollect({
+      root: hermesRoot,
+      tiers: hermesRequestTiers(),
+      ...HERMES_COLLECT_OPTS,
+    });
+  } catch (err) {
+    addMessage('error', `${CONTEXT_SOURCES.hermes} failed to read the workspace: ${err?.message || err}`);
+    return null;
+  }
+
+  const docs = (Array.isArray(res?.docs) ? res.docs : []).map(hermesReadDoc);
+  const issues = Array.isArray(res?.stats?.missing) ? res.stats.missing : [];
+  if (!docs.length) {
+    addMessage('error', `${CONTEXT_SOURCES.hermes} is on, but no topic documents were found in ${res?.root || 'the workspace'}.${issues.length ? ` (${issues.join('; ')})` : ''}`);
+    return null;
+  }
+  const index = hermesParseIndex(res?.indexText);
+  const isIndexed = (doc) => index.has(String(doc.rel || '').toLowerCase());
+
+  const ranked = hermesRankDocs(docs, userText || '');
+  // Only documents that actually matched the message are excerpted, and that is where the
+  // tier rule bites: a parked, archived or inbox document can reach this list solely by
+  // matching what was asked. Nothing outside active/ is ever carried in by a fallback, used
+  // to pad a thin result, or listed for orientation the way current topics are below — an
+  // unmatched historical document is dropped, not shown with a caveat.
+  const excerptable = ranked.filter(r => r.score > 0).slice(0, Math.max(1, hermesMaxTopics));
+
+  const budget = Math.max(1000, hermesMaxChars);
+  const blocks = [];
+  const shown = [];
+  let used = 0;
+  const perDoc = Math.max(600, Math.floor((budget * 0.8) / Math.max(1, excerptable.length)));
+  for (const { doc, idf, q } of excerptable) {
+    if (used >= budget) break;
+    const header = hermesDocHeader(doc, isIndexed(doc));
+    const cap = Math.min(perDoc, budget - used - header.length);
+    if (cap < 200) break;
+    const snippet = libBestBlocks(doc.body, new Set(q), idf, cap);
+    if (!snippet) continue;
+    blocks.push(`${header}\n- excerpt:\n\n${snippet}${hermesExcerptFooter(doc)}`);
+    shown.push(doc);
+    used += header.length + snippet.length;
+  }
+
+  // Everything current that was not excerpted, as one line each. Titles and dates only —
+  // enough that the model knows what the workspace does and does not cover, without
+  // handing it content for a question that did not ask for it.
+  const excerptedPaths = new Set(shown.map(d => d.rel));
+  const listings = [];
+  for (const d of ranked.map(r => r.doc)) {
+    if (listings.length >= 12 || used >= budget) break;
+    if (d.tier !== 'active' || excerptedPaths.has(d.rel)) continue;
+    const line = `- ${d.title} (${d.rel}) — ${hermesAgeText(d.fresh)}${isIndexed(d) ? ' · listed in ACTIVE.md' : ''}`;
+    listings.push(line);
+    used += line.length;   // titles are cheap, but a large workspace makes them add up
+  }
+
+  if (!blocks.length && !listings.length) return null;
+
+  const tierCounts = new Map();
+  for (const doc of shown) tierCounts.set(doc.tier, (tierCounts.get(doc.tier) || 0) + 1);
+  renderHermesNote({
+    excerpted: blocks.length,
+    listed: listings.length,
+    tiers: [...tierCounts.entries()],
+    reviewDue: shown.filter(d => d.fresh.state === 'review-due').length,
+    undated: shown.filter(d => d.fresh.state === 'undated').length,
+    historical: shown.filter(d => d.tier !== 'active' || d.meta.superseded_by).length,
+  });
+
+  const scope = `searched: ${hermesRequestTiers().join(', ')} in ${res.root}`;
+  const parts = [HERMES_FRAMING];
+  parts.push(`\n${contextSourceHeader('hermes')} — ${blocks.length} topic${blocks.length === 1 ? '' : 's'} retrieved for this message (${scope})`);
+  parts.push(...blocks);
+  if (listings.length) {
+    parts.push(blocks.length
+      ? `\n#### Other current topics in the workspace (titles only — no excerpt was retrieved for this message)`
+      : `\n#### Current topics in the workspace (titles only)\n\nNothing in the workspace matched this message. These are listed so you know what it covers — do not connect your answer to them, and do not treat this list as an answer to anything.`);
+    parts.push(...listings);
+  }
+  if (issues.length) parts.push(`\n(Retrieval notes: ${issues.join('; ')}.)`);
+  return parts.join('\n');
 }
 
 async function sendMessage() {
@@ -7661,6 +8260,13 @@ async function sendMessage() {
     libraryContext = await buildLibraryContext(text);
   }
 
+  // Hermes warm memory is only ever read because the user turned it on for this message —
+  // there is no auto-enable, and no path that reads that workspace with the toggle off.
+  let hermesContext = null;
+  if (hermesEnabled) {
+    hermesContext = await buildHermesContext(text);
+  }
+
   let historyContext = null;
   if (historyEnabled) {
     historyContext = await buildHistoryContext(text);
@@ -7671,11 +8277,12 @@ async function sendMessage() {
     webSearchContext,
     conceptMapContext,
     libraryContext,
+    hermesContext,
     historyContext,
   });
 }
 
-async function streamAssistantResponse({ forceImageDescriptionsForLastUser = false, webSearchContext = null, conceptMapContext = null, libraryContext = null, historyContext = null } = {}) {
+async function streamAssistantResponse({ forceImageDescriptionsForLastUser = false, webSearchContext = null, conceptMapContext = null, libraryContext = null, hermesContext = null, historyContext = null } = {}) {
   const distToBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight;
   if (distToBottom < 350) autoScrollEnabled = true;
   document.body.classList.add('streaming');
@@ -7789,11 +8396,14 @@ async function streamAssistantResponse({ forceImageDescriptionsForLastUser = fal
   const apiMessages = buildApiMessagesForModel(conversationHistory, currentModel, { forceImageDescriptionsForLastUser });
   // Inject extra context as system messages just before the last user turn. Order:
   // concept-map memory (long-term background), then the user's local library (curated
-  // source material), then their browser history (recent activity), then web results
-  // (external/current), then the user turn.
+  // source material), then Hermes warm memory (another agent's notes — dated, and never
+  // authoritative about now), then their browser history (recent activity), then web
+  // results (external/current), then the user turn. Hermes sits after the library and
+  // before the live-ish sources deliberately: it is second-hand and time-stamped, so it
+  // should not be the last thing read before the question.
   // Per-message context sources go next to the newest user turn, where being adjacent to the
   // question is the point: they are about this message.
-  const contextSources = [conceptMapContext, libraryContext, historyContext, webSearchContext].filter(Boolean);
+  const contextSources = [conceptMapContext, libraryContext, hermesContext, historyContext, webSearchContext].filter(Boolean);
   if (contextSources.length) {
     let lastUserIdx = -1;
     for (let i = apiMessages.length - 1; i >= 0; i--) {
@@ -8378,6 +8988,9 @@ async function init() {
     if (settingsApiToken) settingsApiToken.value = savedToken || '';
   } catch {}
   await initExaApiKey();
+  // Before the first send, so a message never goes out with the library/map/history/Hermes
+  // settings of an origin that has simply never been configured.
+  await initMachinePaths();
 
   await loadModels();
   await loadChats();

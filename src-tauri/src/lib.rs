@@ -151,6 +151,67 @@ fn exa_key_file(app: &AppHandle) -> PathBuf {
     app_root(app).join("exa-api-key.txt")
 }
 
+// ── Machine-specific paths: the settings localStorage cannot be trusted to hold ──────
+// Same reasoning as the three files above, for a different reason. localStorage belongs to
+// a web origin, and this app has four of them on one machine — `tauri dev` serves the
+// frontend on the first free port from 1430 up (so a launch while another Tauri app holds
+// 1430 lands on 1431, and the dev broker pins its own port), and the release build is
+// `tauri://localhost`. Each is a separate store, i.e. a fresh install. `DEFAULTS` makes
+// that harmless for every portable setting — but a path that only exists on this machine
+// must never be a default in a public repo, so those are exactly the settings nothing can
+// restore, and they are what visibly "resets after a code change". A file under app-data
+// is origin-independent, so it survives all four.
+const MACHINE_PATH_KEYS: [&str; 4] = [
+    "librarySources",   // Local library: the notes folders/files to read
+    "conceptMapPath",   // Concept map: a pinned graph (blank = newest on disk)
+    "historyProfiles",  // Browser history: explicit Chromium profile paths
+    "hermesRoot",       // Hermes warm memory: the workspace root
+];
+
+fn machine_paths_file(app: &AppHandle) -> PathBuf {
+    app_root(app).join("machine-paths.json")
+}
+
+#[tauri::command]
+fn get_machine_paths(app: AppHandle) -> Result<Value, String> {
+    let text = fs::read_to_string(machine_paths_file(&app)).unwrap_or_default();
+    let parsed: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({}));
+    let mut out = serde_json::Map::new();
+    // Filtered on the way out as well as in: a hand-edited file cannot introduce a key the
+    // frontend does not expect, and a key retired from the list stops being served.
+    for key in MACHINE_PATH_KEYS {
+        if let Some(v) = parsed.get(key).and_then(Value::as_str) {
+            out.insert(key.to_string(), json!(v));
+        }
+    }
+    Ok(Value::Object(out))
+}
+
+#[tauri::command]
+fn set_machine_path(app: AppHandle, key: String, value: String) -> Result<Value, String> {
+    if !MACHINE_PATH_KEYS.contains(&key.as_str()) {
+        return Err(format!("not a machine-path setting: {key}"));
+    }
+    // Read-modify-write the whole file: two settings changed in different windows must not
+    // erase each other, and the file is a handful of short strings.
+    let existing = get_machine_paths(app.clone())?;
+    let mut map = existing.as_object().cloned().unwrap_or_default();
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        map.remove(&key);   // cleared means cleared — not "fall back to the stored one"
+    } else {
+        map.insert(key, json!(value));
+    }
+    let path = machine_paths_file(&app);
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let text = serde_json::to_string_pretty(&Value::Object(map))
+        .map_err(|e| format!("Failed to encode machine paths: {e}"))?;
+    fs::write(&path, text).map_err(|e| format!("Failed to save machine paths: {e}"))?;
+    Ok(json!({ "ok": true }))
+}
+
 fn load_exa_api_key_from_file(app: &AppHandle) -> String {
     fs::read_to_string(exa_key_file(app))
         .ok()
@@ -3887,6 +3948,168 @@ fn library_collect(sources: Vec<Value>, opts: Option<Value>) -> Result<Value, St
     }))
 }
 
+// ── Hermes warm memory: read the Hermes-General workspace, tier by tier ────────────
+// A fifth context source. The Hermes agent keeps cross-project notes in a workspace with
+// four tiers, and the tier is not a folder convention — it is the evidentiary standing of
+// everything inside it (active = current topic, parked/archive = historical, inbox =
+// untriaged). So this reader is deliberately NOT library_collect pointed at a path: the
+// caller names the tiers it wants, only those four names can ever resolve to a directory,
+// and each document comes back tagged with the tier it was read from so the frontend
+// cannot lose track of which standing applies. Read-only — nothing here writes, and the
+// workspace's own lifecycle files (ACTIVE.md, the tier READMEs, templates/) belong to
+// Hermes.
+const HERMES_TIERS: [&str; 4] = ["active", "parked", "inbox", "archive"];
+
+// Only prose. A README in a tier describes the tier itself, not a topic, and would
+// otherwise read as a document asserting that its own directory is historical.
+fn hermes_is_topic_file(name: &str) -> bool {
+    if name.starts_with('.') || name.eq_ignore_ascii_case("README.md") {
+        return false;
+    }
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".md") || lower.ends_with(".markdown") || lower.ends_with(".txt")
+}
+
+fn hermes_read_doc(path: &Path, tier: &str, root: &Path, max_chars: usize) -> Option<Value> {
+    let raw = fs::read_to_string(path).ok()?;
+    let total = raw.chars().count();
+    let truncated = total > max_chars;
+    let text: String = if truncated {
+        raw.chars().take(max_chars).collect()
+    } else {
+        raw
+    };
+    let mtime = fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    Some(json!({
+        "path": path.to_string_lossy(),
+        "tier": tier,
+        "name": path.file_name().and_then(|s| s.to_str()).unwrap_or("doc"),
+        "rel": path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/"),
+        "text": text,
+        "chars": total,
+        "truncated": truncated,
+        "mtime": mtime
+    }))
+}
+
+fn hermes_walk_tier(
+    dir: &Path,
+    tier: &str,
+    root: &Path,
+    max_files: usize,
+    max_chars: usize,
+    out: &mut Vec<Value>,
+    depth: usize,
+) {
+    if depth > 3 || out.len() >= max_files {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut paths: Vec<PathBuf> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+    paths.sort();
+    for path in paths {
+        if out.len() >= max_files {
+            return;
+        }
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        if path.is_dir() {
+            hermes_walk_tier(&path, tier, root, max_files, max_chars, out, depth + 1);
+        } else if hermes_is_topic_file(&name) {
+            if let Some(doc) = hermes_read_doc(&path, tier, root, max_chars) {
+                out.push(doc);
+            }
+        }
+    }
+}
+
+// Empty root resolves to <home>/Hermes-General. Home-relative rather than absolute on
+// purpose: this repo is public, and a machine-specific path baked into a default has
+// already shipped once from the concept map.
+fn hermes_default_root() -> Option<PathBuf> {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok()?;
+    if home.trim().is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(home).join("Hermes-General"))
+}
+
+#[tauri::command]
+fn hermes_collect(opts: Option<Value>) -> Result<Value, String> {
+    let opts = opts.unwrap_or_else(|| json!({}));
+    let max_files = opts.get("maxFilesPerTier").and_then(Value::as_u64).unwrap_or(40) as usize;
+    let max_chars = opts.get("maxFileChars").and_then(Value::as_u64).unwrap_or(60_000) as usize;
+
+    let root_opt = opts
+        .get("root")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().trim_matches('"').to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(hermes_default_root)
+        .ok_or_else(|| "No Hermes workspace path set, and no home directory to resolve one from.".to_string())?;
+    if !root_opt.is_dir() {
+        return Err(format!("Hermes workspace not found: {}", root_opt.to_string_lossy()));
+    }
+
+    // Only the four known tier names ever become a path, so a tier string cannot walk out
+    // of the workspace, and an unknown one is reported rather than quietly skipped.
+    let requested: Vec<String> = opts
+        .get("tiers")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_str()).map(|s| s.trim().to_ascii_lowercase()).collect())
+        .unwrap_or_else(|| vec!["active".to_string()]);
+
+    let mut docs: Vec<Value> = Vec::new();
+    let mut counts = serde_json::Map::new();
+    let mut missing: Vec<String> = Vec::new();
+    let mut capped = false;
+
+    for tier in &requested {
+        if !HERMES_TIERS.contains(&tier.as_str()) {
+            missing.push(format!("unknown tier '{tier}'"));
+            continue;
+        }
+        let dir = root_opt.join(tier);
+        if !dir.is_dir() {
+            missing.push(format!("no {tier}/ directory"));
+            continue;
+        }
+        let mut tier_docs: Vec<Value> = Vec::new();
+        hermes_walk_tier(&dir, tier, &root_opt, max_files, max_chars, &mut tier_docs, 0);
+        if tier_docs.len() >= max_files {
+            capped = true;
+        }
+        counts.insert(tier.clone(), json!(tier_docs.len()));
+        docs.append(&mut tier_docs);
+    }
+
+    // The workspace's own index of what is current. Returned as text — reading it is the
+    // documented first retrieval step, and which topics it lists is provenance the
+    // frontend shows, not something to infer from the directory listing.
+    let index_path = root_opt.join("ACTIVE.md");
+    let index_text = fs::read_to_string(&index_path).unwrap_or_default();
+
+    Ok(json!({
+        "root": root_opt.to_string_lossy(),
+        "indexText": index_text,
+        "indexFound": index_path.is_file(),
+        "docs": docs,
+        "stats": { "tiers": Value::Object(counts), "missing": missing, "capped": capped }
+    }))
+}
+
 // ── Browser history search (Chromium: Vivaldi / Chrome) ────────────────────────────
 // Reads the user's local Chromium "History" SQLite DB (like the chromium-history-timeline
 // app), so the "Browser history" composer toggle can feed the local LLM what the user has
@@ -4196,6 +4419,7 @@ pub fn run() {
             analysis_reset_topics,
             analysis_reset_canonization,
             library_collect,
+            hermes_collect,
             browser_history_search,
             get_models,
             load_model,
@@ -4206,6 +4430,8 @@ pub fn run() {
             set_server_url,
             get_api_token,
             set_api_token,
+            get_machine_paths,
+            set_machine_path,
             shell_open_external,
             window_minimize,
             window_toggle_maximize,

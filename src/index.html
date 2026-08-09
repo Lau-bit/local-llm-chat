@@ -90,6 +90,7 @@
           <button class="settings-tab" data-settings-tab="conceptmap" role="tab" aria-selected="false">Concept map</button>
           <button class="settings-tab" data-settings-tab="library" role="tab" aria-selected="false">Library</button>
           <button class="settings-tab" data-settings-tab="history" role="tab" aria-selected="false">History</button>
+          <button class="settings-tab" data-settings-tab="hermes" role="tab" aria-selected="false">Hermes</button>
         </div>
         <div id="settings-body">
           <section class="settings-pane" data-settings-pane="setup" role="tabpanel">
@@ -389,6 +390,56 @@
             </div>
             <div id="hist-status" class="settings-hint" style="margin: 6px 0 4px;"></div>
           </section>
+
+          <section class="settings-pane" data-settings-pane="hermes" role="tabpanel">
+            <p class="settings-hint" style="margin: 0 0 10px;">
+              A read-only window onto the Hermes agent's warm-memory workspace — its
+              cross-project topic notes, assessments and decision records. Toggle it on with
+              the tiers button by the composer; it is off until you turn it on, and only the
+              topics that match your message are retrieved. Each one is injected with its
+              freshness stamp and where its claims came from. <strong>This app never writes
+              to the workspace.</strong>
+            </p>
+
+            <label class="settings-label">Workspace folder <span class="settings-hint">(leave empty for <code>&lt;home&gt;\Hermes-General</code>)</span></label>
+            <div class="settings-row">
+              <input type="text" id="hermes-root" spellcheck="false" placeholder="C:\Users\me\Hermes-General">
+            </div>
+
+            <label class="settings-label">Tiers to search</label>
+            <p class="settings-hint" style="margin: 0 0 6px;">
+              <code>active/</code> is always searched — it is the only tier holding current
+              topics. The rest are off by design: their material is never current evidence,
+              so it is only ever included when it actually matches what you asked, and it is
+              labelled as historical or untriaged when it is.
+            </p>
+            <div id="hermes-tiers">
+              <label class="cm-check" style="display:flex; margin: 4px 0;">
+                <input type="checkbox" data-tier="parked"> <span><code>parked/</code> — warm: historical until revalidated, even where it reads present-tense</span>
+              </label>
+              <label class="cm-check" style="display:flex; margin: 4px 0;">
+                <input type="checkbox" data-tier="archive"> <span><code>archive/</code> — cold: consulted for history and provenance only</span>
+              </label>
+              <label class="cm-check" style="display:flex; margin: 4px 0;">
+                <input type="checkbox" data-tier="inbox"> <span><code>inbox/</code> — untriaged material, explicitly not evidence</span>
+              </label>
+            </div>
+
+            <label class="settings-label" style="margin-top: 10px;">Max topics <span class="settings-hint">(documents excerpted per message)</span></label>
+            <div class="settings-row">
+              <input type="number" id="hermes-max-topics" min="1" max="30" step="1" value="5">
+            </div>
+
+            <label class="settings-label">Budget <span class="settings-hint">(max characters injected per message)</span></label>
+            <div class="settings-row">
+              <input type="number" id="hermes-max-chars" min="1000" max="200000" step="1000" value="9000">
+            </div>
+
+            <div class="settings-row" style="margin-top: 6px;">
+              <button id="hermes-preview" class="settings-action-btn" style="width:auto; margin:0; padding:6px 12px;">Test read workspace</button>
+            </div>
+            <div id="hermes-status" class="settings-hint" style="margin: 6px 0 4px;"></div>
+          </section>
         </div>
       </div>
 
@@ -586,7 +637,7 @@
         <button id="image-preview-clear" title="Remove all images">&times;</button>
       </div>
       <div id="composer-main-row">
-        <!-- The four context sources. `display: contents` keeps them laid out by the row's
+        <!-- The five context sources. `display: contents` keeps them laid out by the row's
              flexbox while still grouping them semantically under one name. -->
         <div id="context-sources" role="group" aria-label="Context sources">
         <button id="web-search-toggle" title="Context source: Web search — off" aria-pressed="false">
@@ -617,6 +668,15 @@
             <path d="M3 3v5h5"/>
             <path d="M3.05 13a9 9 0 1 0 2.6-6.36L3 8"/>
             <path d="M12 7v5l3 2"/>
+          </svg>
+        </button>
+        <!-- Stacked tiers, because the tier is the whole point of this source: active on
+             top, then the warm and cold layers that are never current evidence. -->
+        <button id="hermes-toggle" title="Context source: Hermes warm memory — off" aria-pressed="false">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 3 3 7.5l9 4.5 9-4.5z"/>
+            <path d="M3 12l9 4.5 9-4.5"/>
+            <path d="M3 16.5 12 21l9-4.5"/>
           </svg>
         </button>
         </div>

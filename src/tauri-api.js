@@ -53,6 +53,8 @@
     setApiToken: (token) => invoke('set_api_token', { token }),
     getExaApiKey: () => invoke('get_exa_api_key'),
     setExaApiKey: (key) => invoke('set_exa_api_key', { key }),
+    getMachinePaths: () => invoke('get_machine_paths'),
+    setMachinePath: (key, value) => invoke('set_machine_path', { key, value }),
 
     saveChat: (chat, baseCount) => invoke('chat_save', { chat, baseCount }),
     listChats: () => invoke('chat_list'),
@@ -91,6 +93,7 @@
     analysisResetCanonization: (datasetId, runId) => invoke('analysis_reset_canonization', { datasetId, runId }),
 
     libraryCollect: (sources, opts) => invoke('library_collect', { sources, opts }),
+    hermesCollect: (opts) => invoke('hermes_collect', { opts }),
     historySearch: (opts) => invoke('browser_history_search', { opts }),
 
     openExternal: (url) => invoke('shell_open_external', { url }),

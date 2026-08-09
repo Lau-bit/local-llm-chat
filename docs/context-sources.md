@@ -1,6 +1,7 @@
 # Context sources — design and measured behaviour
 
-The app has four **context sources**: Web search, Concept map, Local library, Browser history.
+The app has five **context sources**: Web search, Concept map, Local library, Browser history,
+Hermes warm memory.
 Each is built by the app *before* the request is sent and injected as a `system` message — the model
 invokes nothing and is told so explicitly. This document records how they are assembled and what was
 measured on real hardware, so the design decisions are not re-derived from scratch.
@@ -20,7 +21,7 @@ header the model reads.
 [system: preamble]            ← always sent, constant text
 [system: primed concept map]  ← once per chat, frozen
 …conversation…
-[system: per-message sources] ← library / history / web / map slice, before the newest user turn
+[system: per-message sources] ← library / hermes / history / web / map slice, before the user turn
 [user]
 ```
 
@@ -129,6 +130,74 @@ on an earlier turn says nothing about this one), a broad query *after* a miss re
 why. With the guard in place the same question is answered *"I cannot tailor an approach to your
 existing workflows… here is a general framework"*, which is the correct answer. A specific retry after
 a miss is unaffected.
+
+## Hermes warm memory: retrieving another agent's notes without inheriting their certainty
+
+The fifth source reads a **warm-memory workspace** — the topic notes, assessments and decision
+records the Hermes agent keeps outside this app, at `<home>/Hermes-General` by default. It is the
+only source whose material arrives with an evidentiary standing already attached to it, and
+preserving that standing across the trip into the prompt is the entire design.
+
+The workspace sorts documents into four tiers, and a tier is not filing — it says how a claim in
+that document may be used:
+
+| tier | standing |
+|---|---|
+| `active/` | current topic, still point-in-time |
+| `parked/` | historical until revalidated, **even where the prose is present-tense** |
+| `archive/` | historical, kept for provenance |
+| `inbox/` | untriaged, explicitly not evidence |
+
+Three properties follow from that, and each is enforced in a different layer so no single edit can
+quietly undo them:
+
+- **Explicitly selected, never ambient.** The source ships off (`hermesEnabled: '0'`), and
+  `sendMessage` has no path that reads the workspace with the toggle off. Turning it on searches
+  `active/` only; the other three tiers are opt-in checkboxes in Settings → Hermes.
+- **Non-current tiers cannot arrive by accident.** Even opted in, a parked/archive/inbox document
+  is included **only when it lexically matches the message**. There is no recency or salience
+  fallback for them, they are never used to pad a thin result, and — unlike current topics — an
+  unmatched one is dropped rather than listed with a caveat. When one does appear, its tier
+  standing is the first thing in its header, and `superseded_by` overrides the tier wording.
+- **Read-only, and bounded at the Rust boundary.** `hermes_collect` is the only door. It resolves
+  the root, and only the four known tier names can ever become a path, so a tier string cannot walk
+  out of the workspace; README files, dotfiles and `templates/` are excluded, since a tier's README
+  describes the tier rather than asserting a topic. Nothing in the app writes there.
+
+### What each document carries
+
+Every retrieved document is injected with its metadata block before any of its text: tier standing,
+path, `status`, freshness, the `sources:` list it was built from, and its section headings. Freshness
+comes from the document's own `information_as_of` and `review_after`, **never from the file's mtime**
+— the workspace rewrites documents long after the observations they record, so an mtime would date
+the edit and present it as the observation. A document past `review_after` is labelled `REVIEW DUE`;
+one with no stamp is labelled as unable to be aged rather than silently treated as recent.
+
+Ages are floored, not rounded. Most stamps are date-only and parse to midnight, so rounding reports
+a note written yesterday evening as two days old and a review date as falling a day early.
+
+### The matched-token floor, measured again
+
+A query of three or more tokens must match a document on **two** of them. This is the same rule
+`concept_search` needs, and it was re-measured here rather than assumed: *"how do I re-tension a
+bicycle chain"* retrieved a UI-shock assessment, because that document happens to contain the word
+"chain". A whole document is a far larger surface than a concept label, so a single common word lands
+in one almost every time, and the result is a dated assessment of an unrelated subject presented as
+relevant. Queries below three tokens keep single-token matching — there is nothing else to go on.
+
+### When nothing matches
+
+The block is still sent, but with **titles and dates only** and an explicit instruction not to
+connect the answer to them. That is a deliberate middle path between the two failures: injecting
+content nobody asked for (the laundering the concept map's on-demand mode exists to prevent), and
+saying nothing, which leaves the model free to assume the workspace covers a subject it does not.
+The list is the workspace's own current-topic index, which is also the first step of its documented
+retrieval discipline.
+
+Verified by `hermes.mjs` in the test harness (36 assertions, no model needed): the fixture cases for
+tier handling, superseding, review dates and budgets, plus a read of the real workspace that asserts
+its files are byte-for-byte untouched afterwards. The Rust seam, the UI wiring and the actual
+injected system message were checked in the running app over CDP.
 
 ## Measured on gemma-4-26b-a4b (RTX 5090, 100% GPU offload)
 

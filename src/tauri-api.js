@@ -93,6 +93,9 @@
     analysisResetCanonization: (datasetId, runId) => invoke('analysis_reset_canonization', { datasetId, runId }),
 
     libraryCollect: (sources, opts) => invoke('library_collect', { sources, opts }),
+    // Goes through Rust rather than fetch: the webview CSP is default-src 'self', so a
+    // page-side call to a loopback port is blocked. See library_search in lib.rs.
+    librarySearch: (baseUrl, query, k) => invoke('library_search', { baseUrl, query, k }),
     hermesCollect: (opts) => invoke('hermes_collect', { opts }),
     historySearch: (opts) => invoke('browser_history_search', { opts }),
 

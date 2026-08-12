@@ -344,6 +344,19 @@
             <div class="settings-row">
               <input type="number" id="lib-max-chars" min="1000" max="200000" step="1000" value="12000">
             </div>
+
+            <label class="settings-label">Semantic ranking <span class="settings-hint">(Relevant mode only)</span></label>
+            <label class="cm-check" style="margin: 2px 0 6px;">
+              <input type="checkbox" id="lib-semantic"> Order files with a local vault-search service when one is running
+            </label>
+            <div class="settings-row">
+              <input type="text" id="lib-search-url" spellcheck="false" placeholder="http://127.0.0.1:5278">
+            </div>
+            <div class="settings-hint" style="margin: 4px 0 0;">
+              Keyword ranking misses short terms and inflections. If a vault-search service answers, it
+              reorders the same files instead — nothing else changes, and if it does not answer this
+              falls back silently for the rest of the session.
+            </div>
           </section>
 
           <section class="settings-pane" data-settings-pane="history" role="tabpanel">

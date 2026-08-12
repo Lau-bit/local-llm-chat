@@ -3872,6 +3872,55 @@ fn library_collect_dir(
     }
 }
 
+/// Ask a local vault-search service to RANK the library for a message.
+///
+/// WHY THIS IS A RUST COMMAND AND NOT A `fetch` IN THE PAGE. The webview's CSP is
+/// `default-src 'self'` with no `connect-src`, so a page-side fetch to a loopback port is
+/// blocked outright — measured by driving the running app over CDP, where it surfaced as
+/// a bare "Failed to fetch". The alternatives were widening the CSP or moving the call to
+/// the backend. Widening it to `http://127.0.0.1:*` in a PUBLIC repo would let any content
+/// this app renders — including model output — reach every loopback service on a user's
+/// machine, to serve a feature that is optional and machine-specific. Every other network
+/// call here already goes through Rust, so this one does too and the CSP is untouched.
+///
+/// Deliberately dumb: it forwards a query, returns whatever JSON came back, and never
+/// interprets it. Ranking lives in the service; deciding what to do with a failure lives
+/// in the caller, which falls back to lexical ordering.
+///
+/// LOOPBACK ONLY. The URL is a user setting, so it is checked rather than trusted: a
+/// non-loopback host is refused, because "point this at a URL" must not become a way to
+/// send the user's notes-shaped queries to an arbitrary server.
+#[tauri::command]
+async fn library_search(base_url: String, query: String, k: Option<u64>) -> Result<Value, String> {
+    let base = base_url.trim().trim_end_matches('/').to_string();
+    let parsed = reqwest::Url::parse(&base).map_err(|e| format!("Bad search URL: {e}"))?;
+    let host = parsed.host_str().unwrap_or_default();
+    if !matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1") {
+        return Err(format!("Refusing a non-loopback search URL: {host}"));
+    }
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_millis(700))
+        .timeout(Duration::from_millis(1500))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let url = format!("{}/api/search", base);
+    let resp = client
+        .get(&url)
+        .query(&[
+            ("q", query.chars().take(400).collect::<String>()),
+            ("k", k.unwrap_or(25).clamp(1, 50).to_string()),
+        ])
+        .send()
+        .await
+        .map_err(|e| format!("Cannot reach search service: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("Search service returned {}", resp.status()));
+    }
+    resp.json::<Value>().await.map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn library_collect(sources: Vec<Value>, opts: Option<Value>) -> Result<Value, String> {
     let opts = opts.unwrap_or_else(|| json!({}));
@@ -4419,6 +4468,7 @@ pub fn run() {
             analysis_reset_topics,
             analysis_reset_canonization,
             library_collect,
+            library_search,
             hermes_collect,
             browser_history_search,
             get_models,

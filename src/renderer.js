@@ -327,6 +327,8 @@ const libMode           = document.getElementById('lib-mode');
 const libMaxChars       = document.getElementById('lib-max-chars');
 const libPreview        = document.getElementById('lib-preview');
 const libStatus         = document.getElementById('lib-status');
+const libSemantic       = document.getElementById('lib-semantic');
+const libSearchUrl      = document.getElementById('lib-search-url');
 const historyToggle     = document.getElementById('history-toggle');
 const histMode          = document.getElementById('hist-mode');
 const histDays          = document.getElementById('hist-days');
@@ -401,6 +403,12 @@ const DEFAULTS = {
   libraryMode: 'relevant',
   librarySources: '',  // machine-specific → file-backed, see initMachinePaths
   libraryMaxChars: '24000',
+  // Semantic ordering via a local vault-search service, if one is running. A loopback
+  // URL is portable in a way a filesystem path is not, so unlike librarySources this
+  // belongs in DEFAULTS: on a machine with nothing on 5278 the first probe fails, the
+  // feature latches off for the session, and the lexical path runs exactly as before.
+  librarySemantic: '1',
+  librarySearchUrl: 'http://127.0.0.1:5278',
   // Browser history
   historyEnabled: '1',
   historyMode: 'relevant',
@@ -662,6 +670,8 @@ let libraryEnabled = prefBool('libraryEnabled');
 let libraryMode = pref('libraryMode');  // 'relevant' | 'all'
 let librarySourcesText = pref('librarySources');
 let libraryMaxChars = prefInt('libraryMaxChars');
+let librarySemantic = prefBool('librarySemantic');
+let librarySearchUrl = pref('librarySearchUrl');
 const LIBRARY_FRAMING = `The following is content from the user's own local library — notes and source texts they have placed in specific folders/files for you to use directly. Treat it as authoritative, user-provided material and draw on it when it is relevant to the message; refer to the file name when you use something from it. If a piece isn't relevant to the message, ignore it.`;
 // Read caps handed to the Rust library_collect command (per-message; JS then trims to budget).
 const LIBRARY_COLLECT_OPTS = { maxFiles: 400, maxTotalChars: 2000000, maxFileChars: 200000 };
@@ -1147,6 +1157,8 @@ applyLibraryToggle();
 if (libSources) libSources.value = librarySourcesText;
 if (libMode) libMode.value = libraryMode;
 if (libMaxChars) libMaxChars.value = libraryMaxChars;
+if (libSemantic) libSemantic.checked = librarySemantic;
+if (libSearchUrl) libSearchUrl.value = librarySearchUrl;
 
 libSources?.addEventListener('change', () => {
   librarySourcesText = libSources.value;
@@ -1165,6 +1177,18 @@ libMaxChars?.addEventListener('change', () => {
   localStorage.setItem('libraryMaxChars', val);
 });
 
+libSemantic?.addEventListener('change', () => {
+  librarySemantic = !!libSemantic.checked;
+  localStorage.setItem('librarySemantic', librarySemantic ? '1' : '0');
+  libSearchOffUntilReload = false;   // turning it back on is a request to retry
+});
+
+libSearchUrl?.addEventListener('change', () => {
+  librarySearchUrl = libSearchUrl.value.trim();
+  localStorage.setItem('librarySearchUrl', librarySearchUrl);
+  libSearchOffUntilReload = false;   // a new address deserves a fresh probe
+});
+
 libPreview?.addEventListener('click', async () => {
   const sources = libParseSources(libSources ? libSources.value : librarySourcesText);
   if (!sources.length) { if (libStatus) libStatus.textContent = 'Add at least one folder or file path first.'; return; }
@@ -1179,6 +1203,7 @@ libPreview?.addEventListener('click', async () => {
       ? `${files.length} files · ${zones.length} zone(s): ${zones.join(', ')} · ~${kb}k chars`
         + (miss.length ? ` · ${miss.length} missing path(s)` : '')
         + (res?.stats?.capped ? ' · capped' : '')
+        + (files.length ? ` · ${await libSemanticCoverage(files)}` : '')
       : `No readable text files found${miss.length ? ` · missing: ${miss.join(', ')}` : ''}.`;
   } catch (err) {
     if (libStatus) libStatus.textContent = `Read failed: ${err?.message || err}`;
@@ -7637,9 +7662,16 @@ function libBestBlocks(text, q, idf, cap) {
 }
 
 // "Relevant" packing: IDF-rank files against the message, take the best blocks of each.
-function libPackRelevant(files, userText, budget) {
+//
+// `order` (optional) supplies the ranking from outside — see libSemanticOrder. When it is
+// given, only the ORDER changes: block selection, the per-file share and the budget loop are
+// the same code, so the semantic path cannot alter how much context a message gets. It also
+// skips the empty-query bail-out below, which is the point: "what does td do" tokenizes to
+// nothing here (3-char floor, and every other word is a stopword), so the lexical path
+// returns no files at all for a question a semantic ranker answers immediately.
+function libPackRelevant(files, userText, budget, order = null) {
   const q = new Set(cmTokens(userText));
-  if (!q.size) return [];
+  if (!q.size && !order) return [];
   const df = new Map();
   const fileToks = files.map(f => {
     const toks = new Set(cmTokens(`${f.name || ''} ${f.text || ''}`));
@@ -7648,11 +7680,13 @@ function libPackRelevant(files, userText, budget) {
   });
   const total = files.length || 1;
   const idf = (t) => Math.log((total + 1) / ((df.get(t) || 0) + 1)) + 1;
-  const scored = files.map((f, i) => {
-    let s = 0;
-    for (const t of q) if (fileToks[i].has(t)) s += idf(t);
-    return { f, s };
-  }).filter(x => x.s > 0).sort((a, b) => b.s - a.s);
+  const scored = order
+    ? order.map(f => ({ f, s: 1 }))
+    : files.map((f, i) => {
+      let s = 0;
+      for (const t of q) if (fileToks[i].has(t)) s += idf(t);
+      return { f, s };
+    }).filter(x => x.s > 0).sort((a, b) => b.s - a.s);
   if (!scored.length) return [];
   const out = [];
   let used = 0;
@@ -7667,6 +7701,124 @@ function libPackRelevant(files, userText, budget) {
   return out;
 }
 
+/* ── Semantic ordering via the local vault-search service ─────────────────────────
+   OPTIONAL, LOCAL, AND IT ONLY REORDERS. The lexical ranker above scores a file by
+   summing IDF over query terms, which measurably fails in three ways on a notes
+   corpus: tokens under three characters do not exist (`td`, `ci`, `rg`), `run` and
+   `runs` are different terms, and one passing mention ranks level with a document
+   about the subject. `vault-search` (a separate local project, 127.0.0.1:5278) indexes
+   the same kind of material with an embedding model and answers with a ranked list.
+
+   THREE PROPERTIES THIS MUST HAVE, and they are why it looks like this:
+
+   1. IT CANNOT BREAK A MESSAGE. One short-timeout request; any failure returns null and
+      the caller falls through to the lexical path unchanged. After one failure the
+      service is not probed again for the rest of the session — on a machine that has
+      never heard of vault-search (this is a public repo) the cost is one refused
+      connection per app run, not one per message.
+
+   ⚠ IT GOES THROUGH RUST, NOT `fetch`. The webview's CSP is `default-src 'self'` with no
+   `connect-src`, so a page-side fetch to a loopback port is blocked outright — measured
+   by driving the running app over CDP, where it read as a bare "Failed to fetch". The
+   fix is NOT to widen the CSP: `connect-src http://127.0.0.1:*` in a public repo would
+   let anything this app renders, model output included, reach every loopback service on
+   a user's machine. `library_search` in lib.rs makes the call instead, which is also how
+   every other network call in this app already works.
+   2. IT ONLY REORDERS FILES THE APP ALREADY READ. `library_collect` stays the single
+      source of truth for WHICH files are in scope; anything vault-search returns that
+      is not in that set is dropped. Your library sources and its indexed roots need not
+      be the same folders, and where they do not overlap this simply does nothing.
+   3. IT CHANGES NO BUDGET. The ordered list goes back through libPackRelevant, so the
+      same block selection and the same character budget apply.                        */
+
+let libSearchOffUntilReload = false;   // one failure is enough; see property 1
+
+// WHY the lexical path ran when the semantic one was asked for. Property 2 makes a
+// non-overlapping configuration a no-op *by design*, but it used to be a SILENT one: the
+// only trace was `ranked: lexical` in the note, which is also what a plain miss looks
+// like. Measured 2026-08-12 — this machine's library sources were two files in Documents\
+// and vault-search indexed neither, so the feature had never once engaged in daily use and
+// nothing said so. The design is unchanged; only the silence is.
+let libSemanticWhy = '';
+
+const libPathKey = (p) => String(p || '').replace(/\\/g, '/').toLowerCase();
+
+// How many of these files sit under a root the service actually indexes. A prefix test, so
+// it over-counts (the service applies its own extension allowlist and exclusions on top) —
+// but it is the difference between "wrong folders" and "right folders, weak match", and
+// only the first is a mistake the user can fix. null = the service did not report roots.
+function libCountIndexed(files, roots) {
+  const rs = (Array.isArray(roots) ? roots : []).map(r => libPathKey(r).replace(/\/+$/, '') + '/');
+  if (!rs.length) return null;
+  return files.filter(f => rs.some(r => libPathKey(f.path).startsWith(r))).length;
+}
+
+/** Ranked subset of `files`, or null to mean "use the lexical path". */
+async function libSemanticOrder(userText, files) {
+  libSemanticWhy = '';
+  if (!librarySemantic) return null;
+  if (libSearchOffUntilReload) { libSemanticWhy = 'vault-search unreachable'; return null; }
+  if (!userText || !files.length) return null;
+  if (!window.api?.librarySearch) return null;
+
+  const base = String(librarySearchUrl || '').replace(/\/$/, '');
+  if (!base) return null;
+
+  let hits, roots;
+  try {
+    // Ask for more than the budget can hold: results outside the library's own file set
+    // are dropped below, so the useful count is only known after intersecting.
+    const body = await window.api.librarySearch(base, userText.slice(0, 400), 25);
+    hits = Array.isArray(body?.results) ? body.results : [];
+    roots = body?.roots;
+  } catch {
+    libSearchOffUntilReload = true;
+    libSemanticWhy = 'vault-search unreachable';
+    return null;
+  }
+
+  const byPath = new Map(files.map(f => [libPathKey(f.path), f]));
+  const ordered = [];
+  const taken = new Set();
+  for (const h of hits) {
+    const f = byPath.get(libPathKey(h.path));
+    if (!f || taken.has(f)) continue;
+    taken.add(f);
+    ordered.push(f);
+  }
+  // A single overlapping file is not a ranking. Fall back rather than hand the model one
+  // note because it happened to be the only one both systems know about.
+  if (ordered.length >= 2) return ordered;
+  const indexed = libCountIndexed(files, roots);
+  libSemanticWhy = indexed === 0
+    ? `vault-search indexes none of these ${files.length} file${files.length === 1 ? '' : 's'}`
+    : `vault-search matched ${ordered.length} of ${files.length}`;
+  return null;
+}
+
+/* One line for Settings → "Test read sources": would the semantic ranker actually engage on
+   THESE sources? The in-chat note can only report this after a message has already been
+   sent with the wrong configuration; this answers it while the paths are still on screen,
+   which is where a folder mismatch is cheap to fix. The probe is a real search — /api/search
+   is the only endpoint the Rust command will call — and its query is irrelevant, because
+   what is wanted from the reply is `roots`. */
+async function libSemanticCoverage(files) {
+  if (!librarySemantic) return 'semantic ordering off';
+  const base = String(librarySearchUrl || '').replace(/\/$/, '');
+  if (!base || !window.api?.librarySearch) return 'vault-search not configured';
+  let roots;
+  try {
+    roots = (await window.api.librarySearch(base, 'index coverage probe', 1))?.roots;
+  } catch (err) {
+    return `vault-search unreachable (${String(err?.message || err).slice(0, 60)})`;
+  }
+  const n = libCountIndexed(files, roots);
+  if (n === null) return 'vault-search up (roots unknown — older service)';
+  if (n === 0) return `⚠ vault-search indexes NONE of these files — semantic ordering will never run`;
+  if (n < 2) return `⚠ vault-search indexes only ${n} of ${files.length} — needs 2+ to rank`;
+  return `vault-search indexes ${n} of ${files.length}`;
+}
+
 function renderLibraryNote(info) {
   const div = document.createElement('div');
   div.className = 'message search-sources library-note';
@@ -7676,7 +7828,11 @@ function renderLibraryNote(info) {
   div.appendChild(title);
   const sub = document.createElement('div');
   sub.className = 'search-sources-queries';
+  // The ranker is named because the two pick genuinely different files, and "why did it
+  // send that note" is unanswerable without knowing which one ran.
   sub.textContent = `${info.mode} · zones: ${info.zones.join(', ') || 'none'}`
+    + (info.ranker ? ` · ranked: ${info.ranker}` : '')
+    + (info.why ? ` · ${info.why}` : '')
     + (info.missing ? ` · ${info.missing} missing path(s)` : '');
   div.appendChild(sub);
   messagesEl.appendChild(div);
@@ -7709,11 +7865,17 @@ async function buildLibraryContext(userText) {
 
   const budget = Math.max(1000, libraryMaxChars);
   let picked;
+  let ranker = libraryMode === 'all' ? 'recent' : 'lexical';
   if (libraryMode === 'all' || !userText) {
     picked = libPackAll(files, budget);
   } else {
-    picked = libPackRelevant(files, userText, budget);
-    if (!picked.length) picked = libPackAll(files, Math.min(budget, 4000));  // no lexical hit → compact recent
+    const order = await libSemanticOrder(userText, files);
+    if (order) { picked = libPackRelevant(files, userText, budget, order); ranker = 'semantic'; }
+    else picked = libPackRelevant(files, userText, budget);
+    if (!picked.length) {
+      picked = libPackAll(files, Math.min(budget, 4000));  // no hit at all → compact recent
+      ranker = 'recent';
+    }
   }
   if (!picked.length) return null;
 
@@ -7725,7 +7887,10 @@ async function buildLibraryContext(userText) {
   }
   const zoneNames = [...byZone.keys()];
 
-  renderLibraryNote({ files: picked.length, zones: zoneNames, mode: libraryMode, missing: missing.length });
+  renderLibraryNote({
+    files: picked.length, zones: zoneNames, mode: libraryMode, missing: missing.length, ranker,
+    why: ranker === 'semantic' ? '' : libSemanticWhy,
+  });
 
   const parts = [
     LIBRARY_FRAMING,

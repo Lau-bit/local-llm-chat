@@ -13,6 +13,11 @@ use std::{
 use tauri::{ipc::Channel, AppHandle, Emitter, Manager, WebviewWindow};
 use tokio::sync::oneshot;
 
+// Public so `tests/provider_stream.rs` can drive the real parser against the real bytes
+// that `tools/fake-server.mjs` puts on a socket.
+pub mod stream_parse;
+use stream_parse::{take_complete_lines, StreamAccum};
+
 const DEFAULT_SERVER_URL: &str = "http://localhost:1234";
 const CONNECT_TIMEOUT_SECS: u64 = 30;
 const RESPONSE_HEADERS_TIMEOUT_SECS: u64 = 120;
@@ -23,7 +28,14 @@ const IMAGE_ANALYSIS_MAX_TOKENS: u64 = 8192;
 struct AppState {
     // Keyed by generation id so one in-flight generation starting never cancels another
     // (previously a single shared slot — starting request B silently killed request A).
-    current_cancel: Mutex<HashMap<u64, oneshot::Sender<()>>>,
+    //
+    // The value carries a *scope* as well as the canceller, because the keying alone was
+    // being defeated at cancel time: `chat_cancel` drained the whole map, and there are two
+    // independent Stop buttons — the composer's and Data Analysis's. Pressing Stop in the
+    // chat while an analysis run was mid-batch cancelled that batch too (and vice versa),
+    // which surfaced as an analysis run dying with "cancelled" for no reason the user could
+    // see. A cancel now only reaches generations started by the same part of the app.
+    current_cancel: Mutex<HashMap<u64, (String, oneshot::Sender<()>)>>,
     next_generation: Mutex<u64>,
     current_model_load_cancel: Mutex<Option<oneshot::Sender<()>>>,
     server_url: Mutex<String>,
@@ -38,6 +50,15 @@ struct AppState {
     // Cache of chat_id -> file path so single-chat ops don't rescan the whole chats tree.
     // Rebuilt wholesale on a lookup miss (e.g. externally-added files) to stay correct.
     chat_index: Mutex<Option<HashMap<String, PathBuf>>>,
+}
+
+/// Does a cancel for `wanted` reach a generation registered under `entry`?
+///
+/// An empty `wanted` means "cancel everything", and an empty `entry` means the caller did
+/// not declare a scope and so stays cancellable by anyone — both are needed so a caller
+/// that has not been updated cannot become uncancellable.
+fn cancel_scope_matches(entry: &str, wanted: &str) -> bool {
+    wanted.is_empty() || entry.is_empty() || entry == wanted
 }
 
 fn next_generation_id(state: &AppState) -> u64 {
@@ -1631,9 +1652,22 @@ async fn post_stream(
     let endpoint = format!("{}/v1/chat/completions", server_url.trim_end_matches('/'));
     let start = now_ms();
 
+    // Which Stop button owns this request. Callers that do not say are cancellable by any
+    // scope, preserving the previous behaviour for anything not yet updated.
+    let cancel_scope = options
+        .as_ref()
+        .and_then(|o| o.get("cancelScope"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
     let (cancel_tx, mut cancel_rx) = oneshot::channel();
     let generation = next_generation_id(&state);
-    state.current_cancel.lock().unwrap().insert(generation, cancel_tx);
+    state
+        .current_cancel
+        .lock()
+        .unwrap()
+        .insert(generation, (cancel_scope, cancel_tx));
     let _cancel_guard = CancelGuard {
         state: state.inner(),
         generation,
@@ -1810,20 +1844,31 @@ async fn post_stream(
     }
 
     let mut stream = response.bytes_stream();
-    let mut full_content = String::new();
-    let mut tool_calls: Vec<Value> = Vec::new();
+    let mut accum = StreamAccum::new();
     // Raw bytes, not a String: network chunk boundaries aren't guaranteed to land on
     // UTF-8 character boundaries, so decoding each chunk independently (as before) could
     // split a multi-byte character and turn it into replacement-character garbage.
     let mut buffer: Vec<u8> = Vec::new();
-    let mut chunk_count = 0u64;
-    let mut stream_error: Option<String> = None;
+
+    // Text that already reached the user is real output, whatever happens to the rest of
+    // the stream. Every interrupted path below returns it alongside the error so the
+    // frontend can keep and save it: a stall or a dropped socket used to discard the whole
+    // partial answer, which on a long generation meant losing minutes of visible text.
+    macro_rules! interrupted {
+        ($($field:tt)*) => {{
+            let mut out = json!({ $($field)* });
+            out["content"] = json!(accum.content);
+            out["partial"] = json!(!accum.content.is_empty());
+            out["chunkCount"] = json!(accum.chunk_count);
+            out
+        }};
+    }
 
     loop {
         let next = tokio::select! {
             _ = &mut cancel_rx => {
-                dev_log(&window, "response", json!({ "endpoint": endpoint, "model": model, "durationMs": now_ms().saturating_sub(start), "chunkCount": chunk_count, "status": "cancelled" }));
-                return json!({ "cancelled": true });
+                dev_log(&window, "response", json!({ "endpoint": endpoint, "model": model, "durationMs": now_ms().saturating_sub(start), "chunkCount": accum.chunk_count, "contentLength": accum.content.len(), "status": "cancelled" }));
+                return interrupted!("cancelled": true);
             }
             item = tokio::time::timeout(Duration::from_secs(STALL_TIMEOUT_SECS), stream.next()) => item,
         };
@@ -1831,7 +1876,9 @@ async fn post_stream(
         let Some(item) = (match next {
             Ok(v) => v,
             Err(_) => {
-                return json!({ "error": format!("Stream stalled — no data for {STALL_TIMEOUT_SECS}s") })
+                let msg = format!("Stream stalled — no data for {STALL_TIMEOUT_SECS}s");
+                dev_log(&window, "response", json!({ "endpoint": endpoint, "model": model, "durationMs": now_ms().saturating_sub(start), "chunkCount": accum.chunk_count, "status": "error", "error": msg }));
+                return interrupted!("error": msg);
             }
         }) else {
             break;
@@ -1839,96 +1886,38 @@ async fn post_stream(
 
         let bytes = match item {
             Ok(b) => b,
-            Err(e) => return json!({ "error": e.to_string() }),
+            Err(e) => {
+                // A dropped connection mid-generation lands here. reqwest's message alone
+                // ("error decoding response body") does not say that, so name it.
+                let msg = format!("Connection lost while streaming: {e}");
+                dev_log(&window, "response", json!({ "endpoint": endpoint, "model": model, "durationMs": now_ms().saturating_sub(start), "chunkCount": accum.chunk_count, "status": "error", "error": msg }));
+                return interrupted!("error": msg);
+            }
         };
 
         buffer.extend_from_slice(&bytes);
 
-        // Only decode up through the last newline; '\n' (0x0A) never appears inside a
-        // multi-byte UTF-8 sequence, so splitting on raw bytes here is always safe. Any
-        // trailing partial line — which may end mid-character if a chunk boundary split
-        // it — stays buffered as raw bytes until the rest of it arrives.
-        let Some(split_at) = buffer.iter().rposition(|&b| b == b'\n').map(|i| i + 1) else {
+        let Some(text) = take_complete_lines(&mut buffer) else {
             continue;
         };
-        let complete: Vec<u8> = buffer.drain(..split_at).collect();
-        let text = String::from_utf8_lossy(&complete);
 
         for line in text.split('\n') {
-            let trimmed = line.trim();
-            if trimmed.is_empty()
-                || trimmed.starts_with("event:")
-                || trimmed == "data: [DONE]"
-                || !trimmed.starts_with("data: ")
-            {
-                continue;
+            if let Some(delta) = accum.apply_line(line) {
+                let _ = stream_channel.send(delta);
             }
-            let Ok(json_event) = serde_json::from_str::<Value>(&trimmed[6..]) else {
-                continue;
-            };
-
-            if let Some(err_msg) = json_event.get("error").and_then(Value::as_str) {
-                stream_error = Some(err_msg.to_string());
+            if accum.error.is_some() {
                 break;
-            }
-
-            // Standard OpenAI chat/completions streaming format
-            if let Some(delta) = json_event
-                .pointer("/choices/0/delta/content")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-            {
-                full_content.push_str(delta);
-                chunk_count += 1;
-                let _ = stream_channel.send(delta.to_string());
-            }
-
-            // Tool calls arrive split across chunks: the id and function name appear once,
-            // the arguments accumulate as JSON fragments, and `index` says which call each
-            // fragment belongs to. Reassemble per index rather than assuming one call, and
-            // do not forward any of it to the stream channel — it is not answer text.
-            if let Some(deltas) = json_event
-                .pointer("/choices/0/delta/tool_calls")
-                .and_then(Value::as_array)
-            {
-                for d in deltas {
-                    let idx = d.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                    while tool_calls.len() <= idx {
-                        tool_calls.push(json!({
-                            "id": "", "type": "function",
-                            "function": { "name": "", "arguments": "" }
-                        }));
-                    }
-                    let slot = &mut tool_calls[idx];
-                    if let Some(id) = d.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-                        slot["id"] = json!(id);
-                    }
-                    if let Some(name) = d
-                        .pointer("/function/name")
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.is_empty())
-                    {
-                        slot["function"]["name"] = json!(name);
-                    }
-                    if let Some(args) = d.pointer("/function/arguments").and_then(Value::as_str) {
-                        let joined = format!(
-                            "{}{}",
-                            slot["function"]["arguments"].as_str().unwrap_or(""),
-                            args
-                        );
-                        slot["function"]["arguments"] = json!(joined);
-                    }
-                }
             }
         }
 
-        if stream_error.is_some() {
+        if accum.error.is_some() {
             break;
         }
     }
 
-    if let Some(error) = stream_error {
-        return json!({ "error": error });
+    if let Some(error) = accum.error.clone() {
+        dev_log(&window, "response", json!({ "endpoint": endpoint, "model": model, "durationMs": now_ms().saturating_sub(start), "chunkCount": accum.chunk_count, "contentLength": accum.content.len(), "status": "error", "error": error }));
+        return interrupted!("error": error);
     }
 
     dev_log(
@@ -1938,8 +1927,8 @@ async fn post_stream(
             "endpoint": endpoint,
             "model": model,
             "durationMs": now_ms().saturating_sub(start),
-            "contentLength": full_content.len(),
-            "chunkCount": chunk_count,
+            "contentLength": accum.content.len(),
+            "chunkCount": accum.chunk_count,
             "status": "success",
             "reasoningRequested": reasoning_preference,
             "reasoningFallback": reasoning_fallback
@@ -1947,8 +1936,8 @@ async fn post_stream(
     );
 
     json!({
-        "content": full_content,
-        "toolCalls": tool_calls,
+        "content": accum.content,
+        "toolCalls": accum.tool_calls,
         "reasoningRequested": reasoning_preference,
         "reasoningFallback": reasoning_fallback
     })
@@ -2013,15 +2002,30 @@ async fn chat_analyze_image(
 }
 
 #[tauri::command]
-fn chat_cancel(state: tauri::State<'_, AppState>) -> Result<Value, String> {
-    // Cancels every in-flight generation (there is normally exactly one from the UI's
-    // point of view), rather than a single shared slot that a second request starting
-    // could silently steal from an unrelated first one.
+fn chat_cancel(state: tauri::State<'_, AppState>, scope: Option<String>) -> Result<Value, String> {
+    // Cancels the in-flight generations belonging to `scope` — "chat" for the composer's
+    // Stop button, "analysis" for Data Analysis's. Without a scope it still cancels
+    // everything, which is what an unqualified "stop what you are doing" should mean.
+    //
+    // The scope matters because the two Stop buttons are independent and the app-mode tabs
+    // let a long analysis run continue while the user chats: draining the whole map meant
+    // the composer's Stop silently killed the analysis batch in flight, and the analysis
+    // Stop killed the chat the user was reading.
     let mut map = state.current_cancel.lock().map_err(|e| e.to_string())?;
-    for (_, cancel) in map.drain() {
-        let _ = cancel.send(());
+    let wanted = scope.unwrap_or_default();
+    let mut cancelled = 0usize;
+    let ids: Vec<u64> = map
+        .iter()
+        .filter(|(_, (s, _))| cancel_scope_matches(s, &wanted))
+        .map(|(id, _)| *id)
+        .collect();
+    for id in ids {
+        if let Some((_, cancel)) = map.remove(&id) {
+            let _ = cancel.send(());
+            cancelled += 1;
+        }
     }
-    Ok(json!({ "cancelled": true }))
+    Ok(json!({ "cancelled": true, "count": cancelled, "scope": wanted }))
 }
 
 #[tauri::command]
@@ -4490,4 +4494,33 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod cancel_scope_tests {
+    use super::cancel_scope_matches;
+
+    // The composer's Stop and Data Analysis's Stop are independent, and the app-mode tabs
+    // let a long analysis run continue while the user chats. Before scoping, `chat_cancel`
+    // drained every in-flight generation, so either button killed the other's work.
+    #[test]
+    fn a_scoped_cancel_reaches_only_its_own_scope() {
+        assert!(cancel_scope_matches("chat", "chat"));
+        assert!(!cancel_scope_matches("analysis", "chat"), "chat Stop must not kill an analysis batch");
+        assert!(!cancel_scope_matches("chat", "analysis"), "analysis Stop must not kill the chat");
+    }
+
+    #[test]
+    fn an_unscoped_cancel_still_stops_everything() {
+        assert!(cancel_scope_matches("chat", ""));
+        assert!(cancel_scope_matches("analysis", ""));
+    }
+
+    #[test]
+    fn a_caller_that_declares_no_scope_stays_cancellable() {
+        // So a call site that has not been updated can never become uncancellable.
+        assert!(cancel_scope_matches("", "chat"));
+        assert!(cancel_scope_matches("", "analysis"));
+        assert!(cancel_scope_matches("", ""));
+    }
 }

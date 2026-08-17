@@ -2173,6 +2173,7 @@ async function runAnalysisModelDetailed(messages, temperature, analysisOptions =
       maxTokens,
       responseFormatJson,
       reasoningRequested: requestAnalysisReasoning,
+      cancelScope: 'analysis',
     },
     (chunk) => { text += chunk; }
   );
@@ -4814,7 +4815,9 @@ analysisStopBtn?.addEventListener('click', () => {
   analysisStopRequested = true;
   setAnalysisStatus('Stopping', null);
   if (analysisProgressText) analysisProgressText.textContent = 'Stopping after the current model call finishes...';
-  window.api.cancelMessage().catch(() => {});
+  // Scoped to 'analysis' so stopping a run does not also cancel a chat the user has
+  // streaming in the other app-mode tab.
+  window.api.cancelMessage('analysis').catch(() => {});
 });
 
 settingsServerConnect.addEventListener('click', () => {
@@ -6529,7 +6532,9 @@ async function analyzeImagePart(msgIndex, partIndex, { force = false, bubble = n
 
   const result = await window.api.analyzeImage(
     messages,
-    { model, temperature: 0.2, maxTokens: IMAGE_ANALYSIS_MAX_TOKENS },
+    // 'chat' scope: image analysis runs as part of a send, so the composer's Stop should
+    // reach it.
+    { model, temperature: 0.2, maxTokens: IMAGE_ANALYSIS_MAX_TOKENS, cancelScope: 'chat' },
     (chunk) => {
       streamed += chunk;
       localBubble.set(`${streamed.length.toLocaleString()} chars`);
@@ -6683,7 +6688,7 @@ async function runQueryPlanner(messages) {
   let text = '';
   const result = await window.api.sendMessage(
     messages,
-    { model: currentModel, temperature: 0.2, maxTokens: 400, reasoningRequested: false },
+    { model: currentModel, temperature: 0.2, maxTokens: 400, reasoningRequested: false, cancelScope: 'chat' },
     (chunk) => { text += chunk; }
   );
   if (result?.error) throw new Error(result.error);
@@ -8447,6 +8452,14 @@ async function sendMessage() {
   });
 }
 
+// Appended to an answer that was cut short, so the transcript does not present a truncated
+// reply as a finished one. It goes in the message content rather than in a metadata field
+// on purpose: the .txt transcript is the format that survives a corrupt .json sidecar, and
+// it carries nothing but role and text — a flag stored beside the content would silently
+// disappear on exactly the reload where knowing this matters. It is also the honest thing
+// for the model to read on the next turn.
+const INTERRUPTED_SUFFIX = '\n\n_[Response interrupted — the text above is partial.]_';
+
 async function streamAssistantResponse({ forceImageDescriptionsForLastUser = false, webSearchContext = null, conceptMapContext = null, libraryContext = null, hermesContext = null, historyContext = null } = {}) {
   const distToBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight;
   if (distToBottom < 350) autoScrollEnabled = true;
@@ -8466,6 +8479,8 @@ async function streamAssistantResponse({ forceImageDescriptionsForLastUser = fal
   let rafPending = false;
   let finalized = false;
   let lastRenderAt = 0;
+  let partialPersisted = false;
+  const priorRoundTexts = [];
 
   function finishStreaming() {
     if (finalized) return;
@@ -8477,10 +8492,43 @@ async function streamAssistantResponse({ forceImageDescriptionsForLastUser = fal
     if (activeGeneration === generation) activeGeneration = null;
   }
 
+  // Text that already streamed is real output whatever ended the stream, so every
+  // interrupted path saves it. Both used to lose it in different ways: the error path
+  // deleted the bubble outright, discarding minutes of visible text on a stall or a dropped
+  // connection; and Stop left the text on screen but never put it in conversationHistory,
+  // so the transcript on disk, the array the next request is built from, and the message
+  // indices the DOM is keyed by all disagreed with what the user could see — until a reload
+  // resolved it by dropping the answer.
+  //
+  // Idempotent: Stop can reach this through finalizeStop and through the loop's early
+  // return, and on an error the stream can end while a stop is already pending.
+  async function persistPartialAnswer(status) {
+    if (partialPersisted) return;
+    const text = [...priorRoundTexts, streamedText].filter(t => t.trim()).join('\n\n');
+    if (!text.trim()) return;
+    partialPersisted = true;
+    const marked = `${text}${INTERRUPTED_SUFFIX}`;
+    if (assistantDiv) {
+      assistantDiv.innerHTML = renderMarkdown(marked);
+    } else {
+      assistantDiv = addMessage('assistant', marked);
+    }
+    conversationHistory.push({ role: 'assistant', content: marked });
+    currentChat.messages = conversationHistory.map(m => ({ role: m.role, content: m.content }));
+    await saveCurrentChat();
+    // The error branch records its own meta entry, with the server's message attached, so
+    // only the cancelled paths need one from here — otherwise one exchange leaves two.
+    if (status === 'cancelled') await recordMeta('cancelled', '', 0);
+    updateContextBar();
+    markLatestUnanswered();
+  }
+
   generation.finalizeStop = () => {
     generation.stopped = true;
     finishStreaming();
     if (!streamedText && assistantDiv) assistantDiv.remove();
+    // Not awaited — this runs from a click handler and a timer, neither of which can wait.
+    persistPartialAnswer('cancelled').catch(err => console.error('Failed to save the partial reply:', err));
     markLatestUnanswered();
   };
 
@@ -8538,6 +8586,7 @@ async function streamAssistantResponse({ forceImageDescriptionsForLastUser = fal
     temperature: currentTemp,
     maxTokens: currentMaxTokens > 0 ? currentMaxTokens : undefined,
     reasoningRequested: requestChatReasoning,
+    cancelScope: 'chat',
   };
 
   // On-demand concept map: attach concept_search and let the model pull what it needs.
@@ -8619,12 +8668,14 @@ async function streamAssistantResponse({ forceImageDescriptionsForLastUser = fal
   // lands between them in the transcript rather than above text that arrived after it.
   let result;
   let toolRounds = 0;
-  const priorRoundTexts = [];
   const toolState = cmNewToolState();
 
   for (;;) {
     result = await window.api.sendMessage(apiMessages, options, handleChunk);
-    if (generation.stopped) return;
+    // Stop was pressed. finalizeStop has already saved whatever streamed; this call is the
+    // idempotent second chance for the case where the stream returned before the timer or
+    // the cancel round-trip did.
+    if (generation.stopped) { await persistPartialAnswer('cancelled'); return; }
     if (result?.error || result?.cancelled) break;
 
     const calls = (Array.isArray(result.toolCalls) ? result.toolCalls : [])
@@ -8659,7 +8710,7 @@ async function streamAssistantResponse({ forceImageDescriptionsForLastUser = fal
         content,
       });
     }
-    if (generation.stopped) return;
+    if (generation.stopped) { await persistPartialAnswer('cancelled'); return; }
 
     toolRounds += 1;
     // Withdraw the tool once the cap is reached so the next round has to be an answer —
@@ -8677,7 +8728,16 @@ async function streamAssistantResponse({ forceImageDescriptionsForLastUser = fal
   }
 
   if (result?.error) {
-    if (assistantDiv) assistantDiv.remove();
+    // Keep whatever arrived before the failure. A stall or a dropped connection partway
+    // through a long answer used to delete the entire visible reply and leave only an
+    // error, which is the worst possible trade: the text was already generated, already
+    // paid for, and already read.
+    const hadPartial = [...priorRoundTexts, streamedText].some(t => t.trim());
+    if (hadPartial) {
+      await persistPartialAnswer('error');
+    } else if (assistantDiv) {
+      assistantDiv.remove();
+    }
     const imageHint = requestSentActualImages
       ? '\n\nIf this came from image input, set this model to text-only in Settings > Models or switch to a vision-capable model.'
       : '';
@@ -8685,6 +8745,7 @@ async function streamAssistantResponse({ forceImageDescriptionsForLastUser = fal
     await recordMeta('error', result.error, 0);
   } else if (result?.cancelled) {
     if (!streamedText && assistantDiv) assistantDiv.remove();
+    else await persistPartialAnswer('cancelled');
   } else {
     // A completed response means LM Studio has this model loaded — record it so we
     // don't redundantly reload it later.
@@ -8812,7 +8873,9 @@ sendBtn.addEventListener('click', () => {
       }, STOP_GRACE_MS);
     }
     sendBtn.textContent = 'Stopping…';
-    window.api.cancelMessage()
+    // Scoped to 'chat': an unscoped cancel also killed whatever Data Analysis had in
+    // flight, which the user has no reason to connect to pressing Stop in the composer.
+    window.api.cancelMessage('chat')
       .then(() => generation?.finalizeStop?.())
       .catch(() => generation?.finalizeStop?.());
   } else {

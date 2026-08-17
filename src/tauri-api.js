@@ -42,7 +42,10 @@
   window.api = {
     sendMessage: (messages, options, onChunk) => streamInvoke('chat_send', messages, options, onChunk),
     analyzeImage: (messages, options, onChunk) => streamInvoke('chat_analyze_image', messages, options, onChunk),
-    cancelMessage: () => invoke('chat_cancel'),
+    // `scope` limits the cancel to generations started by the same part of the app —
+    // 'chat' for the composer's Stop, 'analysis' for Data Analysis's. Omitted = cancel
+    // everything. See chat_cancel in lib.rs.
+    cancelMessage: (scope) => invoke('chat_cancel', { scope: scope || null }),
 
     getModels: (serverUrl) => invoke('get_models', { serverUrl }),
     loadModel: (model) => invoke('load_model', { model }),

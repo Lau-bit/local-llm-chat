@@ -20,3 +20,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
 tokio = { version = "1", features = ["macros", "sync", "time"] }
+
+[dev-dependencies]
+# `tests/provider_stream.rs` spawns tools/fake-server.mjs and drives the real HTTP + SSE
+# path against it, so it needs a runtime that can drive a child process and real sockets.
+tokio = { version = "1", features = ["macros", "sync", "time", "rt-multi-thread", "process", "io-util"] }

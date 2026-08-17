@@ -8,7 +8,12 @@
     "start": "tauri dev",
     "dev": "tauri dev",
     "build": "tauri build",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test": "node tools/context-tests.mjs && node tools/stream-state-tests.mjs",
+    "test:context": "node tools/context-tests.mjs",
+    "test:stream": "node tools/stream-state-tests.mjs",
+    "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml --target-dir src-tauri/target/test",
+    "fake-server": "node tools/fake-server.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0"
